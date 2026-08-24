@@ -56,6 +56,5 @@ vulnerabilities requiring an already-compromised host.
   CI-enforced (Native Dependency Hygiene workflow).
 
 The full control inventory and audit-readiness scorecard is maintained
-in the project's internal audit-readiness review
-(`docs/phases/phase-3/security-audit-readiness.md` in the private
+in the project's internal audit-readiness review (in the private
 development repository).

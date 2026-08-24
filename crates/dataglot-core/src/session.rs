@@ -26,7 +26,7 @@ use crate::error::Result;
 ///
 /// Without this, `\d` / `\dt` / `\dn` fail with `table
 /// 'dataglot.pg_catalog.*' not found`. See  and
-/// `docs/phases/phase-3/06-pg-catalog-compatibility.md`.
+/// the phase-3 `pg-catalog-compatibility` plan.
 ///
 /// **Identity model.** Uses `EmptyContextProvider` for v1; `pg_roles`
 /// is empty and `pg_table_is_visible` returns the default visibility

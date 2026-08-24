@@ -3,7 +3,7 @@
 //! OData is a REST protocol, not SQL: a source is queried with a `GET`
 //! against an entity-set URL carrying query-string parameters (`$select`,
 //! `$filter`, `$top`, …). There is no remote SQL engine to unparse to, so —
-//! per CLAUDE.md rule 3 — this connector is a **direct `TableProvider`**, not
+//! per hard rule 3 — this connector is a **direct `TableProvider`**, not
 //! a `datafusion-federation` `SQLExecutor`.
 //!
 //! # Slices
@@ -21,7 +21,7 @@
 //! - [`sap`] is a thin SAP S/4HANA layer over [`OdataConnector`] adding the
 //!   `sap-client` / `sap-language` request headers.
 //!
-//! See `docs/phases/phase-4/01-odata-sap-s4hana-connector.md`.
+//! See the phase-4 `odata-sap-s4hana-connector` plan.
 
 pub mod connector;
 pub mod decode;

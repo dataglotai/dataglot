@@ -38,7 +38,7 @@
 //! }
 //! ```
 //!
-//! Per CLAUDE.md rule 12, [`PostgresCatalogConfig`] and
+//! Per hard rule 12, [`PostgresCatalogConfig`] and
 //! [`WarehouseCredentialsConfig::Static`] have hand-written `Debug`
 //! implementations that redact the DSN and the secret-access-key. Any
 //! `DSN` or secret values held in env vars are looked up at boot via
@@ -266,7 +266,7 @@ pub struct ServerConfig {
     /// }
     /// ```
     ///
-    /// Spec: `docs/phases/phase-1/08-catalog-service.md`.
+    /// Spec: the phase-1 `catalog-service` plan.
     #[serde(default)]
     pub catalog_service: Option<CatalogServiceConfig>,
     /// Lineage emitter configuration — Architecture Decisions §10.
@@ -288,7 +288,7 @@ pub struct ServerConfig {
     /// }
     /// ```
     ///
-    /// See `docs/phases/phase-1/06-openlineage-emitter.md`.
+    /// See the phase-1 `openlineage-emitter` plan.
     #[serde(default)]
     pub lineage: Option<LineageConfig>,
     /// Governance backends to publish data products to —
@@ -312,7 +312,7 @@ pub struct ServerConfig {
     /// }
     /// ```
     ///
-    /// Spec: `docs/phases/phase-1/10-data-product-registration.md`.
+    /// Spec: the phase-1 `data-product-registration` plan.
     #[serde(default)]
     pub governance_publishers: Vec<GovernancePublisherConfig>,
     /// Optional Ballista distributed-execution configuration
@@ -339,7 +339,7 @@ pub struct ServerConfig {
     /// }
     /// ```
     ///
-    /// Spec: `docs/phases/phase-2/02-ballista-distributed-execution.md`
+    /// Spec: the phase-2 `ballista-distributed-execution` plan
     /// slice 3a.
     #[serde(default)]
     pub ballista: Option<BallistaServerConfig>,
@@ -368,7 +368,7 @@ pub struct ServerConfig {
     /// }
     /// ```
     ///
-    /// Spec: `docs/phases/phase-2/04-inbound-governance-integration.md`.
+    /// Spec: the phase-2 `inbound-governance-integration` plan.
     /// Slice 1 ships the echo path (HMAC verify + envelope parse +
     /// 200 ack); slices 2/3 add the rule-store mutation and the
     /// DataHub-shape adapter.
@@ -499,7 +499,7 @@ pub enum GovernancePublisherConfig {
         gms_endpoint: String,
         /// Name of the env var that holds the bearer token. The
         /// literal token is intentionally *not* on disk per
-        /// CLAUDE.md rule 12 — operators wire it through the
+        /// hard rule 12 — operators wire it through the
         /// process environment. Resolved once at boot; rotation
         /// requires a server restart (Phase 2 follow-up).
         ///
@@ -514,7 +514,7 @@ pub enum GovernancePublisherConfig {
 /// Catalog-service (Phase 1 task 08) configuration block.
 ///
 /// `dsn` is the Postgres libpq DSN of the catalog-service
-/// database; per CLAUDE.md rule 12, [`Debug`] redacts it.
+/// database; per hard rule 12, [`Debug`] redacts it.
 /// Postgres-backed control-plane store — the HA / multi-node backend.
 ///
 /// `org_id` is the tenant scope; Phase 1 hardcodes `"default"`.
@@ -541,7 +541,7 @@ impl fmt::Debug for PostgresStoreConfig {
 }
 
 /// Embedded pure-Rust single-file store — the zero-external-dependency
-/// default (CLAUDE.md rule 15 clean; no C, no Postgres). Production uses the
+/// default (hard rule 15 clean; no C, no Postgres). Production uses the
 /// `redb` backend (`dataglot_catalog::RedbMetaStore`,  slice A):
 /// single-file, ACID/MVCC, transactional per-key.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -606,7 +606,7 @@ pub struct IdentityProfileConfig {
     /// Name of the environment variable holding this user's cleartext
     /// password, consulted only when [`AuthConfig::mode`] is
     /// [`AuthMode::Md5`](crate::config::AuthMode). The password itself
-    /// never appears in the config file (CLAUDE.md rule 12) — only the
+    /// never appears in the config file (hard rule 12) — only the
     /// env-var *name* does. `None` ⇒ the user cannot authenticate under
     /// md5 mode (no credential), though their profile still resolves for
     /// authorization once authenticated by some other means.
@@ -969,7 +969,7 @@ pub struct RateLimitConfig {
 ///
 /// The cleartext lives only in this struct's heap allocation; its
 /// [`Debug`] impl deliberately renders neither the usernames nor the
-/// passwords (CLAUDE.md rule 12).
+/// passwords (hard rule 12).
 #[derive(Clone)]
 pub struct ConfigPasswordSource {
     creds: Arc<HashMap<String, String>>,
@@ -1508,7 +1508,7 @@ pub struct MaterializationConfig {
 /// Scheduled warehouse maintenance (Phase 4 Task 03). Compaction +
 /// orphan-cleanup today; snapshot-expiry joins here once it lands (blocked
 /// on an `iceberg-rust` upstream API — see
-/// `docs/phases/phase-4/03-compaction-and-maintenance.md`).
+/// the phase-4 `compaction-and-maintenance` plan).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MaintenanceConfig {
     /// Tables to compact on a cadence. Each entry targets one warehouse
@@ -1917,7 +1917,7 @@ pub enum CatalogConfig {
     /// boot by [`build_one_connector`] with a clear error.
     Oracle(OracleCatalogConfig),
     /// Lakehouse warehouse source (REST catalog + S3 storage) — see
-    /// [`WarehouseCatalogConfig`]. Per CLAUDE.md rule 7 the underlying
+    /// [`WarehouseCatalogConfig`]. Per hard rule 7 the underlying
     /// table format is never surfaced to users.
     Warehouse(WarehouseCatalogConfig),
     /// Direct object-storage table reads (parquet via
@@ -1982,7 +1982,7 @@ impl CatalogConfig {
     ///   empty config — defensive, won't happen for valid
     ///   configs).
     ///
-    /// Per CLAUDE.md rule 12 the binding never carries
+    /// Per hard rule 12 the binding never carries
     /// credentials. The `endpoint_hint` is the
     /// `<scheme>://<host>:<port>` form for SQL DSNs, with the
     /// userinfo segment stripped.
@@ -2003,7 +2003,7 @@ impl CatalogConfig {
                 // identifier is the public "host" equivalent
                 // (`<orgname>-<accountname>` — appears verbatim in
                 // the public Snowsight URL). Safe to surface as
-                // the endpoint hint per CLAUDE.md rule 12.
+                // the endpoint hint per hard rule 12.
                 endpoint_hint: c.account.clone(),
             }),
             Self::Oracle(c) => CatalogBinding::LiveConnector(LiveConnectorBinding {
@@ -2013,7 +2013,7 @@ impl CatalogConfig {
                 // separately (user + password/password_env), never in
                 // the DSN, so the common case is the literal DSN. The
                 // helper additionally strips any `user/pass@` userinfo
-                // prefix as defense-in-depth (CLAUDE.md rule 12).
+                // prefix as defense-in-depth (hard rule 12).
                 endpoint_hint: redacted_oracle_endpoint_hint(&c.dsn),
             }),
             Self::Warehouse(c) => CatalogBinding::IcebergCache(IcebergCacheBinding {
@@ -2029,7 +2029,7 @@ impl CatalogConfig {
                     .map_or_else(|| "<no tables>".to_string(), |t| t.url.clone()),
             }),
             // The service URL carries no credentials (auth is a separate
-            // field), so it's safe as the endpoint hint (CLAUDE.md rule 12).
+            // field), so it's safe as the endpoint hint (hard rule 12).
             Self::Odata(c) => CatalogBinding::LiveConnector(LiveConnectorBinding {
                 kind: LiveConnectorKind::Odata,
                 endpoint_hint: c.service_url.clone(),
@@ -2092,7 +2092,7 @@ impl CatalogConfig {
 }
 
 /// Render a credential-safe endpoint hint for SQL DSN
-/// configs. CLAUDE.md rule 12: the hint is what the catalog-
+/// configs. Hard rule 12: the hint is what the catalog-
 /// service UI surfaces; no password / user portion of the DSN
 /// ever appears here.
 ///
@@ -2130,7 +2130,7 @@ fn redacted_endpoint_hint(dsn: Option<&str>, dsn_env: Option<&str>) -> String {
 }
 
 /// Render a credential-safe endpoint hint for an Oracle Easy Connect
-/// DSN. CLAUDE.md rule 12.
+/// DSN. Hard rule 12.
 ///
 /// Oracle Easy Connect (`[//]host[:port][/service]`) carries no
 /// credentials — `user` / `password` are separate config fields — so
@@ -2158,7 +2158,7 @@ fn redacted_oracle_endpoint_hint(dsn: &str) -> String {
 /// # Redaction
 ///
 /// `Debug` never prints the literal DSN — only an indication that one
-/// was set. CLAUDE.md rule 12.
+/// was set. Hard rule 12.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct PostgresCatalogConfig {
     /// Literal libpq DSN. Mutually exclusive with `dsn_env` / `dsn_secret`.
@@ -2242,7 +2242,7 @@ impl fmt::Debug for PostgresCatalogConfig {
 /// # Redaction
 ///
 /// `Debug` never prints the literal DSN — only an indication that
-/// one was set. CLAUDE.md rule 12.
+/// one was set. Hard rule 12.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct MysqlCatalogConfig {
     /// Literal `mysql_async` DSN, of the form
@@ -2300,7 +2300,7 @@ impl fmt::Debug for MysqlCatalogConfig {
 /// Exactly one of `password` (literal) or `password_env` (name of
 /// the env var holding the password) must be set. The env-var
 /// indirection exists so production deployments can keep the
-/// password out of the on-disk config (CLAUDE.md rule 12).
+/// password out of the on-disk config (hard rule 12).
 ///
 /// # Redaction
 ///
@@ -2317,7 +2317,7 @@ impl fmt::Debug for MysqlCatalogConfig {
 /// `dataglot_federation::snowflake::SnowflakeConfig` carries the
 /// same shape on the federation side. The two are deliberately
 /// separate types — the server is a peer of `dataglot-federation`,
-/// not a downstream consumer (CLAUDE.md rule 4) — but the field
+/// not a downstream consumer (hard rule 4) — but the field
 /// names match so an operator inspecting both sees the same
 /// vocabulary.
 #[derive(Clone, Serialize, Deserialize)]
@@ -2361,7 +2361,7 @@ pub struct SnowflakeCatalogConfig {
 }
 
 impl fmt::Debug for SnowflakeCatalogConfig {
-    /// Credential-safe `Debug` per CLAUDE.md rule 12.
+    /// Credential-safe `Debug` per hard rule 12.
     ///
     /// Visible: `account`, `warehouse`, `database`, `schema`,
     /// `password_env` / `private_key_env` (env-var names, not their
@@ -2423,7 +2423,7 @@ pub enum OracleDriverConfig {
 /// The `dsn` is an Oracle Easy Connect string
 /// (`//host:port/service`) and carries **no** userinfo — `user` and
 /// the password (literal `password` or `password_env` indirection)
-/// are separate fields. Per CLAUDE.md rule 12 the password never
+/// are separate fields. Per hard rule 12 the password never
 /// appears in `Debug`/logs; the `user` is redacted too
 /// (service-account names leak org structure), matching the
 /// Snowflake config's treatment.
@@ -2433,7 +2433,7 @@ pub enum OracleDriverConfig {
 /// `dataglot_federation::oracle::OracleConnector::connect_with_driver(name,
 /// dsn, user, password, driver)` on the federation side (the `driver`
 /// maps from [`OracleDriverConfig`]). The server is a peer of
-/// `dataglot-federation`, not a downstream consumer (CLAUDE.md rule
+/// `dataglot-federation`, not a downstream consumer (hard rule
 /// 4); the field vocabulary is kept aligned deliberately.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OracleCatalogConfig {
@@ -2468,7 +2468,7 @@ pub struct OracleCatalogConfig {
 }
 
 impl fmt::Debug for OracleCatalogConfig {
-    /// Credential-safe `Debug` per CLAUDE.md rule 12.
+    /// Credential-safe `Debug` per hard rule 12.
     ///
     /// Visible: `dsn` (credential-free Easy Connect string),
     /// `schema`, `password_env` (the env-var name, not its value).
@@ -2519,14 +2519,14 @@ impl fmt::Debug for OracleCatalogConfig {
 /// The password comes only from `password_env` (resolved at connect,
 /// never stored). The `uri` may embed userinfo for drivers that demand
 /// it, so `Debug` redacts it wholesale; `driver_options` values are
-/// redacted too (tokens, key material). Per CLAUDE.md rule 12 none of
+/// redacted too (tokens, key material). Per hard rule 12 none of
 /// these surface in logs or errors.
 ///
 /// # Pairs with
 ///
 /// `dataglot_federation::adbc::AdbcConnector::connect(AdbcConfig)` on
 /// the federation side; the field vocabulary is kept aligned
-/// deliberately (CLAUDE.md rule 4 — the server is a peer, not a
+/// deliberately (hard rule 4 — the server is a peer, not a
 /// downstream consumer).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdbcCatalogConfig {
@@ -2584,7 +2584,7 @@ fn default_adbc_pool_min_idle() -> usize {
 }
 
 impl fmt::Debug for AdbcCatalogConfig {
-    /// Credential-safe `Debug` per CLAUDE.md rule 12.
+    /// Credential-safe `Debug` per hard rule 12.
     ///
     /// Visible: `driver_path`, `dialect`, scopes, pool sizing,
     /// `password_env` (the env-var name, not its value). Redacted:
@@ -2662,7 +2662,7 @@ pub enum WarehouseCredentialsConfig {
 
 impl fmt::Debug for WarehouseCredentialsConfig {
     /// Credential-safe `Debug`. The static `secret_access_key` is
-    /// replaced with `<redacted>`. CLAUDE.md rule 12.
+    /// replaced with `<redacted>`. Hard rule 12.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Environment => f.write_str("Environment"),
@@ -2762,7 +2762,7 @@ impl fmt::Debug for ObjectStorageS3Config {
     /// Credential-safe `Debug`. The inline `secret_access_key` is
     /// replaced with `<redacted>`; every other field (endpoint, region,
     /// non-secret access key id, the env-var *name*, addressing mode) is
-    /// shown. CLAUDE.md rule 12 — matches the hand-written `Debug` on the
+    /// shown. Hard rule 12 — matches the hand-written `Debug` on the
     /// sibling credential configs.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ObjectStorageS3Config")
@@ -2864,7 +2864,7 @@ pub struct OdataCatalogConfig {
 impl fmt::Debug for OdataCatalogConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // `auth` has its own redacting Debug; `service_url` is
-        // credential-free. No secret rendered (CLAUDE.md rule 12).
+        // credential-free. No secret rendered (hard rule 12).
         f.debug_struct("OdataCatalogConfig")
             .field("service_url", &self.service_url)
             .field("auth", &self.auth)
@@ -2915,7 +2915,7 @@ impl fmt::Debug for SapS4hanaCatalogConfig {
 ///
 /// For each method exactly one of the literal / `*_env` fields must be
 /// set — the literal for inline config, the `*_env` name for env-var
-/// indirection (resolved at boot, never logged; CLAUDE.md rule 12).
+/// indirection (resolved at boot, never logged; hard rule 12).
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OdataAuthConfig {
@@ -2944,7 +2944,7 @@ pub enum OdataAuthConfig {
 impl fmt::Debug for OdataAuthConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Never render the literal secret; the `*_env` *name* is safe
-        // (it's a variable name, not the value). CLAUDE.md rule 12.
+        // (it's a variable name, not the value). Hard rule 12.
         match self {
             Self::Basic {
                 user, password_env, ..
@@ -3081,7 +3081,7 @@ pub enum RestPaginationConfig {
 ///
 /// For `basic` / `bearer` / `header`, exactly one of the literal / `*_env`
 /// field must be set — the literal for inline config, the `*_env` name for
-/// env-var indirection (resolved at boot, never logged; CLAUDE.md rule 12).
+/// env-var indirection (resolved at boot, never logged; hard rule 12).
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RestAuthConfig {
@@ -3147,7 +3147,7 @@ pub enum RestAuthConfig {
 impl fmt::Debug for RestAuthConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Never render a literal secret; the `*_env` *name* is safe (a
-        // variable name, not the value). CLAUDE.md rule 12.
+        // variable name, not the value). Hard rule 12.
         match self {
             Self::None => f.write_str("None"),
             Self::Basic {
@@ -4315,7 +4315,7 @@ fn resolve_mysql_dsn_with_env(
 /// Resolve a `SnowflakeCatalogConfig`'s password — either the
 /// literal `password` field (dev-only escape hatch) or the value
 /// of the env var named by `password_env` (production indirection
-/// per CLAUDE.md rule 12).
+/// per hard rule 12).
 ///
 /// Required-field validation for `account` / `warehouse` /
 /// `database` / `user` is the operator's job (a malformed config
@@ -4348,7 +4348,7 @@ fn resolve_snowflake_password_with_env(
         }
         (Some(pw), None) => Ok(pw.clone()),
         (None, Some(env_name)) => env(env_name).with_context(|| {
-            // Variable name, never the resolved value (CLAUDE.md rule 12).
+            // Variable name, never the resolved value (hard rule 12).
             format!(
                 "catalog '{name}': environment variable '{env_name}' \
                  (configured via `password_env`) is not set"
@@ -4388,7 +4388,7 @@ fn resolve_snowflake_config_with_env(
     let private_key_pem = match cfg.private_key_env.as_deref() {
         Some(var) => {
             let key = env(var).with_context(|| {
-                // Variable name only, never the key (CLAUDE.md rule 12).
+                // Variable name only, never the key (hard rule 12).
                 format!(
                     "catalog '{name}': environment variable '{var}' \
                      (configured via `private_key_env`) is not set"
@@ -4424,7 +4424,7 @@ fn resolve_snowflake_config_with_env(
 
 /// Resolve an `OracleCatalogConfig`'s password — either the literal
 /// `password` field (dev-only escape hatch) or the value of the env
-/// var named by `password_env` (production indirection per CLAUDE.md
+/// var named by `password_env` (production indirection per hard
 /// rule 12). Same "literal or env-var, never both" shape as
 /// [`resolve_snowflake_password`].
 ///
@@ -4456,7 +4456,7 @@ fn resolve_oracle_password_with_env(
         }
         (Some(pw), None) => Ok(pw.clone()),
         (None, Some(env_name)) => env(env_name).with_context(|| {
-            // Variable name, never the resolved value (CLAUDE.md rule 12).
+            // Variable name, never the resolved value (hard rule 12).
             format!(
                 "catalog '{name}': environment variable '{env_name}' \
                  (configured via `password_env`) is not set"
@@ -4552,7 +4552,7 @@ pub async fn build_connectors<S: std::hash::BuildHasher>(
 ///
 /// `tolerate_unreachable = true` logs each connect failure at WARN
 /// (catalog name + kind + error chain — never credentials, per
-/// CLAUDE.md rule 12) and skips that catalog; the returned map holds
+/// hard rule 12) and skips that catalog; the returned map holds
 /// only the catalogs that connected. A fully unreachable set yields an
 /// empty map rather than an error. See
 /// [`ServerConfig::tolerate_unreachable_catalogs`].
@@ -4568,7 +4568,7 @@ pub async fn build_connectors_with<S: std::hash::BuildHasher>(
     let mut out: HashMap<String, Arc<dyn DfCatalogProvider>> =
         HashMap::with_capacity(catalogs.len());
     for (name, cfg) in catalogs {
-        // Names are safe to log (CLAUDE.md rule 12 covers credentials,
+        // Names are safe to log (hard rule 12 covers credentials,
         // not catalog identifiers).
         tracing::info!(catalog = %name, kind = catalog_kind(cfg), "registering federated catalog");
         match build_one_connector(name, cfg).await {
@@ -4617,7 +4617,7 @@ pub async fn build_connectors_with_health<S: std::hash::BuildHasher>(
         HashMap::with_capacity(catalogs.len());
     let mut handles: HashMap<String, ConnectorHealthHandle> = HashMap::new();
     for (name, cfg) in catalogs {
-        // Names are safe to log (CLAUDE.md rule 12 covers credentials,
+        // Names are safe to log (hard rule 12 covers credentials,
         // not catalog identifiers).
         tracing::info!(catalog = %name, kind = catalog_kind(cfg), "registering federated catalog");
         match build_one_connector_with_health(name, cfg).await {
@@ -5019,7 +5019,7 @@ async fn build_adbc_catalog(
 /// Resolve an [`OdataAuthConfig`] into the federation crate's
 /// [`OdataAuth`], enforcing exactly-one of literal / `*_env` per method
 /// and reading the env var at boot. Never renders a secret in an error
-/// (CLAUDE.md rule 12).
+/// (hard rule 12).
 ///
 /// [`OdataAuth`]: dataglot_federation::odata::OdataAuth
 fn resolve_odata_auth(
@@ -5143,7 +5143,7 @@ fn rest_column_type(
 
 /// Resolve a [`RestAuthConfig`] into the federation crate's [`RestAuth`],
 /// enforcing exactly-one of literal / `*_env` per credential field and reading
-/// the env var at boot. Never renders a secret in an error (CLAUDE.md rule 12).
+/// the env var at boot. Never renders a secret in an error (hard rule 12).
 ///
 /// [`RestAuth`]: dataglot_federation::rest::RestAuth
 fn resolve_rest_auth(
@@ -5892,7 +5892,7 @@ mod tests {
 
     #[test]
     fn catalog_service_config_debug_redacts_dsn() {
-        // CLAUDE.md rule 12 regression guard.
+        // hard rule 12 regression guard.
         let cfg = CatalogServiceConfig::Postgres(PostgresStoreConfig {
             dsn: "postgresql://datasvc:supersecret@10.0.0.5:5432/catalog".into(),
             org_id: "default".into(),
@@ -6149,7 +6149,7 @@ mod tests {
 
     #[test]
     fn postgres_catalog_binding_strips_userinfo_from_dsn() {
-        // CLAUDE.md rule 12 — credentials never appear on the
+        // hard rule 12 — credentials never appear on the
         // binding. The DSN's `user:pass@` segment must be elided.
         let cfg = CatalogConfig::Postgres(PostgresCatalogConfig {
             dsn: Some("postgresql://datasvc:supersecret@10.0.0.5:5432/billing".into()),
@@ -6265,7 +6265,7 @@ mod tests {
         // Defense-in-depth: even though the Oracle config keeps creds
         // in separate fields, a DSN that embeds a `user/pass@` prefix
         // (some Oracle tooling accepts it) must never surface that
-        // prefix in the binding hint (CLAUDE.md rule 12).
+        // prefix in the binding hint (hard rule 12).
         let cfg = CatalogConfig::Oracle(OracleCatalogConfig {
             dsn: "scott/tiger@//db.internal:1521/ORCLPDB1".into(),
             user: "DATAGLOT_SVC".into(),
@@ -8435,7 +8435,7 @@ mod tests {
     }
 
     /// `ConfigPasswordSource`'s `Debug` must not leak usernames or
-    /// passwords (CLAUDE.md rule 12).
+    /// passwords (hard rule 12).
     #[test]
     fn config_password_source_debug_is_redacted() {
         let mut creds = HashMap::new();
@@ -8764,7 +8764,7 @@ mod tests {
         assert!(msg.contains("warehouse"), "{msg}");
     }
 
-    /// CLAUDE.md rule 12: the literal DSN never appears in `Debug`
+    /// Hard rule 12: the literal DSN never appears in `Debug`
     /// output for [`PostgresCatalogConfig`].
     #[test]
     fn debug_redacts_postgres_dsn() {
@@ -8794,7 +8794,7 @@ mod tests {
         assert!(s.contains("<redacted>"), "{s}");
     }
 
-    /// CLAUDE.md rule 12: the literal `secret_access_key` never appears
+    /// Hard rule 12: the literal `secret_access_key` never appears
     /// in `Debug` output for [`WarehouseCredentialsConfig::Static`]. The
     /// access-key-id and the env-var **name** are kept visible — they
     /// are not themselves secrets.
@@ -8824,7 +8824,7 @@ mod tests {
         assert_eq!(s, "Environment");
     }
 
-    /// CLAUDE.md rule 12 regression guard for the inline S3 secret. The
+    /// Hard rule 12 regression guard for the inline S3 secret. The
     /// `ObjectStorageS3Config` `Debug` must redact `secret_access_key`
     /// while still showing the non-secret fields ( 1a).
     #[test]
@@ -9232,7 +9232,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE.md rule 12: the literal DSN never appears in `Debug`
+    /// Hard rule 12: the literal DSN never appears in `Debug`
     /// output for [`MysqlCatalogConfig`]. The env-var **name** is
     /// kept visible since it is not itself a secret.
     #[test]
@@ -9583,7 +9583,7 @@ mod tests {
     /// Debug must never leak the URI (may embed userinfo), the
     /// username, or driver-option values; the driver path, dialect,
     /// and the password env-var *name* stay visible for operator
-    /// identification (CLAUDE.md rule 12).
+    /// identification (hard rule 12).
     #[test]
     fn debug_redacts_adbc_credentials() {
         let cfg = CatalogConfig::Adbc(sample_adbc_cfg());
@@ -9757,7 +9757,7 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("exadata"), "error names the catalog: {msg}");
         assert!(msg.contains("oracle"), "error names the feature: {msg}");
-        // CLAUDE.md rule 12: the password never surfaces in the error.
+        // hard rule 12: the password never surfaces in the error.
         assert!(!msg.contains("super-secret"), "password leaked: {msg}");
     }
 
@@ -9775,7 +9775,7 @@ mod tests {
     ///   2. the error message mentions the catalog name (so
     ///      operators see which catalog booted unhealthy)
     ///   3. the password never appears in the error chain
-    ///      (CLAUDE.md rule 12)
+    ///      (hard rule 12)
     ///
     /// The previous test asserted a typed "not yet wired" error
     /// when `as_catalog_provider` was still a stub on the

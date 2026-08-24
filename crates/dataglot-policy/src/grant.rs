@@ -5,7 +5,7 @@
 //! that, in **grant mode**, rejects a query at plan time unless the session
 //! holds every privilege the query's table scans require. Like every other
 //! Dataglot policy, enforcement is a plan-time `LogicalPlan` walk — no UDFs,
-//! no runtime SQL (CLAUDE.md rule 6).
+//! no runtime SQL (hard rule 6).
 //!
 //! # Semantics (decided,  F5b)
 //!

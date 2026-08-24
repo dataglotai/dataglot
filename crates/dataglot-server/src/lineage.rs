@@ -5,7 +5,7 @@
 //! (Marquez, `DataHub`, `OpenMetadata`, Informatica — all four
 //! accept the standard schema as an intake).
 //!
-//! Spec: `docs/phases/phase-1/06-openlineage-emitter.md`.
+//! Spec: the phase-1 `openlineage-emitter` plan.
 //!
 //! # Failure-isolation contract
 //!
@@ -540,7 +540,7 @@ impl LineageObserver {
     /// `dataglot_policy` and convert into the `dataglot_core`
     /// representation. Identity types are duplicated across crates
     /// because `dataglot-core` cannot depend on `dataglot-policy`
-    /// (CLAUDE.md rule 4); this is the conversion seam.
+    /// (hard rule 4); this is the conversion seam.
     fn snapshot_identity() -> Identity {
         let policy_id = dataglot_policy::current_session_identity().unwrap_or_default();
         Identity {

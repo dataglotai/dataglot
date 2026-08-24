@@ -1,7 +1,7 @@
 //! `BindingChange` event stream + the LISTEN/NOTIFY pump.
 //!
-//! Spec: `docs/phases/phase-1/08-catalog-service.md` (subscribe
-//! section) and `docs/phases/phase-1/09-catalog-provider-cache.md`
+//! Spec: the phase-1 `catalog-service` plan (subscribe
+//! section) and the phase-1 `catalog-provider-cache` plan
 //! (the consumer side).
 //!
 //! The catalog service emits a `catalog_binding_changed`

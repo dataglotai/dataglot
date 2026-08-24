@@ -47,11 +47,10 @@ jobs:
       - name: Install protoc (Ballista/substrait)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - name: Install cargo-llvm-cov
-        run: cargo install --locked cargo-llvm-cov
-
-      # Deliberately no `target` in this cache: the instrumented target dir is
-      # tens of GB — restoring it would eat the disk headroom freed above.
+      # Restored BEFORE the `cargo install` below so the registry cache
+      # serves that build too. Deliberately no `target` in this cache: the
+      # instrumented target dir is tens of GB — restoring it would eat the
+      # disk headroom freed above.
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -59,6 +58,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-llvm-cov
+        run: cargo install --locked cargo-llvm-cov
 
       - name: Generate coverage summary
         run: make coverage-json COVERAGE_JSON_OUT=target/coverage-summary.json

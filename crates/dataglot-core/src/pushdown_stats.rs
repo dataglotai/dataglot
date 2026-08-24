@@ -46,7 +46,7 @@ pub enum PushdownOutcome {
 /// reaches a terminal state.
 ///
 /// `sql` is the dialect-rendered statement sent to the source; like filter
-/// literals it is user data (CLAUDE.md rule 12), so the server stores it under
+/// literals it is user data (hard rule 12), so the server stores it under
 /// the same visibility as the query's own SQL (both surface only on the
 /// operator-facing query registry, never in logs above `debug`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,7 +78,7 @@ pub struct PushdownStat {
 ///
 /// [`record`]: PushdownSink::record
 ///
-/// `Send + Sync + 'static` per CLAUDE.md rule 10 — the sink is stored as an
+/// `Send + Sync + 'static` per hard rule 10 — the sink is stored as an
 /// `Arc<dyn PushdownSink>` in a task-local that outlives any single query.
 pub trait PushdownSink: Send + Sync + 'static {
     /// Record one pushdown stat against the query identified by `run_id`.

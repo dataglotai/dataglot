@@ -26,7 +26,7 @@
 /// source is still reachable and the credentials still valid — the result rows
 /// are discarded.
 ///
-/// # CLAUDE.md compliance
+/// # Hard-rule compliance
 /// * Rule 10 — `Send + Sync + 'static`, async.
 /// * Rule 11 — implementors do all I/O asynchronously (blocking clients hop
 ///   through `spawn_blocking` exactly as their `SQLExecutor` impl does).
@@ -38,6 +38,6 @@ pub trait ConnectorHealthCheck: Send + Sync + 'static {
     /// Cheap liveness probe that REUSES the existing authenticated client — a
     /// single round-trip that errors iff the source is unreachable or creds are
     /// invalid. Must NOT rebuild the client or re-authenticate. The returned
-    /// error string must be credential-safe (CLAUDE.md rule 12).
+    /// error string must be credential-safe (hard rule 12).
     async fn health_check(&self) -> Result<(), String>;
 }

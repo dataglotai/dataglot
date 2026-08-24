@@ -25,7 +25,7 @@
 //!
 //! The credential lookup ([`PasswordSource`]) is a trait so the server
 //! crate owns *where* passwords come from (config + env indirection,
-//! CLAUDE.md rule 12) without `dataglot-pgwire` taking a dependency on
+//! hard rule 12) without `dataglot-pgwire` taking a dependency on
 //! `dataglot-server` (rule 4).
 //!
 //! The authenticated username flows into the exact same
@@ -49,7 +49,7 @@ use pgwire::error::PgWireResult;
 /// hash so timing/responses don't trivially distinguish unknown users
 /// from wrong passwords.
 ///
-/// # Credential isolation (CLAUDE.md rule 12)
+/// # Credential isolation (hard rule 12)
 ///
 /// Implementations **must not** leak the cleartext password through
 /// their [`Debug`] impl — redact it. The bound exists because
@@ -59,7 +59,7 @@ use pgwire::error::PgWireResult;
 pub trait PasswordSource: Debug + Send + Sync + 'static {
     /// Cleartext password for `user`, or `None` when `user` is unknown.
     ///
-    /// Async (CLAUDE.md rule 10): the in-memory config source resolves
+    /// Async (hard rule 10): the in-memory config source resolves
     /// synchronously, but the seam exists so a future directory backend
     /// (`LDAP` / `IdP`) can do IO here without a breaking change.
     async fn password(&self, user: &str) -> Option<String>;

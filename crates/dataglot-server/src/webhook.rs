@@ -1,6 +1,7 @@
 //! Inbound governance webhook — Phase 2 spec 04 slice 1.
 //!
-//! HTTP receiver for the [Interface 3] policy-ingestion event stream
+//! HTTP receiver for the Interface 3 policy-ingestion event stream
+//! (defined in the phase-2 `inbound-governance-integration` plan)
 //! from a governance platform's Actions Framework (`DataHub` Actions,
 //! Informatica IDMC, etc.). Operators wire `[webhook]` in
 //! `dataglot.toml`; the server boots a sibling axum task on its own
@@ -43,8 +44,6 @@
 //!   to start — fail-fast is the only safe shape.
 //! - **Replay.** Out of scope for slice 1 (spec §"Open questions" #3).
 //!   Idempotency by `event_id` lands in slice 3 or 3.5.
-//!
-//! [Interface 3]: ../../../../docs/phases/phase-2/04-inbound-governance-integration.md
 
 use std::net::SocketAddr;
 

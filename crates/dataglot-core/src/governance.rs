@@ -2,15 +2,15 @@
 //! §11 Interfaces #2 and #5 of the governance integration epic.
 //!
 //! Spec:
-//! - `docs/phases/phase-1/10-data-product-registration.md`
-//! - `docs/phases/phase-1/11-column-definition-sync.md`
+//! - the phase-1 `data-product-registration` plan
+//! - the phase-1 `column-definition-sync` plan
 //!
 //! This module plants the **trait + types** for the outbound
 //! channel from the Peaka Catalog Service to a governance
 //! backend (`DataHub` / `OpenMetadata` / Informatica). The HTTP
 //! adapter that implements [`DataProductPublisher`] lives in
 //! `dataglot-server::governance` (`reqwest` belongs there per
-//! CLAUDE.md rule 4).
+//! hard rule 4).
 //!
 //! # Phase 1 scope
 //!
@@ -68,7 +68,7 @@ pub struct ColumnMetadata {
 ///
 /// Closed enum (no `#[non_exhaustive]`) — a fourth variant
 /// would be a wire-shape break across Phase versions. Spec'd
-/// in `docs/phases/phase-1/11-column-definition-sync.md`;
+/// in the phase-1 `column-definition-sync` plan;
 /// implementations are added per phase:
 ///
 /// - **Phase 1** (this PR): only [`Self::Placeholder`] is
@@ -173,7 +173,7 @@ pub enum ProductPlatform {
     /// Live federated generic REST/JSON source — Salesforce,
     /// Athena Health, and similar `SaaS` APIs.
     Rest,
-    /// Iceberg-cached warehouse table (CLAUDE.md rule 7:
+    /// Iceberg-cached warehouse table (hard rule 7:
     /// the *governance* platform name is `iceberg` because
     /// that's what `DataHub` / `OpenMetadata` expect; the
     /// user-facing surface stays Iceberg-free).
@@ -374,7 +374,7 @@ mod tests {
     fn product_platform_serde_lowercase() {
         // `kind: "iceberg"` on the wire is intentional — that's
         // what `DataHub` / `OpenMetadata` expect for the platform
-        // name even though CLAUDE.md rule 7 keeps Iceberg out
+        // name even though hard rule 7 keeps Iceberg out
         // of user-facing surfaces. Pin this so a future
         // rename to "warehouse" or similar doesn't silently
         // break the governance integration.

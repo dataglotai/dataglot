@@ -1,7 +1,7 @@
 //! Phase 2 slice 4c.B — multi-source UNION dispatch.
 //!
-//! The re-scoped slice 4c (see `docs/phases/phase-2/02-ballista-
-//! distributed-execution.md`) proves multi-worker parallelism via N
+//! The re-scoped slice 4c (see the phase-2
+//! `ballista-distributed-execution` plan) proves multi-worker parallelism via N
 //! parallel single-partition federated reads against N distinct
 //! catalog backends, unioned at the coordinator. Each leg is one
 //! `VirtualExecutionPlan` — single-partition by upstream

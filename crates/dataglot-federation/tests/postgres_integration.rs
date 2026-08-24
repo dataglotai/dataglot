@@ -79,7 +79,7 @@ async fn federated_select_with_pushdown() {
     let (dsn, _container) = setup_users_table().await;
 
     // Build the connector and resolve a TableProvider for public.users.
-    // Per CLAUDE.md rule 13 the schema is fetched here (first access),
+    // Per hard rule 13 the schema is fetched here (first access),
     // not at connector construction time.
     let connector = Arc::new(
         PostgresConnector::connect(&dsn)
@@ -172,7 +172,7 @@ async fn federated_select_with_pushdown() {
     );
 }
 
-/// Lazy schema resolution (CLAUDE.md rule 13): constructing a connector
+/// Lazy schema resolution (hard rule 13): constructing a connector
 /// must not fetch any table schemas. We verify this by connecting to a
 /// database that has no user tables yet and asserting `connect` still
 /// succeeds.
@@ -301,7 +301,7 @@ async fn catalog_provider_three_part_name_select() {
 }
 
 /// `Debug` output for a connector must never include the password
-/// (CLAUDE.md rule 12). This one also runs without Docker since we
+/// (hard rule 12). This one also runs without Docker since we
 /// never actually open the connection — but we still ignore it when
 /// Docker is unavailable to keep the whole file under one gate.
 #[tokio::test]

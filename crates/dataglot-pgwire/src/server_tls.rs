@@ -75,7 +75,7 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 /// Build a [`TlsAcceptor`] from a PEM cert chain + private key on disk.
 ///
 /// Blocking (reads + parses files) — call it off the async executor
-/// (`spawn_blocking`) at boot, not per connection (CLAUDE.md rule 11).
+/// (`spawn_blocking`) at boot, not per connection (hard rule 11).
 ///
 /// # Errors
 /// Returns a [`PgWireError::Io`] if a file can't be read, the PEM is

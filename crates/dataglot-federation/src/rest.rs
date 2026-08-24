@@ -2,7 +2,7 @@
 //!
 //! A sibling of the OData connector ([`super::odata`]): a REST API is queried
 //! with an HTTP `GET` and has no remote SQL engine to unparse to, so — per
-//! CLAUDE.md rule 3 — this is a **direct `TableProvider`**, not a
+//! hard rule 3 — this is a **direct `TableProvider`**, not a
 //! `datafusion-federation` `SQLExecutor`.
 //!
 //! Unlike OData there is no universal metadata document, so a source declares

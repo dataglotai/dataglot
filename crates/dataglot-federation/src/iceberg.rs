@@ -5,7 +5,7 @@
 //! and resolves `<namespace>.<table>` to a `DataFusion` `TableProvider`
 //! backed by `iceberg-datafusion`.
 //!
-//! # CLAUDE.md compliance
+//! # Hard-rule compliance
 //!
 //! * Rule 1 — `iceberg-datafusion` returns Arrow `RecordBatch` streams
 //!   from its `TableProvider::scan`; we do not interpose any row-mode
@@ -536,7 +536,7 @@ impl fmt::Debug for WarehouseConnector {
 /// name. The cache is fixed at construction time — see the docs on
 /// [`WarehouseConnector::as_catalog_provider`] for why.
 ///
-/// Per CLAUDE.md rules 7 + 12, `Debug` does not surface the inner
+/// Per hard rules 7 + 12, `Debug` does not surface the inner
 /// iceberg catalog client and uses neutral terminology.
 ///
 /// [`CatalogProvider`]: datafusion::catalog::CatalogProvider
@@ -688,7 +688,7 @@ fn build_storage_factory() -> Arc<dyn iceberg::io::StorageFactory> {
 mod tests {
     use super::*;
 
-    /// CLAUDE.md rule 12: the secret-access-key never appears in the
+    /// Hard rule 12: the secret-access-key never appears in the
     /// `Debug` representation of [`WarehouseCredentials`].
     #[test]
     fn debug_redacts_static_secret_access_key() {
@@ -721,7 +721,7 @@ mod tests {
         assert_eq!(s, "Environment");
     }
 
-    /// CLAUDE.md rule 12 (continued): the connector's `Debug` does not
+    /// Hard rule 12 (continued): the connector's `Debug` does not
     /// expose the catalog client. The catalog client is held opaquely
     /// and rendered as `<redacted>` so that any future iceberg-rust
     /// change that adds credential-bearing fields to `Catalog::fmt`
@@ -761,7 +761,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE.md rule 7: the connector type name is neutral. This is a
+    /// Hard rule 7: the connector type name is neutral. This is a
     /// trivial test but it pins the rename — if anyone tries to rename
     /// `WarehouseConnector` back to `IcebergConnector` they'll have to
     /// update this assertion, providing a tripwire on the user-facing
@@ -980,7 +980,7 @@ mod tests {
     /// * return a non-`None` `SchemaProvider` for each known schema,
     /// * return `None` for an unknown schema.
     ///
-    /// Per CLAUDE.md rule 13, `as_catalog_provider` only fetches names
+    /// Per hard rule 13, `as_catalog_provider` only fetches names
     /// — no per-table metadata is loaded here.
     #[tokio::test]
     async fn catalog_provider_lists_top_level_namespaces() {

@@ -3,7 +3,7 @@
 //!
 //! Backs the control plane's durable state — catalogs, secrets, users, roles,
 //! grants, policies, and derived products — on [`redb`], a pure-Rust
-//! (CLAUDE.md rule 15 clean) ACID/MVCC embedded KV store. It is the production
+//! (hard rule 15 clean) ACID/MVCC embedded KV store. It is the production
 //! embedded backend; the whole-file JSON [`crate::EmbeddedMetaStore`] it
 //! replaces stays only as a fast in-test [`MetaStore`] double.
 //!

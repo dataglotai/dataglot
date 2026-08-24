@@ -2,7 +2,7 @@
 //! `TableProvider` / `CatalogProvider` ( slices 1–3).
 //!
 //! A REST API is queried with an HTTP `GET` and has no remote SQL engine to
-//! unparse to, so — per CLAUDE.md rule 3 — this is a **direct
+//! unparse to, so — per hard rule 3 — this is a **direct
 //! [`TableProvider`]**, a sibling of the `OData` connector, not a
 //! `datafusion-federation` `SQLExecutor`. Unlike `OData` there is no metadata
 //! document, so each table declares its Arrow schema and the row array is
@@ -48,7 +48,7 @@ use super::oauth2::{OAuth2Config, OAuth2TokenCache};
 /// How the REST connector authenticates to a source.
 ///
 /// `Debug` is hand-written to never render a password, token, or header value
-/// (CLAUDE.md rule 12).
+/// (hard rule 12).
 #[derive(Clone)]
 pub enum RestAuth {
     /// No authentication (public endpoint).
@@ -639,7 +639,7 @@ pub(crate) struct RestScanExec {
 
 // Hand-written so the request URL is redacted — a pushed equality literal in
 // its query string could be a credential, and a derived `Debug` would render
-// it in plan/debug logging (CLAUDE.md rule 12). `auth` uses its own redacting
+// it in plan/debug logging (hard rule 12). `auth` uses its own redacting
 // `Debug`.
 impl fmt::Debug for RestScanExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -700,7 +700,7 @@ fn join_url(base: &str, next: &str) -> DfResult<String> {
 /// redacted for plan display. Pushed equality literals are appended to the URL
 /// as `?…`, and a filter value — or a `user:pass@host` password — can be a
 /// credential, so neither may surface in an `EXPLAIN` / plan representation
-/// (CLAUDE.md rule 12). The scheme/host/path are safe.
+/// (hard rule 12). The scheme/host/path are safe.
 fn redacted_url(url: &str) -> String {
     if let Ok(mut parsed) = Url::parse(url) {
         // Some APIs carry an API key in the user-info username (e.g.
@@ -797,7 +797,7 @@ impl ExecutionPlan for RestScanExec {
                 // pushed equality literal in the query string could be a
                 // credential, and reqwest keeps the full URL in its error,
                 // which would otherwise surface through the pgwire error path
-                // (CLAUDE.md rule 12).
+                // (hard rule 12).
                 let resp = req
                     .header("Accept", "application/json")
                     .send()
@@ -862,7 +862,7 @@ fn external<E: std::error::Error + Send + Sync + 'static>(e: E) -> DataFusionErr
 
 /// Like [`external`] but for a [`reqwest::Error`], first stripping the URL so a
 /// pushed equality literal (possible credential) in the query string can't
-/// escape through the error path (CLAUDE.md rule 12).
+/// escape through the error path (hard rule 12).
 fn external_reqwest(e: reqwest::Error) -> DataFusionError {
     external(e.without_url())
 }

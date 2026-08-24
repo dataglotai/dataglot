@@ -3,7 +3,8 @@
 
 Single source of truth for both `make coverage-json` (local) and the nightly
 `coverage.yml` workflow. Reads llvm-cov's JSON on stdin (or a file arg) and
-writes `docs/site/data/coverage.json` with:
+writes a JSON summary (destination via `COVERAGE_JSON_OUT`, default
+`target/coverage-summary.json`) with:
 
   - overall line / region / function totals (count, covered, percent)
   - a per-crate breakdown (grouped by `crates/<name>/`)
@@ -122,7 +123,7 @@ def main() -> int:
         "crates": crates,
     }
 
-    dest = os.environ.get("COVERAGE_JSON_OUT", "docs/site/data/coverage.json")
+    dest = os.environ.get("COVERAGE_JSON_OUT", "target/coverage-summary.json")
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     with open(dest, "w") as fh:
         json.dump(out, fh, indent=2)

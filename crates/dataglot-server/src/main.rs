@@ -35,7 +35,7 @@ use dataglot_server::server::DataglotServer;
 /// with it; that keeps `main` itself testable.
 ///
 /// # Why async
-/// CLAUDE.md rule 11 forbids blocking IO in async context. The
+/// hard rule 11 forbids blocking IO in async context. The
 /// original implementation used `std::net::TcpStream::connect_timeout`
 /// directly inside `#[tokio::main]`, which would have blocked the
 /// runtime thread for up to 2 seconds. The async path uses

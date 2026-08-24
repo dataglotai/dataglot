@@ -14,9 +14,9 @@
 //! **staging** table, then repoints the logical name via catalog
 //! `rename_table` (park live → write staging → promote staging → drop parked).
 //! A failed staging write never touches the live table; readers see the prior
-//! table until the final promote. (Spec decision, `docs/phases/phase-3/07-trino-retirement.md`.)
+//! table until the final promote. (Spec decision, the phase-3 `trino-retirement` plan.)
 //!
-//! # CLAUDE.md compliance
+//! # Hard-rule compliance
 //!
 //! * Rule 1 — batches flow as Arrow straight into the iceberg writer; no
 //!   row-mode conversion.

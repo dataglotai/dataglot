@@ -5,7 +5,7 @@
 //! **async** md5 auth exchange (the server's `PasswordSource` reads the meta
 //! store): the user's **superuser** flag and its **RBAC role** memberships.
 //! The sync [`StartupObserver`](crate::StartupObserver) builds the session
-//! identity but is sync — CLAUDE.md rule 11 forbids blocking on async inside
+//! identity but is sync — hard rule 11 forbids blocking on async inside
 //! it, so it must not re-query the store.
 //!
 //! So, exactly like [`crate::auth_org`], the value is bridged through a tokio

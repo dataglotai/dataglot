@@ -58,7 +58,7 @@
 //!
 //! Spec 02 sketched the API as `dataglot-core/src/ballista_context.rs`,
 //! but `dataglot-core` cannot depend on `dataglot-ballista` (would
-//! violate CLAUDE.md rule 4's strict dependency direction; the
+//! violate hard rule 4's strict dependency direction; the
 //! Ballista crate is heavy enough that pulling it into core's
 //! workspace-default build path would dominate everyone's compile).
 //! Placing the factory next to slice 1's smoke test keeps Ballista's
@@ -172,7 +172,7 @@ pub struct BallistaContextFactory {
     /// instance from the same config the coordinator uses, fail
     /// construction if the backend is unreachable, and exit before
     /// registering with the scheduler. Coordinator never serializes
-    /// resolved tokens onto the wire (CLAUDE.md rule 12).
+    /// resolved tokens onto the wire (hard rule 12).
     ///
     /// `None` is the default — callers that don't ship credentials in
     /// the Ballista path leave the slot empty. The accessor on
@@ -940,7 +940,7 @@ mod tests {
     }
 
     /// Phase 2 slice 3b — the factory's `Debug` impl must never leak
-    /// resolver contents (CLAUDE.md rule 12). The resolver slot
+    /// resolver contents (hard rule 12). The resolver slot
     /// surfaces only as a presence marker.
     #[test]
     fn factory_debug_does_not_leak_resolver_contents() {

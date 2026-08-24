@@ -52,7 +52,7 @@ pub enum CatalogAdminOutcome {
 /// Why a catalog-DDL statement could not be applied.
 ///
 /// Every variant's `Display` is **client-safe**: it names the catalog and the
-/// problem but never carries credentials (CLAUDE.md rule 12) — the connector
+/// problem but never carries credentials (hard rule 12) — the connector
 /// builders are responsible for redacting their own error chains, and the
 /// [`Self::Backend`] message is built from those already-redacted strings.
 #[derive(Debug)]

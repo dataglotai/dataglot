@@ -1,6 +1,6 @@
 //! In-process `CatalogProvider` cache — Phase 1 task 09.
 //!
-//! Spec: `docs/phases/phase-1/09-catalog-provider-cache.md`.
+//! Spec: the phase-1 `catalog-provider-cache` plan.
 //!
 //! Sits in front of [`crate::CatalogService`] and gives the
 //! query plane sub-millisecond catalog lookups. Cache hits
@@ -45,7 +45,7 @@ use crate::subscribe::{BindingChange, BindingChangeKind};
 /// `build_connectors` (its existing connector-construction
 /// helper) into this closure; keeping it generic in the cache
 /// crate avoids a reverse dep on `dataglot-server` /
-/// `dataglot-federation` per CLAUDE.md rule 4.
+/// `dataglot-federation` per hard rule 4.
 ///
 /// The closure is called on every cold miss and on every
 /// re-resolve following a `BindingChange`.

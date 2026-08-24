@@ -1,6 +1,6 @@
 //! The [`MetaStore`] trait — the backend-agnostic control-plane store.
 //!
-//! Spec: `docs/phases/phase-6/01-sql-native-runtime-config.md` (slice A).
+//! Spec: the phase-6 `sql-native-runtime-config` plan (slice A).
 //!
 //! The meta store is the source of truth for catalog **bindings** and
 //! their credential-free **source configs**, plus a change feed the read
@@ -26,7 +26,7 @@ use crate::Result;
 
 /// A stored user, **without** its password hash. This is the shape returned by
 /// [`MetaStore::list_users`] — the opaque password hash is deliberately absent
-/// so it can never leak through a listing (CLAUDE.md rule 12). The hash is
+/// so it can never leak through a listing (hard rule 12). The hash is
 /// retrievable only via [`MetaStore::get_user`], for M3b's auth path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserRecord {
@@ -257,7 +257,7 @@ pub struct DerivedProductRecord {
 /// Method contracts mirror the read/write surface the server boot path
 /// and (later slices) runtime SQL DDL need. Credential **values** never
 /// cross this boundary — `source_config` carries `*_env` names only
-/// (CLAUDE.md rule 12); the store persists and returns them verbatim.
+/// (hard rule 12); the store persists and returns them verbatim.
 ///
 /// The store is **org-parameterized** (multi-tenant foundation,
 /// M1): one instance serves every org, and each data method takes the

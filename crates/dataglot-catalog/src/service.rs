@@ -2,7 +2,7 @@
 //!
 //! Owns the Postgres pool, the org scope, and the boot-time
 //! schema-version guard. Spec:
-//! `docs/phases/phase-1/08-catalog-service.md`.
+//! the phase-1 `catalog-service` plan.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -518,7 +518,7 @@ impl CatalogService {
     ///
     /// The value is the raw JSON; the caller deserializes it into its own
     /// `CatalogConfig` (this crate doesn't depend on `dataglot-server`,
-    /// CLAUDE.md rule 4). Rows with a NULL `source_config` are omitted.
+    /// hard rule 4). Rows with a NULL `source_config` are omitted.
     ///
     /// # Errors
     /// [`CatalogServiceError::Query`] on Postgres-side failure.

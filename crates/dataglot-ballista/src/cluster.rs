@@ -65,7 +65,7 @@ use crate::plan_guard::SerializationGuardQueryPlanner;
 /// refuse to register with the scheduler if construction fails (the
 /// trait's pre-fetch contract is where backend reachability is
 /// checked). The coordinator's resolver never serializes its resolved
-/// tokens onto the wire (CLAUDE.md rule 12).
+/// tokens onto the wire (hard rule 12).
 ///
 /// Consumers — connectors that bind a `CredentialHandle` to its
 /// resolved payload at execution time — do not yet exist; the Phase 1

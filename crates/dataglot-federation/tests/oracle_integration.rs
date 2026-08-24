@@ -10,8 +10,8 @@
 //! the dedicated x86 CI Oracle job (see the spec's CI step); it cannot run
 //! on Apple-Silicon dev machines.
 //!
-//! This is the mandatory EXPLAIN pushdown-parity test (CLAUDE.md "SQL
-//! connector parity" rule), modelled on
+//! This is the mandatory EXPLAIN pushdown-parity test (the project's
+//! "SQL connector parity" rule), modelled on
 //! `single_source_complex_query_pushed_through_natively` in
 //! `postgres_integration.rs`. The Oracle twist: the pushed SQL must carry
 //! `FETCH FIRST … ROWS ONLY` (not `LIMIT`), proving the connector's

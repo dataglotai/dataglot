@@ -7,7 +7,7 @@
 //! No Docker — local filesystem only — so this test is part of the
 //! standard `cargo test --workspace` run.
 //!
-//! Spec: `docs/phases/phase-1/04-object-storage-connector.md`.
+//! Spec: the phase-1 `object-storage-connector` plan.
 
 use std::collections::HashMap;
 use std::fs::File;

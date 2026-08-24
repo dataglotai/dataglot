@@ -146,7 +146,7 @@ dataglot-core = { path = "../dataglot-core" }
 # `kind = "postgres"` instantiates a `PostgresConnector`,
 # `kind = "mysql"` instantiates a `MysqlConnector`, and
 # `kind = "warehouse"` instantiates a `WarehouseConnector` (Iceberg-backed
-# under the hood — never surfaced to users per CLAUDE.md rule 7).
+# under the hood — never surfaced to users per hard rule 7).
 dataglot-federation = { path = "../dataglot-federation", features = [
   "postgres",
   "mysql",
@@ -214,7 +214,7 @@ prometheus = "0.14"
 # HTTP client for the OpenLineage HTTP emitter
 # (`dataglot-server::lineage::OpenLineageHttpEmitter`). Pulled
 # in as a runtime dep here rather than core because core
-# stays minimum-dep per CLAUDE.md rule 4. Was a dev-dep prior
+# stays minimum-dep per hard rule 4. Was a dev-dep prior
 # to the lineage emitter slice.
 reqwest.workspace = true
 serde.workspace = true

@@ -1,6 +1,6 @@
 //! Phase 2 slice 1 — Ballista localhost smoke test.
 //!
-//! The audit (`docs/phases/phase-2/00-distributed-readiness-audit.md`)
+//! The audit (the phase-2 `distributed-readiness-audit` plan)
 //! explicitly deferred the in-process Ballista probe to this slice. The
 //! deliverable is "the smallest viable Ballista cluster that proves the
 //! moving parts wire up" — not the federation pushdown story, not the
@@ -63,7 +63,7 @@
 //! resulting physical plan executes in-place. Ballista forces the
 //! serialization boundary unconditionally.
 //!
-//! # CLAUDE.md rule notes
+//! # Hard-rule notes
 //!
 //! * Rule 1 — query results collected as `Vec<RecordBatch>`; no row-mode
 //!   conversion on the read path.

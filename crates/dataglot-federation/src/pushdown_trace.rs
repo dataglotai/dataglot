@@ -16,7 +16,7 @@
 //!   `LIMIT` satisfied by the local plan, or a cancelled query upstream).
 //!
 //! The START event carries the SQL and so stays at `debug!` — filter literals
-//! are user data (CLAUDE.md rule 12). The terminal events never repeat the
+//! are user data (hard rule 12). The terminal events never repeat the
 //! SQL, so they are safe to leave on at the default `dataglot=info` filter.
 //! All events use the [`PUSHDOWN_TARGET`] tracing target, mirroring the
 //! `dataglot::audit` convention so a subscriber can route pushdown telemetry

@@ -32,7 +32,7 @@ adbc = ["dataglot-federation/adbc"]
 # exact match for the workspace after the coordinated DataFusion 54
 # ecosystem bump (, 2026-07-25). Bumped from 53.0.0; all four
 # ballista* crates move together and Cargo unifies them via the
-# crates.io source. See `docs/phases/phase-2/02-ballista-distributed-execution.md`
+# crates.io source. See the phase-2 `ballista-distributed-execution` plan
 # under "Upstream release watch" for the release-watch history.
 #
 # The `standalone` feature is what brings the in-process executor +
@@ -181,7 +181,7 @@ thiserror = { workspace = true }
 # Slice 2: `BallistaContextFactory` takes the same `SessionConfig`
 # `dataglot-core::SessionContextFactory` accepts, so single-node →
 # distributed swap is a one-line factory change at boot. Crate
-# dependency direction OK per CLAUDE.md rule 4
+# dependency direction OK per hard rule 4
 # (`dataglot-ballista → dataglot-core`).
 dataglot-core = { path = "../dataglot-core" }
 # Federation analyzer rules + `FederatedQueryPlanner`. Mirror the
@@ -295,7 +295,7 @@ parquet.workspace = true
 # the Ballista cluster to assert governance parity end-to-end. The
 # dep is dev-only — production wiring of policy lives in
 # `dataglot-server`, which keeps the lateral-crate hygiene from
-# CLAUDE.md rule 4 intact (no library cycle between sibling crates).
+# hard rule 4 intact (no library cycle between sibling crates).
 dataglot-policy = { path = "../dataglot-policy" }
 tempfile = { workspace = true }
 testcontainers = { workspace = true }

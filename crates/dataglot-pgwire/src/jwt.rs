@@ -16,7 +16,7 @@
 //! maps that to a rejected connection. An unverified token is **never**
 //! trusted for either authentication or group membership.
 //!
-//! # Credential isolation (CLAUDE.md rule 12)
+//! # Credential isolation (hard rule 12)
 //!
 //! The token, its signature, and the signing key are secrets. They never
 //! appear in a [`JwtError`]'s `Display` / `Debug` (the error is value-free
@@ -53,7 +53,7 @@ impl JwtAlgorithm {
     }
 }
 
-/// Error verifying a presented JWT. **Value-free** (CLAUDE.md rule 12): a
+/// Error verifying a presented JWT. **Value-free** (hard rule 12): a
 /// variant never carries the token, signature, key, or any claim value —
 /// only the *kind* of failure, so it is safe to log / surface.
 #[derive(Debug, thiserror::Error)]

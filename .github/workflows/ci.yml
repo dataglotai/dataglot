@@ -51,12 +51,10 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Install taplo (TOML formatter)
-        run: cargo install --locked taplo-cli
-
-      # Deliberately no `target` in this cache: the workspace target dir is
-      # tens of GB — restoring it would eat the disk headroom freed above
-      # (and exceed the repo's cache quota anyway).
+      # Restored BEFORE the `cargo install` below so the registry cache
+      # serves that build too. Deliberately no `target` in this cache: the
+      # workspace target dir is tens of GB — restoring it would eat the disk
+      # headroom freed above (and exceed the repo's cache quota anyway).
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -64,6 +62,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install taplo (TOML formatter)
+        run: cargo install --locked taplo-cli
 
       - name: Format + lint (fmt, taplo, clippy)
         run: make check

@@ -24,10 +24,10 @@
 //! [`LdapAuthenticator`]'s bind→search orchestration (DN/filter templating,
 //! outcome mapping, injection escaping) is unit-tested against an in-memory
 //! mock with **no live server**. The real client [`Ldap3Connection`] wraps the
-//! pure-Rust `ldap3` crate (CLAUDE.md rule 15) and its tokio backend, so every
+//! pure-Rust `ldap3` crate (hard rule 15) and its tokio backend, so every
 //! call is async and non-blocking (rule 11).
 //!
-//! # Credential isolation (CLAUDE.md rule 12)
+//! # Credential isolation (hard rule 12)
 //!
 //! The bind password is passed straight to the directory and never logged;
 //! [`LdapError`] is value-free (no DN, no password, no filter), and
@@ -58,7 +58,7 @@ pub struct LdapConfig {
     pub group_name_attr: String,
 }
 
-/// Error performing an LDAP operation. **Value-free** (CLAUDE.md rule 12): no
+/// Error performing an LDAP operation. **Value-free** (hard rule 12): no
 /// variant carries the DN, password, filter, or any entry data — only the
 /// kind of failure.
 #[derive(Debug, thiserror::Error)]

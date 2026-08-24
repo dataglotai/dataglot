@@ -12,7 +12,7 @@
 //!   wired to `datafusion-federation` so filters/projections/limits push
 //!   down to `PostgreSQL`.
 //!
-//! # CLAUDE.md compliance
+//! # Hard-rule compliance
 //!
 //! * Rule 1 — data flows as Arrow `RecordBatch` end-to-end; rows are decoded
 //!   into Arrow arrays inside the `SQLExecutor::execute` impl on
@@ -75,7 +75,7 @@ use dataglot_core::{DataglotError, Result as DataglotResult};
 /// when present and falls back to the generic `Display` for
 /// non-db variants (IO, TLS, parse, etc.).
 ///
-/// **Credential safety** (CLAUDE.md rule 12): `DbError` fields
+/// **Credential safety** (hard rule 12): `DbError` fields
 /// (severity, code, message, detail, hint) come from `PostgreSQL`'s
 /// response and describe the failure, not the connection — they
 /// never contain DSN, password, or token material. The generic
@@ -201,7 +201,7 @@ where
 }
 
 impl PostgresConnector {
-    // MULTI-TENANT NOTE (; spec at docs/phases/phase-3/02-adbc-connector.md).
+    // MULTI-TENANT NOTE (; spec: the phase-3 `adbc-connector` plan).
     // The single shared `Arc<Client>` held by this connector has no per-user
     // isolation; the same physical connection serves every pgwire session on
     // this catalog. Safe today only because nothing in `connect` /
@@ -394,7 +394,7 @@ impl PostgresConnector {
     /// `datafusion-federation`.
     ///
     /// The schema is fetched on demand by querying
-    /// `information_schema.columns`. This satisfies CLAUDE.md rule 13
+    /// `information_schema.columns`. This satisfies hard rule 13
     /// (lazy schema resolution) — no remote query is issued until the
     /// caller actually asks for a table.
     ///
@@ -587,7 +587,7 @@ impl PostgresConnector {
 }
 
 impl fmt::Debug for PostgresConnector {
-    /// Credential-safe `Debug` impl (CLAUDE.md rule 12). Emits host, port,
+    /// Credential-safe `Debug` impl (hard rule 12). Emits host, port,
     /// user, and dbname — never password. The `client` field is
     /// intentionally omitted (`finish_non_exhaustive`) because its own
     /// `Debug` impl would expose the connection config, including the
@@ -608,7 +608,7 @@ impl fmt::Debug for PostgresConnector {
 /// fixed at construction time — see the docs on
 /// [`PostgresConnector::as_catalog_provider`] for why.
 ///
-/// Per CLAUDE.md rule 12, `Debug` does not surface anything from the
+/// Per hard rule 12, `Debug` does not surface anything from the
 /// underlying `PostgresConnector` other than its name.
 ///
 /// [`CatalogProvider`]: datafusion::catalog::CatalogProvider
@@ -1243,7 +1243,7 @@ fn pg_decode_err(e: tokio_postgres::Error) -> DataFusionError {
     ))))
 }
 
-// MULTI-TENANT NOTE (; spec at docs/phases/phase-3/02-adbc-connector.md).
+// MULTI-TENANT NOTE (; spec: the phase-3 `adbc-connector` plan).
 // `execute` below sends user-driven SQL on the single `Arc<Client>` shared
 // across all pgwire sessions. Safe today because the federation unparser
 // only emits read-only `SELECT` statements. If you add pre/post hooks that
@@ -1612,7 +1612,7 @@ mod tests {
     #[test]
     fn redacted_dsn_omits_password() {
         // Parse a DSN with a password and confirm it never appears in
-        // the redacted output. This is the core of CLAUDE.md rule 12.
+        // the redacted output. This is the core of hard rule 12.
         let cfg =
             Config::from_str("host=example.com port=5433 user=alice password=s3cret dbname=mydb")
                 .unwrap();
@@ -1697,7 +1697,7 @@ mod tests {
     }
 
     /// `PostgresCatalog`'s `Debug` impl exposes only the connector name
-    /// and a schema count — neither password nor host. CLAUDE.md rule 12.
+    /// and a schema count — neither password nor host. Hard rule 12.
     #[test]
     fn catalog_debug_does_not_leak_credentials() {
         let cat = PostgresCatalog {

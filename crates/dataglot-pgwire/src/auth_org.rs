@@ -6,7 +6,7 @@
 //! username and learns which org owns it — *before* the sync
 //! [`StartupObserver`](crate::StartupObserver) runs. The observer needs that
 //! org to scope the session (per-org catalog swap + session identity), but it
-//! is **sync**: CLAUDE.md rule 11 forbids blocking on async inside it, so it
+//! is **sync**: Hard rule 11 forbids blocking on async inside it, so it
 //! must not re-query the store.
 //!
 //! So, exactly like [`crate::session_org`], the value is bridged through a
@@ -17,7 +17,7 @@
 //! (config-identity org → this auth-resolved org → boot org).
 //!
 //! Why a pgwire-owned task-local rather than the server reaching into
-//! `dataglot_policy` / writing across crates: CLAUDE.md rule 4 forbids a
+//! `dataglot_policy` / writing across crates: Hard rule 4 forbids a
 //! lateral `dataglot-pgwire -> dataglot-policy`/`-server` dependency, so the
 //! server (which depends on both) mirrors the resolved value into this
 //! pgwire-owned seam instead. The org is a plain tenant name, never a

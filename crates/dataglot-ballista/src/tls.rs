@@ -138,7 +138,7 @@ impl TlsArgs {
 /// `ServerTlsConfig` instances as they need without re-IO and without
 /// exposing tonic types in the cross-module surface.
 ///
-/// `Debug` redacts the cert / key payloads per CLAUDE.md rule 12 —
+/// `Debug` redacts the cert / key payloads per hard rule 12 —
 /// the key is sensitive; the cert is at-rest fine but the audit trail
 /// should not have to distinguish.
 #[derive(Clone)]

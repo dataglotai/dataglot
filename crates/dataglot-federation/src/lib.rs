@@ -23,7 +23,7 @@
 //!
 //! # Feature Flags
 //!
-//! Enable connectors via feature flags (per CLAUDE.md rule 9):
+//! Enable connectors via feature flags (per hard rule 9):
 //! - `postgres` - `PostgreSQL` data source connector
 //! - `mysql` - `MySQL` data source connector
 //! - `iceberg` - Apache Iceberg table format support (Rule 7: kept as
@@ -81,7 +81,7 @@ pub use registry::{ConnectorRegistry, DynConnectorRegistry, InMemoryConnectorReg
 // Re-export the `SQLExecutor` trait from `datafusion-federation` so
 // `dataglot-server`'s ballista wiring (slice 4b.5) can name the
 // trait type for the `InMemoryConnectorRegistry::new` map without
-// taking a direct `datafusion-federation` dep (CLAUDE.md rule 4 —
+// taking a direct `datafusion-federation` dep (hard rule 4 —
 // cross-crate touchpoints go through known re-exports rather than
 // transitive symbols).
 pub use datafusion_federation::sql::SQLExecutor;

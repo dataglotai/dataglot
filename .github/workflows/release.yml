@@ -15,7 +15,8 @@
 #   mc=$(gh pr view <release-pr> --json mergeCommit -q .mergeCommit.oid)
 #   git tag -a v0.X.Y "$mc" -m "..." && git push origin v0.X.Y
 #
-# Full procedure: docs/instructions/pull-requests.md → "Cutting a release".
+# Full procedure: the maintainers' release runbook ("Cutting a
+# release", in the private development repo's instruction set).
 
 name: Release
 

@@ -87,7 +87,7 @@ const WORKER_CONTAINERS: usize = 4;
 /// Phase 2 exit criterion #3 — **near-linear worker scaling**.
 ///
 /// Re-interpreted 2026-05-29 (see
-/// `docs/phases/phase-2/05-four-worker-throughput-gap.md`): the
+/// the phase-2 `four-worker-throughput-gap` plan): the
 /// original "≥5× on a 4-worker cluster" is arithmetically unreachable —
 /// Amdahl caps an N-worker cluster at ~N× vs a single equivalent
 /// worker, so 4 workers can never hit 5×. The defensible distributed-

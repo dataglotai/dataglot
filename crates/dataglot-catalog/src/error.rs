@@ -1,6 +1,6 @@
 //! Error type for the catalog service.
 //!
-//! Library crate per CLAUDE.md rule 8 — typed errors via
+//! Library crate per hard rule 8 — typed errors via
 //! `thiserror`, no `anyhow` here.
 
 use thiserror::Error;

@@ -547,7 +547,7 @@ fn encode_federation(
             // phantom config bug (found by the  distributed-adbc
             // e2e). Don't leak the raw compute_context — SQL
             // connectors often encode host/database/user identity into
-            // it (CLAUDE.md rule 12). CodeRabbit flagged this on
+            // it (hard rule 12). CodeRabbit flagged this on
             // PR #272.
             tracing::warn!("{}", PRESUBMISSION_WARN);
             DataFusionError::NotImplemented(DISTRIBUTED_SOURCE_UNSUPPORTED.to_string())
@@ -955,7 +955,7 @@ fn encode_federated_table_provider(
             // unserializable-provider path uses, not an Internal that
             // sends operators chasing config agreement (and gets
             // DataFusion's "file a bug report" boilerplate appended).
-            // Don't leak the raw compute_context (CLAUDE.md rule 12).
+            // Don't leak the raw compute_context (hard rule 12).
             tracing::warn!(table = %table_ref, "{}", PRESUBMISSION_WARN);
             DataFusionError::NotImplemented(format!(
                 "table '{table_ref}' is not available in distributed mode: \

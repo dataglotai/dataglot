@@ -1,6 +1,6 @@
 //! Phase 1 · `OpenLineage` emitter MVP — slice 5 end-to-end test.
 //!
-//! Spec: `docs/phases/phase-1/06-openlineage-emitter.md`.
+//! Spec: the phase-1 `openlineage-emitter` plan.
 //!
 //! What's covered here that other tests don't cover individually:
 //!

@@ -36,7 +36,6 @@ Three reasons:
 
 ## See also
 
-- `docs/phases/phase-2/03-tpch-baseline.md` — the spec.
-- `crates/dataglot-tests/benches/tpch_baseline.rs` — the runner.
-- `docs/site/data/tpch-baseline.json` — the published baseline (after
-  the first nightly run lands).
+- the phase-2 `tpch-baseline` plan — the spec (maintainers' private
+  development repo, along with the `tpch_baseline.rs` bench runner and
+  the nightly-published baseline JSON).

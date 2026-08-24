@@ -3,14 +3,14 @@
 //! This module plants the trait the per-query lineage hook
 //! rides on; the actual HTTP emitter implementation lives in
 //! `dataglot-server::lineage` (where `reqwest` is acceptable
-//! as a runtime dep). The split honours CLAUDE.md rule 4 —
+//! as a runtime dep). The split honours hard rule 4 —
 //! `dataglot-core` stays the minimum-deps crate, and the
 //! cross-crate consumers (`dataglot-pgwire`, `dataglot-server`,
 //! and eventually `dataglot-policy` for the audit-trail hook)
 //! all reference the trait through `dataglot-core` without a
 //! lateral dependency between them.
 //!
-//! Spec: `docs/phases/phase-1/06-openlineage-emitter.md`.
+//! Spec: the phase-1 `openlineage-emitter` plan.
 //!
 //! # Failure-isolation contract
 //!
@@ -30,7 +30,7 @@
 //! the `dataglot-server` config surface land in follow-up PRs;
 //! the `columnLineage` facet emission + the internal lineage
 //! graph for propagated enforcement are  slices 2–5
-//! (`docs/phases/phase-3/05-lineage-closure.md`).
+//! (the phase-3 `lineage-closure` plan).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -163,7 +163,7 @@ pub struct QueryFinishContext<'a> {
 /// Identity context — same shape as
 /// `dataglot_policy::Identity` but re-declared here because
 /// `dataglot-core` cannot depend on `dataglot-policy` (the
-/// dependency direction goes the other way per CLAUDE.md
+/// dependency direction goes the other way per hard
 /// rule 4). The two structs are kept in sync by hand.
 ///
 /// The HTTP emitter renders the populated fields as a
@@ -318,7 +318,7 @@ fn dataset_of_with_defaults(
 // contributed, and how (the [`TransformationType`]). This is the
 // data behind the `OpenLineage` `columnLineage` facet and the
 // internal lineage graph used for propagated tag enforcement
-// (Interface 4) — see `docs/phases/phase-3/05-lineage-closure.md`.
+// (Interface 4) — see the phase-3 `lineage-closure` plan.
 //
 // Crate-placement note (rule 4): this is **structural only** and
 // has no `dataglot-policy` dependency. The policy masking rewrite
@@ -671,7 +671,7 @@ fn lineage_map(plan: &LogicalPlan) -> Result<Vec<Vec<InputFieldContribution>>, D
 /// reimplementation). The result feeds the `OpenLineage`
 /// `columnLineage` facet (slice 2) and the internal lineage
 /// graph used for propagated tag enforcement (slice 4). See
-/// `docs/phases/phase-3/05-lineage-closure.md`.
+/// the phase-3 `lineage-closure` plan.
 ///
 /// # Errors
 /// Returns a [`DataFusionError`] only on traversal-level

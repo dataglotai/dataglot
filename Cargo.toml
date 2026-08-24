@@ -13,7 +13,7 @@ members = [
 # scheduler + executor + gRPC stack. The transitive dep `substrait`
 # requires a `protoc` binary at build time, and the compile alone
 # takes ~8 minutes on a cold cache. The spec
-# (`docs/phases/phase-2/02-ballista-distributed-execution.md`) calls
+# (the phase-2 `ballista-distributed-execution` plan) calls
 # this out explicitly: "Ballista's dep tree is heavy and would
 # dominate the default workspace build path."
 #
@@ -93,7 +93,7 @@ base64 = "0.23"
 
 # Secret envelope encryption — `dataglot-server` encrypts
 # `CREATE SECRET` values at rest in the meta store. Pure-Rust RustCrypto AEAD
-# (no `*-sys`, no C toolchain — CLAUDE.md rule 15 clean), same family as the
+# (no `*-sys`, no C toolchain — hard rule 15 clean), same family as the
 # `hmac`/`sha2` already used for MD5 auth. XChaCha20-Poly1305 is used with a
 # random 192-bit nonce (safe to generate randomly, unlike a 96-bit nonce).
 chacha20poly1305 = "0.11"
@@ -115,7 +115,7 @@ rand = "0.10"
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 
 # LDAP / Active Directory directory-group resolution for the `ldap`
-# connection-auth mode. Pure-Rust async LDAP client (CLAUDE.md
+# connection-auth mode. Pure-Rust async LDAP client (hard
 # rule 15 clean — no `*-sys`, no C toolchain): default features are turned
 # OFF to drop the native-TLS (`openssl-sys`) path, and LDAPS is served by the
 # pure-Rust `tls-rustls` feature (same rustls/ring stack as pgwire ingress).
@@ -148,7 +148,7 @@ toml = "1.1"
 # for HMAC-SHA256 verification of the inbound governance
 # (Interface 3) payload signature. RustCrypto org maintainers;
 # both crates have zero `unsafe` on the hot path. See
-# `docs/phases/phase-2/04-inbound-governance-integration.md`.
+# the phase-2 `inbound-governance-integration` plan.
 hmac = "0.13"
 sha2 = "0.11"
 
@@ -165,7 +165,7 @@ url = "2"
 # `run.runId` (UUIDv4). The `v4` feature pulls the random
 # generator; `serde` is needed because run IDs cross JSON
 # boundaries (HTTP emitter payload). See
-# `docs/phases/phase-1/06-openlineage-emitter.md`.
+# the phase-1 `openlineage-emitter` plan.
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Used by `dataglot-server::lineage` to format `eventTime` as
@@ -295,8 +295,8 @@ pedantic = { level = "deny", priority = -1 }
 cast_possible_truncation = "allow"
 module_name_repetitions = "allow"
 
-# Tier 1 — async-safety + ship-readiness lints. These encode three CLAUDE.md
-# commitments as enforceable lints:
+# Tier 1 — async-safety + ship-readiness lints. These encode three of the
+# workspace's hard-rule commitments as enforceable lints:
 #   - Rule 11 (no blocking IO in async context) — paired with clippy.toml
 #     `disallowed-methods`.
 #   - Long-running server posture — `dbg!()` and `todo!()` must never reach

@@ -38,7 +38,7 @@
 //!
 //! # With JSON output (also reads tpch-baseline.json for ratio):
 //! BALLISTA_4WORKER_REPORT_OUTPUT=/tmp/phase2-benchmarks.json \
-//! BALLISTA_4WORKER_BASELINE_INPUT=docs/site/data/tpch-baseline.json \
+//! BALLISTA_4WORKER_BASELINE_INPUT=path/to/tpch-baseline.json \
 //!     cargo bench -p dataglot-ballista --bench four_worker_throughput
 //!
 //! # Faster local iteration (SF=0.1, smaller dataset):

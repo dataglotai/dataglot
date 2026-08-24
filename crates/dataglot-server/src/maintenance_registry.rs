@@ -13,7 +13,7 @@
 //! maintenance task is listed from boot.
 //!
 //! Only redacted status is stored — job label, target, counts, timings, and
-//! the (already credential-scrubbed) error string (CLAUDE.md rule 12).
+//! the (already credential-scrubbed) error string (hard rule 12).
 
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};

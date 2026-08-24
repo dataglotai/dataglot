@@ -54,7 +54,7 @@ async fn main() -> ExitCode {
             // DataglotError::Configuration; Ballista RPC failures
             // surface as DataglotError::Internal. Either way the
             // operator gets a single diagnostic line + non-zero
-            // exit. CLAUDE.md rule 12 — the resolver Debug impls
+            // exit. Hard rule 12 — the resolver Debug impls
             // redact secrets, so this Display is credential-safe.
             tracing::error!(error = %e, "dataglot-ballista-executor failed");
             eprintln!("dataglot-ballista-executor: {e}");

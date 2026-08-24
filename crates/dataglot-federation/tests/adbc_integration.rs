@@ -1,6 +1,6 @@
 //! Integration tests for the generic ADBC connector,
 //! modelled on the `postgres_integration.rs` precedent and the test
-//! scenarios document at `docs/phases/phase-3/02-adbc-connector-tests.md`
+//! scenarios document at the phase-3 `adbc-connector-tests` plan
 //! (section 5).
 //!
 //! Fixture: the DuckDB shared library, which exports the

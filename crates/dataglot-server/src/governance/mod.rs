@@ -24,7 +24,7 @@
 //! `MetadataChangeProposal` JSON bodies to a configured `DataHub`
 //! GMS endpoint.
 //!
-//! Spec: `docs/phases/phase-1/10-data-product-registration.md`.
+//! Spec: the phase-1 `data-product-registration` plan.
 //!
 //! # Failure-isolation contract
 //!
@@ -107,7 +107,7 @@ pub struct DataHubPublisher {
 impl std::fmt::Debug for DataHubPublisher {
     /// Credential-safe `Debug`. The `bearer_token` is replaced with
     /// `<redacted>` so a `{:?}` of this publisher never prints the
-    /// token. CLAUDE.md rule 12 — matches the hand-written `Debug` on
+    /// token. Hard rule 12 — matches the hand-written `Debug` on
     /// the credential configs in `config.rs`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DataHubPublisher")
@@ -288,7 +288,7 @@ fn column_to_field(column: &ColumnMetadata) -> Value {
 /// Map our platform enum to `DataHub`'s `dataPlatform` slug. The
 /// slugs match `DataHub`'s built-in platform vocabulary; operators
 /// stay clear of the `iceberg`-internals exposure called out in
-/// CLAUDE.md rule 7 because the *operator* sees `DataHub`'s native
+/// hard rule 7 because the *operator* sees `DataHub`'s native
 /// "Iceberg" label, not Dataglot's internal `IcebergCache` naming.
 fn datahub_platform_slug(platform: ProductPlatform) -> &'static str {
     match platform {
@@ -345,7 +345,7 @@ pub const CATALOG_LEVEL_SENTINEL: &str = "_catalog";
 /// stable across phases — Phase 2 will replace these with real
 /// per-table breakdowns as lineage tracing surfaces them.
 ///
-/// CLAUDE.md rule 13 — schema inference is lazy: we do *not* walk
+/// Hard rule 13 — schema inference is lazy: we do *not* walk
 /// `SchemaProvider::table_names()` / `TableProvider::schema()` at
 /// boot. The columns vector is empty in Phase 1.
 #[must_use]
@@ -576,7 +576,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE.md rule 12 regression guard: a `{:?}` of the publisher
+    /// Hard rule 12 regression guard: a `{:?}` of the publisher
     /// must not print the bearer token ( 1a).
     #[test]
     fn datahub_publisher_debug_redacts_bearer_token() {

@@ -3183,7 +3183,7 @@ async fn build_catalogs_and_cache(
 
     // Build the cache. The closure clones the relevant
     // `CatalogConfig` for each catalog and routes per-name
-    // to `build_one_connector`. CLAUDE.md rule 4 — the cache
+    // to `build_one_connector`. Hard rule 4 — the cache
     // crate doesn't depend on dataglot-server; the closure
     // captures the helper here.
     let owned_cfg: HashMap<String, CatalogConfig> = effective.clone();
@@ -5239,7 +5239,7 @@ mod tests {
             ..ServerConfig::default()
         };
         // `DataglotServer` doesn't implement Debug (and shouldn't
-        // — its internals carry credential bytes per CLAUDE.md
+        // — its internals carry credential bytes per hard
         // rule 12), so `unwrap_err` won't compile. let-else
         // instead.
         let Err(err) = DataglotServer::new(config).await else {

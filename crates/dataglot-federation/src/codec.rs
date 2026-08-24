@@ -2,7 +2,7 @@
 //! Phase 2 prerequisite that unblocks cross-source distributed
 //! execution on Apache Ballista.
 //!
-//! Spec: `docs/phases/phase-2/01-federation-codec-impl.md`
+//! Spec: the phase-2 `federation-codec-impl` plan
 //! (internal phase-plan document).
 //!
 //! # Nodes handled
@@ -284,7 +284,7 @@ impl FederationPlanCodec {
 impl std::fmt::Debug for FederationPlanCodec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Don't dump registry internals — they may carry executor
-        // objects with credential-handle references (CLAUDE.md rule 12).
+        // objects with credential-handle references (hard rule 12).
         f.debug_struct("FederationPlanCodec")
             .field("registry", &"<dyn ConnectorRegistry>")
             .field("logical_codec", &"<dyn LogicalExtensionCodec>")
@@ -320,7 +320,7 @@ impl PhysicalExtensionCodec for FederationPlanCodec {
             // Don't include the executor's name() or
             // compute_context() in error messages — both can
             // encode host/db/user identity for SQL connectors
-            // (CLAUDE.md rule 12: credentials never appear in
+            // (hard rule 12: credentials never appear in
             // logs/errors/plan reprs). CodeRabbit flagged the
             // sibling sites in dataglot-ballista on PR #272.
             let context = virtual_plan.executor().compute_context().ok_or_else(|| {

@@ -1,6 +1,6 @@
 //! Error types for Dataglot.
 //!
-//! Uses `thiserror` for typed errors per CLAUDE.md rule 8.
+//! Uses `thiserror` for typed errors per hard rule 8.
 
 use std::sync::Arc;
 

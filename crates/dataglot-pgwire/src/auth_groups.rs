@@ -5,7 +5,7 @@
 //! discovered during the **async** startup exchange — the JWT is verified and
 //! its `groups` claim read, or the LDAP bind succeeds and the directory is
 //! searched. The sync [`StartupObserver`](crate::StartupObserver) that builds
-//! the session identity runs afterwards and, per CLAUDE.md rule 11, must not
+//! the session identity runs afterwards and, per hard rule 11, must not
 //! block on async IO to re-query the directory.
 //!
 //! So, exactly like [`crate::auth_org`], the resolved groups are bridged

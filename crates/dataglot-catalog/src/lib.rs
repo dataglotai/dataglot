@@ -1,7 +1,7 @@
 //! Peaka Catalog Service — the Phase 1 control plane for
 //! `CatalogBinding` registration.
 //!
-//! Spec: `docs/phases/phase-1/08-catalog-service.md`.
+//! Spec: the phase-1 `catalog-service` plan.
 //!
 //! The service owns the binding map persistently (across server
 //! restarts) and exposes it via a typed in-process API. The
@@ -23,7 +23,7 @@
 //!
 //! # Crate dependency direction
 //!
-//! Extends CLAUDE.md rule 4:
+//! Extends hard rule 4:
 //!
 //! ```text
 //! dataglot-server → dataglot-catalog → dataglot-core

@@ -1,7 +1,7 @@
 //! Connector registry — maps stable connector-name strings to
 //! `Arc<dyn SQLExecutor>` instances.
 //!
-//! Spec: `docs/phases/phase-2/01-federation-codec-impl.md`
+//! Spec: the phase-2 `federation-codec-impl` plan
 //! (internal phase-plan document).
 //!
 //! # Why a registry exists
@@ -283,7 +283,7 @@ impl Default for InMemoryConnectorRegistry {
     }
 }
 
-// Deliberate `missing_fields_in_debug` allow: per CLAUDE.md rule 12,
+// Deliberate `missing_fields_in_debug` allow: per hard rule 12,
 // executor / planner objects can carry references to credential
 // handles and must never appear in `Debug` output. Just expose the
 // registered names. The two parallel maps share keys by construction,
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn debug_redacts_executor_internals() {
         // Connector executors may carry references to credential
-        // handles (CLAUDE.md rule 12). The registry's `Debug` impl
+        // handles (hard rule 12). The registry's `Debug` impl
         // must only print names, never the executor objects.
         let reg = InMemoryConnectorRegistry::from_iter([("pg_demo".to_string(), fake("pg_demo"))]);
         let rendered = format!("{reg:?}");

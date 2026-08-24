@@ -14,7 +14,7 @@
 //! lists every declared materialization from boot, before the first run.
 //!
 //! Only redacted status is stored — product name, target, counts, timings, and
-//! the (already credential-scrubbed) error string (CLAUDE.md rule 12).
+//! the (already credential-scrubbed) error string (hard rule 12).
 
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};

@@ -11,7 +11,7 @@
 //! - [`CredentialHandle`] — an opaque, named reference to a credential.
 //!   Configs hold handles, not raw secrets, so that credentials never
 //!   appear in `Debug`, in plan trees, in logs, or in error chains
-//!   (CLAUDE.md rule 12).
+//!   (hard rule 12).
 //! - [`CredentialResolver`] — the trait every backend (env vars,
 //!   Vault, AWS Secrets Manager, ...) implements. Resolution happens
 //!   at execution time, not at config load.
@@ -172,7 +172,7 @@ pub enum CredentialError {
 ///
 /// All implementations must be `Send + Sync + 'static` so a single
 /// `Arc<dyn CredentialResolver>` can be shared across pgwire sessions
-/// (CLAUDE.md rule 10).
+/// (hard rule 10).
 pub trait CredentialResolver: Send + Sync + 'static {
     /// Look up the credential named by `handle` and return its
     /// resolved payload.
@@ -719,7 +719,7 @@ mod redaction_proptests {
     //! Property: the redacted `Debug` impls on [`Credentials`] and
     //! [`CredentialConfigEntry`] never emit secret material, for *any*
     //! secret value — not just the hand-picked examples in `tests`.
-    //! This is the proptest backstop for CLAUDE.md rule 12 ("credentials
+    //! This is the proptest backstop for hard rule 12 ("credentials
     //! never appear in logs, error messages, or plan representations").
     //!
     //! Generated-secret hygiene: secret bodies are 12+ char lowercase

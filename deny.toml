@@ -85,7 +85,7 @@ allow-git = [
   # dataglot-federation/Cargo.toml. The fork carries a 3-line `arrow` 57→58
   # bump so the crate aligns with our workspace; retires the moment upstream
   # ships its own arrow-58 release. See
-  # docs/phases/phase-1/05-snowflake-connector.md.
+  # the phase-1 `snowflake-connector` plan.
   "https://github.com/peakacom/snowflake-rs",
   # tpchgen-rs (Phase 2 task 03 baseline harness). Crates.io's latest 2.0.2
   # release (Dec 2025) targets arrow 57; upstream PR #246 bumped `main` to

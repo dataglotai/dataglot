@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep the production runtime Rust-only (CLAUDE.md rule 15).
+"""Keep the production runtime Rust-only (hard rule 15).
 
 The engine, connectors, catalog service, and EL pipeline are Rust. This
 guard fails when a **production crate** gains a **direct** non-Rust /
@@ -224,7 +224,7 @@ def main() -> int:
                     offenders.append(f"  {crate}: `{real}` ({table})")
 
     if offenders:
-        print("Non-Rust dependency in a production crate (CLAUDE.md rule 15):\n")
+        print("Non-Rust dependency in a production crate (hard rule 15):\n")
         print("\n".join(sorted(set(offenders))))
         print(
             "\nThe production runtime is Rust-only. If this dependency is "

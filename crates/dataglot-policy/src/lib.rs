@@ -7,7 +7,7 @@
 //! [`NoopPolicyEnforcer`] (identity rewrite) so the integration point
 //! is exercised end-to-end without changing query results.
 //!
-//! Per CLAUDE.md rule 6 every policy lands as a planning-time
+//! Per hard rule 6 every policy lands as a planning-time
 //! `LogicalPlan` rewrite — not a UDF, not runtime SQL rewriting. The
 //! adapter satisfies that by registering as an optimizer rule.
 //!
@@ -199,7 +199,7 @@ pub fn policy_version() -> &'static str {
 ///   startup-params extractor when that PR lands.
 ///
 /// `Identity` is intentionally a leaf data struct (no
-/// credentials, no tokens, no opaque handles). Per CLAUDE.md
+/// credentials, no tokens, no opaque handles). Per hard
 /// rule 12 credentials never appear in logs / error messages /
 /// plan representations; the identity surfaces by name only.
 /// Authentication of the claimed identity is the pgwire layer's

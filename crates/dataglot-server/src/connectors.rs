@@ -25,7 +25,7 @@
 //! `dsn_env` / catalog-service / TLS resolution stays identical with no
 //! duplicated connection logic. Credentials never leave this module: only
 //! `{name, kind, registered/live, latency, redacted-error}` is serialized
-//! (CLAUDE.md rule 12).
+//! (hard rule 12).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};

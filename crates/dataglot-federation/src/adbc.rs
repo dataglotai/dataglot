@@ -1,5 +1,5 @@
 //! Generic ADBC connector — BYO-driver federation for breadth-tail sources
-//! (, spec at `docs/phases/phase-3/02-adbc-connector.md`).
+//! (, spec: the phase-3 `adbc-connector` plan).
 //!
 //! The operator supplies the path to an ADBC driver shared library
 //! (`.so` / `.dylib` / `.dll`) plus connection parameters, and Dataglot
@@ -23,14 +23,14 @@
 //!   `sslmode=require`). This connector does not programmatically
 //!   enforce TLS — the user owns the BYO driver's security posture.
 //! - **Credentials stay out of logs, errors, and `Debug` output**
-//!   (CLAUDE.md rule 12). The password is resolved from the environment
+//!   (hard rule 12). The password is resolved from the environment
 //!   at connect time, handed straight to the driver's option map, and
 //!   never stored on the connector.
 //!
 //! # Threading
 //!
 //! Every ADBC call is synchronous FFI, so all driver interaction runs
-//! under [`tokio::task::spawn_blocking`] (CLAUDE.md rule 11). ADBC's
+//! under [`tokio::task::spawn_blocking`] (hard rule 11). ADBC's
 //! `ManagedConnection` serializes its own calls internally but a busy
 //! connection blocks its caller, hence the thin pool
 //! (`connection_pool_size`, default 4). FFI object teardown can block
@@ -771,7 +771,7 @@ impl AdbcConnector {
 
     /// Produce a federation [`TableProvider`] for `<schema>.<table>`
     /// with full pushdown through the ADBC driver. The Arrow schema is
-    /// resolved from the driver on this call — lazy per CLAUDE.md rule
+    /// resolved from the driver on this call — lazy per hard rule
     /// 13, nothing is fetched at [`AdbcConnector::connect`] time.
     ///
     /// # Errors

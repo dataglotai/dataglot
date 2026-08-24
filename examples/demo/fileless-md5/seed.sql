@@ -1,6 +1,8 @@
 -- Seed the whole control plane over SQL — nothing lives in the config file.
 -- Run as the bootstrap `admin` against the `dataglot` bootstrap database.
--- Requires `make demo-sources` (postgres :5433, postgres-orders :5434, mysql :3306).
+-- Expects demo sources on postgres :5433, postgres-orders :5434, mysql :3306
+-- (`make demo-sources` in the private dev repo brings these up; any
+-- Postgres/MySQL you already run works too — adjust the DSNs below).
 
 -- Encrypted source credentials (need DATAGLOT_SECRET_KEY):
 CREATE SECRET pg_dsn     AS 'host=127.0.0.1 port=5433 user=postgres password=postgres dbname=demo';

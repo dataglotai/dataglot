@@ -14,7 +14,7 @@
 //!
 //! # Semantics
 //!
-//! Per CLAUDE.md hard rule 6, row filters are `DataFusion` `Expr`
+//! Per hard rule 6, row filters are `DataFusion` `Expr`
 //! predicates baked into the plan. *No* UDFs, *no* runtime SQL
 //! rewriting. The predicate evaluates against the row values that
 //! reach the `TableScan` — meaning predicates registered as a row

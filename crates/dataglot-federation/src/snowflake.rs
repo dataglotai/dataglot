@@ -46,7 +46,7 @@
 //! GeoJSON/WKB decision) that need more than a straight mapping —
 //! tracked in.
 //!
-//! # CLAUDE.md compliance
+//! # Hard-rule compliance
 //!
 //! * Rule 1 — data flows as Arrow `RecordBatch` end-to-end. Snowflake
 //!   returns Arrow IPC; we forward those batches unchanged.
@@ -142,7 +142,7 @@ pub struct SnowflakeConfig {
 }
 
 impl fmt::Debug for SnowflakeConfig {
-    /// Credential-safe `Debug` impl per CLAUDE.md rule 12. Emits
+    /// Credential-safe `Debug` impl per hard rule 12. Emits
     /// operational targeting fields (account / warehouse / database /
     /// schema) so operators can diagnose "which catalog is this?",
     /// but redacts every auth-adjacent field (`user`, `role`,
@@ -227,7 +227,7 @@ impl SnowflakeConnector {
     /// Construct a connector for the given config. The `SnowflakeApi`
     /// client is built offline — Snowflake's auth handshake fires on
     /// the first query, not at construction time. This matches
-    /// CLAUDE.md rule 13 (lazy schema resolution) and gives us the
+    /// hard rule 13 (lazy schema resolution) and gives us the
     /// same "construction is cheap, first query is where errors
     /// surface" shape the other connectors have.
     ///
@@ -237,7 +237,7 @@ impl SnowflakeConnector {
     /// `snowflake-api`'s constructor).
     pub fn connect(name: impl Into<String>, cfg: SnowflakeConfig) -> DataglotResult<Self> {
         let name = name.into();
-        // CLAUDE.md rule 12: never emit auth-adjacent identifiers
+        // hard rule 12: never emit auth-adjacent identifiers
         // (user, role) at any log level. The non-auth targeting
         // fields tell operators which catalog the line refers to;
         // user/role live inside the opaque `SnowflakeApi` client.
@@ -301,7 +301,7 @@ impl SnowflakeConnector {
             schema_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             // `cfg.user` / `cfg.role` are intentionally dropped at
             // this point — they live inside the `client`'s session
-            // state and are never copied out (CLAUDE.md rule 12).
+            // state and are never copied out (hard rule 12).
         })
     }
 
@@ -594,7 +594,7 @@ impl SnowflakeConnector {
 }
 
 impl fmt::Debug for SnowflakeConnector {
-    /// Credential-safe `Debug` per CLAUDE.md rule 12. Emits
+    /// Credential-safe `Debug` per hard rule 12. Emits
     /// non-auth targeting fields (name / account / warehouse /
     /// database / `default_schema`) so operators can identify which
     /// connector instance a log line refers to. Auth-adjacent
@@ -1511,7 +1511,7 @@ mod tests {
 
     #[test]
     fn config_debug_redacts_credentials() {
-        // Pin CLAUDE.md rule 12: passwords AND auth-adjacent
+        // Pin hard rule 12: passwords AND auth-adjacent
         // identifiers (user, role) never appear in `Debug` output.
         // Service-account usernames and role names can leak
         // organisation structure to log readers, so we treat them
@@ -1555,7 +1555,7 @@ mod tests {
         assert!(!dbg.contains("super-secret"), "password leaked: {dbg}");
         assert!(!dbg.contains("client"), "client field exposed: {dbg}");
         // user + role are redacted alongside the password — same
-        // CLAUDE.md rule 12 reasoning as the config Debug test.
+        // hard rule 12 reasoning as the config Debug test.
         assert!(!dbg.contains("DATAGLOT_SVC"), "user leaked: {dbg}");
         assert!(!dbg.contains("READER"), "role leaked: {dbg}");
         // Operational identifiers visible for diagnostics.

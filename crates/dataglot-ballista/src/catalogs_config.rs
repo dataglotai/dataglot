@@ -6,7 +6,7 @@
 //! The coordinator (`dataglot-server`) reads catalogs from
 //! `ServerConfig::catalogs` (TOML, structured by source type).
 //! `dataglot-ballista` cannot import `ServerConfig` without breaking
-//! the dependency direction in CLAUDE.md rule 4 (sibling crates,
+//! the dependency direction in hard rule 4 (sibling crates,
 //! coordinator depends on `dataglot-ballista`, not the other way
 //! around). For slice 5a.2 we ship a **parallel** JSON-on-disk shape
 //! defined in this module — operators maintain a `catalogs.json` for
@@ -37,7 +37,7 @@
 //!
 //! Exactly one of `dsn` (literal) or `dsn_env` (environment variable
 //! name) must be set per Postgres entry — mirrors
-//! `PostgresCatalogConfig` on the server side. CLAUDE.md rule 12
+//! `PostgresCatalogConfig` on the server side. Hard rule 12
 //! discourages literal DSNs on disk; `dsn_env` is the production
 //! shape.
 //!
@@ -424,7 +424,7 @@ impl std::fmt::Debug for CatalogEntry {
 /// registry from it.
 ///
 /// Surfaces at executor boot via the fail-fast path — the same
-/// CLAUDE.md rule 12 redaction principle applies: error variants
+/// hard rule 12 redaction principle applies: error variants
 /// carry the offending catalog *name* (and env-var *name*) but
 /// never the DSN payload.
 #[derive(Debug, Error)]
@@ -1125,7 +1125,7 @@ mod tests {
     }
 
     /// Defensive: `CatalogEntry::Debug` must redact the DSN. This
-    /// is the second mass-redaction surface (CLAUDE.md rule 12) —
+    /// is the second mass-redaction surface (hard rule 12) —
     /// the first lives on `CredentialConfigEntry`.
     #[test]
     fn entry_debug_redacts_dsn() {

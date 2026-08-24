@@ -18,12 +18,12 @@
 //! - **Slices 3 – 8** — credentials per-worker, split-level parallelism,
 //!   object-store `ETag` scheduler HA, governance parity, mTLS, and the
 //!   four-worker exit-criterion benchmark. See
-//!   `docs/phases/phase-2/02-ballista-distributed-execution.md`.
+//!   the phase-2 `ballista-distributed-execution` plan.
 //!
 //! Slice 2 (this drop) ships the [`BallistaContextFactory`] —
 //! the sibling of `dataglot-core::SessionContextFactory` that
 //! single-node code paths consume. See the type doc and
-//! `docs/phases/phase-2/02-ballista-distributed-execution.md`
+//! the phase-2 `ballista-distributed-execution` plan
 //! slice 2 for the design rationale.
 
 #![forbid(unsafe_code)]
@@ -62,6 +62,6 @@ pub use tls::{install_default_crypto_provider, BallistaTlsConfig, TlsArgs, TlsCo
 // wrap target for `FederationPlanCodec::with_inner_physical_codec`.
 // Re-exported here so `dataglot-server`'s ballista wiring doesn't
 // have to take a direct `ballista-core` dep just to construct the
-// default wrapper (CLAUDE.md rule 4: every cross-crate touchpoint
+// default wrapper (hard rule 4: every cross-crate touchpoint
 // goes through a known re-export, not a transitive symbol).
 pub use ballista_core::serde::BallistaPhysicalExtensionCodec;

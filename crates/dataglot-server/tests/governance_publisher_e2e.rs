@@ -1,6 +1,6 @@
 //! Phase 1 · §11 Interface #2 slice 3 end-to-end test.
 //!
-//! Spec: `docs/phases/phase-1/10-data-product-registration.md`.
+//! Spec: the phase-1 `data-product-registration` plan.
 //!
 //! What this test pins beyond the per-slice unit tests:
 //!

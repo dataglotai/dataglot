@@ -5,7 +5,7 @@
 //!
 //! This is the connector authenticating to its *source* (not the enterprise
 //! ingress auth of ). The secret is resolved from config by the caller
-//! (env indirection), and never logged (CLAUDE.md rule 12).
+//! (env indirection), and never logged (hard rule 12).
 
 use std::fmt;
 use std::time::{Duration, Instant};

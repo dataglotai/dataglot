@@ -1,7 +1,7 @@
 //! Oracle data-source connector — bespoke `SQLExecutor`.
 //!
 //! Federates an Oracle database (the Exadata-displacement read path).
-//! Spec: `docs/phases/phase-3/04-oracle-federation-connector.md`;
+//! Spec: the phase-3 `oracle-federation-connector` plan;
 //! dual-backend plan:.
 //!
 //! [`OracleConnector`] owns the shared Oracle-SQL surface (dialect,
@@ -12,7 +12,7 @@
 //! trait.
 //!
 //! The OCI backend's `oracle` crate (ODPI-C) is **synchronous**, so every
-//! database call runs under `tokio::task::spawn_blocking` (CLAUDE.md
+//! database call runs under `tokio::task::spawn_blocking` (hard
 //! rule 11) and the `oracle::Connection` is held in an `Arc<Mutex<…>>` and
 //! serialized. Schemas resolve lazily on first table access (rule 13).
 //! Credentials never appear in logs, errors, or `Debug` output (rule 12).

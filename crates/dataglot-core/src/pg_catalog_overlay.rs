@@ -60,7 +60,7 @@
 //! `EmptyContextProvider` (no role membership / privilege model)
 //! today. Identity-aware `pg_roles` / `has_table_privilege` is
 //! deferred to a follow-up; see the "Open questions" section of
-//! `docs/phases/phase-3/06-pg-catalog-compatibility.md`.
+//! the phase-3 `pg-catalog-compatibility` plan.
 //!
 //! [`SessionContextFactory::create_federated_context`]: crate::session::SessionContextFactory::create_federated_context
 //! [`MemoryCatalogProvider`]: datafusion::catalog::MemoryCatalogProvider
@@ -1599,7 +1599,7 @@ mod tests {
 
     ///  — T6 from the spec's test inventory.
     ///
-    /// CLAUDE.md rule 13: schema inference is lazy. Wrapping a
+    /// Hard rule 13: schema inference is lazy. Wrapping a
     /// federated `CatalogProvider` with `PgCatalogOverlayProvider`
     /// MUST NOT call into the wrapped provider's schema lookup
     /// machinery just to enumerate `schema_names()` — wrapping is a

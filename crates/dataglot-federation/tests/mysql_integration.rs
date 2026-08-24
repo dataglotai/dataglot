@@ -6,7 +6,7 @@
 //! so the codepath can't drift.
 //!
 //! Scope of these tests (per the Phase 1 `MySQL` connector spec at
-//! `docs/phases/phase-1/03-mysql-federation-connector.md`):
+//! the phase-1 `mysql-federation-connector` plan):
 //!
 //! 1. End-to-end: create a `MysqlConnector`, register the table with
 //!    a `DataFusion` `SessionContext`, and run a `SELECT` with a
@@ -15,10 +15,10 @@
 //!    and for pushdown (the `EXPLAIN` output must show the predicate
 //!    inside a `datafusion-federation` virtual exec node, with the
 //!    `MySQL` dialect emitting backtick-quoted identifiers).
-//! 3. Lazy schema resolution (CLAUDE.md rule 13): `connect` does not
+//! 3. Lazy schema resolution (hard rule 13): `connect` does not
 //!    fetch any table schemas; first access happens on
 //!    `table_provider`.
-//! 4. Credential redaction (CLAUDE.md rule 12): `Debug` output never
+//! 4. Credential redaction (hard rule 12): `Debug` output never
 //!    surfaces a password component from the DSN.
 
 #![cfg(feature = "mysql")]
@@ -96,7 +96,7 @@ async fn federated_select_with_pushdown() {
     let (dsn, _container) = setup_users_table().await;
 
     // Build the connector and resolve a TableProvider for `users`.
-    // Per CLAUDE.md rule 13 the schema is fetched here (first
+    // Per hard rule 13 the schema is fetched here (first
     // access), not at connector construction time. The MySQL
     // module's default DB is `test`, so we look the table up
     // there.
@@ -184,7 +184,7 @@ async fn federated_select_with_pushdown() {
     );
 }
 
-/// Lazy schema resolution (CLAUDE.md rule 13): constructing a
+/// Lazy schema resolution (hard rule 13): constructing a
 /// connector must not fetch any table schemas. We verify this by
 /// connecting to a database that has no user tables yet and
 /// asserting `connect` still succeeds — then asserting that
@@ -221,7 +221,7 @@ async fn connector_does_not_prefetch_schemas() {
     );
 }
 
-// `Debug` redaction (CLAUDE.md rule 12) is exercised by the unit
+// `Debug` redaction (hard rule 12) is exercised by the unit
 // test `mysql::tests::dsn_redacted_in_debug` in `src/mysql.rs`,
 // which exercises the `redacted_dsn` helper directly. We don't
 // repeat it here under the Docker gate because the MySQL

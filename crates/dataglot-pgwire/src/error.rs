@@ -1,6 +1,6 @@
 //! Error types for the pg wire protocol layer.
 //!
-//! Uses `thiserror` for typed errors per CLAUDE.md rule 8.
+//! Uses `thiserror` for typed errors per hard rule 8.
 
 use thiserror::Error;
 

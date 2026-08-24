@@ -9,7 +9,7 @@ description = "Federation layer — FederatedTableProvider and SQL pushdown"
 
 [features]
 default = []
-# Generic ADBC connector (, spec at docs/phases/phase-3/02-adbc-connector.md).
+# Generic ADBC connector (, spec: the phase-3 `adbc-connector` plan).
 # BYO-driver: the operator supplies the path to an ADBC driver shared library
 # (`.so` / `.dylib` / `.dll`) plus a mandatory `dialect` from the strict
 # whitelist of DataFusion-shipped unparser dialects. The `adbc_core` +
@@ -60,7 +60,7 @@ odata = ["dep:quick-xml", "dep:serde_json", "dep:reqwest"]
 rest = ["dep:serde_json", "dep:reqwest"]
 # Lakehouse warehouse table format support (Apache Iceberg under the hood).
 #
-# Per CLAUDE.md rule 7 the user-facing surface never says "Iceberg".
+# Per hard rule 7 the user-facing surface never says "Iceberg".
 # Internally we depend on iceberg-rust (`iceberg`, `iceberg-catalog-rest`,
 # `iceberg-datafusion`, `iceberg-storage-opendal`) pinned to a specific
 # commit on `apache/iceberg-rust` main. The published crate releases up
@@ -81,7 +81,7 @@ iceberg = [
 # in (via the Peaka arrow-58 fork of `andrusha/snowflake-rs`) so
 # downstream consumers can opt in early, but no `SQLExecutor`
 # implementation lands until the Phase 2 federation-breadth
-# follow-up to `docs/phases/phase-1/05-snowflake-connector.md`.
+# follow-up to the phase-1 `snowflake-connector` plan.
 snowflake = ["dep:snowflake-api"]
 # Oracle data source connector (, bespoke — Exadata displacement).
 # Pulls the `oracle` crate (kubo/rust-oracle, an ODPI-C wrapper). NOTE:
@@ -131,7 +131,7 @@ datafusion-federation = { workspace = true, features = ["sql"] }
 # Used by `codec::FederationPlanCodec` to serialise the inner
 # `LogicalPlan` of a `VirtualExecutionPlan` across the Ballista
 # wire format. Phase 2 prerequisite — see
-# `docs/phases/phase-2/01-federation-codec-impl.md`. Version
+# the phase-2 `federation-codec-impl` plan. Version
 # tracks `datafusion` (both crates must share the same proto
 # schema).
 datafusion-proto.workspace = true
@@ -180,7 +180,7 @@ mysql_async = { workspace = true, features = [
 # `oracle` (kubo/rust-oracle) — the Oracle wire client for the `oracle`
 # connector. Wraps ODPI-C (compiles at build with a C compiler);
 # dlopen's Oracle Instant Client at runtime. Synchronous API — every call
-# runs under `tokio::task::spawn_blocking` (CLAUDE.md rule 11).
+# runs under `tokio::task::spawn_blocking` (hard rule 11).
 oracle = { workspace = true, optional = true }
 # `oracle-rs` (stiang/oracle-rs) — pure-Rust Oracle wire client for the
 # `oracle-pure` backend. Reimplements TTC/TNS in Rust: no ODPI-C,
@@ -216,7 +216,7 @@ reqwest = { workspace = true, optional = true, features = ["query", "http2"] }
 # (would force `datafusion 53 → 52` and `datafusion-federation 0.5 →
 # 0.4`, losing ~4 months of upstream feature work). The fork retires
 # the moment upstream ships its own arrow-58 release. See
-# `docs/phases/phase-1/05-snowflake-connector.md` § "Implementation
+# the phase-1 `snowflake-connector` plan § "Implementation
 # prerequisite — `snowflake-rs` fork".
 #
 # Pinning by `rev` (not `branch`) so `cargo update` cannot move us to

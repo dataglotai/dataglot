@@ -59,7 +59,7 @@ pub(crate) const MAX_PAGES: usize = 16;
 /// How the connector authenticates to the OData service.
 ///
 /// `Debug` is hand-written to never render the password or bearer token
-/// (CLAUDE.md rule 12).
+/// (hard rule 12).
 #[derive(Clone)]
 pub enum OdataAuth {
     /// HTTP Basic auth. The password is resolved from config by the caller

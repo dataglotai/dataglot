@@ -5,8 +5,8 @@
 //! rewrites a `LogicalPlan` so every matching column reference inside
 //! a `Projection` returns the registered mask `Expr` instead of the
 //! original column. Predicates, joins, sorts, and aggregates see the
-//! original column values — see [option A in spec
-//! 01](../../../../docs/phases/phase-1/01-column-masking-mvp.md) for
+//! original column values — see option A in the phase-1
+//! `column-masking-mvp` plan for
 //! the design rationale (industry-standard semantics: Snowflake /
 //! `BigQuery` / Databricks DYNAMIC DATA MASKING).
 //!

@@ -1,7 +1,7 @@
 //! [`EmbeddedMetaStore`] — the pure-Rust, zero-external-dependency
-//! [`MetaStore`] backend (CLAUDE.md rule 15 clean; no C, no Postgres).
+//! [`MetaStore`] backend (hard rule 15 clean; no C, no Postgres).
 //!
-//! Spec: `docs/phases/phase-6/01-sql-native-runtime-config.md` (slice A).
+//! Spec: the phase-6 `sql-native-runtime-config` plan (slice A).
 //!
 //! State lives in memory behind a `tokio::sync::Mutex`; every mutation is
 //! flushed to a single JSON file with a **write-temp-then-rename** so a

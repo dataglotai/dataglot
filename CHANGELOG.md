@@ -4,8 +4,8 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project is pre-1.0, so minor versions may contain breaking changes.
 Release history before this file existed is reconstructed from the
-annotated git tags (`git show v0.1.0`, `git show v0.3.0`) and the phase
-closure records under `docs/phases/`.
+annotated git tags (`git show v0.1.0`, `git show v0.3.0`) and the
+maintainers' phase-closure records.
 
 ## [Unreleased]
 
@@ -96,7 +96,7 @@ documentation set and this changelog/release pipeline itself.
   with optimistic concurrency and bounded-memory streaming writes.
 - Inbound governance webhook hardening and `pg_catalog` compatibility
   (psql/JDBC introspection, catalog-scoped `\dt`/`\dn`).
-- External-contributor documentation: SETUP.md, QUICKSTART, SECURITY.md,
+- External-contributor documentation: setup guide, QUICKSTART, SECURITY.md,
   `docs/configuration.md` reference, README docs map.
 
 ## [0.3.0] — 2026-06-02

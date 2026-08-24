@@ -42,6 +42,53 @@ modifications across crates:
 
 This keeps reviews focused and avoids merge conflicts.
 
+## Architecture hard rules
+
+Code comments throughout the workspace cite these as "hard rule N".
+They are constraints, not guidelines — reviewers enforce them on every
+PR:
+
+1. **Arrow everywhere.** All data flows as Arrow `RecordBatch`; no
+   row-based conversion inside the engine. The only serialization
+   boundary is pg wire egress.
+2. **No custom engine internals.** Use DataFusion's `TableProvider`,
+   `OptimizerRule`, and `ExecutionPlan` traits — never reimplement
+   parsing, planning, or optimization.
+3. **Trait abstractions at every boundary.** SQL sources implement
+   `datafusion-federation`'s `SQLExecutor`; non-SQL sources implement
+   `TableProvider` directly. No parallel copies of traits DataFusion
+   already provides.
+4. **Strict crate dependency direction.** `dataglot-server` →
+   `dataglot-pgwire` / `dataglot-federation` / `dataglot-policy` →
+   `dataglot-core`. `dataglot-core` depends on nothing internal; no
+   cycles, no lateral deps between the middle crates.
+5. **Single-crate scope per change.** Cross-crate changes are split
+   into stacked PRs (see "Crate boundaries" above).
+6. **Policy enforcement at planning time.** Column masks and row
+   filters are DataFusion `Expr` predicates baked into the plan — no
+   UDFs, no runtime SQL rewriting.
+7. **Iceberg is invisible to users.** No user-facing API, schema, or
+   error message references Iceberg concepts.
+8. **Typed errors.** Library crates use `thiserror`; only
+   `dataglot-server` may use `anyhow` at the boundary.
+9. **Feature flags over crate proliferation.** New connectors are
+   feature flags on `dataglot-federation`, not new crates.
+10. **Async-first traits.** Traits returning data are async and
+    `Send + Sync + 'static`.
+11. **No blocking IO in async context.** Use
+    `tokio::task::spawn_blocking` for blocking or CPU-bound work.
+12. **Credential isolation.** Credentials never appear in logs, error
+    messages, or plan representations — opaque handles, resolved at
+    execution time.
+13. **Schema inference is lazy.** No eager schema fetches from remote
+    sources; resolve on first query or explicit `DESCRIBE`.
+14. **Test coverage for public APIs.** Every public function, trait
+    impl, and config option has at least one test.
+15. **Rust-only production runtime.** No JVM, Python, or C/C++
+    dependency in a production crate except the documented,
+    feature-gated exceptions — see
+    [docs/native-dependency-policy.md](docs/native-dependency-policy.md).
+
 ## AI-authored PRs
 
 PRs created by Claude Code (from Slack or VS Code) follow the same rules:

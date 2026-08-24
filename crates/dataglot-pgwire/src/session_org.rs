@@ -11,7 +11,7 @@
 //! DDL, so a `CREATE CATALOG` persists under the *issuing connection's* org.
 //!
 //! Why a task-local here rather than reading
-//! `dataglot_policy::current_session_identity()` directly: CLAUDE.md rule 4
+//! `dataglot_policy::current_session_identity()` directly: Hard rule 4
 //! forbids a lateral `dataglot-pgwire -> dataglot-policy` dependency. The org
 //! is a plain `String` (a tenant name, never a credential — rule 12), so the
 //! server mirrors the resolved identity's `org` into this pgwire-owned

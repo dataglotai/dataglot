@@ -1,7 +1,7 @@
 //! Phase 0.5 · Task 03 — full e2e for the pgwire → `MetricsObserver` → /metrics
 //! chain.
 //!
-//! Spec: `docs/phases/phase-0.5/03-pgwire-query-observer-hook.md`.
+//! Spec: the phase-0.5 `pgwire-query-observer-hook` plan.
 //!
 //! What's tested here that the other tests don't cover individually:
 //!

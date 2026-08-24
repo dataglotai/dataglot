@@ -45,9 +45,9 @@
 //! Arrow type the mapper rejected would still hit the
 //! [`DataFusionError::NotImplemented`] branch in `decode_column`,
 //! kept as a defense-in-depth. See
-//! `docs/phases/phase-1/03-mysql-federation-connector.md`.
+//! the phase-1 `mysql-federation-connector` plan.
 //!
-//! # CLAUDE.md compliance
+//! # Hard-rule compliance
 //!
 //! * Rule 1 — data flows as Arrow `RecordBatch` end-to-end; rows are
 //!   decoded into Arrow arrays inside the `SQLExecutor::execute` impl
@@ -170,7 +170,7 @@ fn apply_resilience_defaults(opts: Opts) -> Opts {
 }
 
 impl MysqlConnector {
-    // MULTI-TENANT NOTE (; spec at docs/phases/phase-3/02-adbc-connector.md).
+    // MULTI-TENANT NOTE (; spec: the phase-3 `adbc-connector` plan).
     // The single shared `Arc<Mutex<Conn>>` held by this connector has no
     // per-user isolation; the same physical connection serves every pgwire
     // session on this catalog (serialized through the mutex). Safe today only
@@ -282,7 +282,7 @@ impl MysqlConnector {
     /// `datafusion-federation`.
     ///
     /// The schema is fetched on demand by querying
-    /// `information_schema.columns`. This satisfies CLAUDE.md rule
+    /// `information_schema.columns`. This satisfies hard rule
     /// 13 (lazy schema resolution) — no remote query is issued
     /// until the caller actually asks for a table.
     ///
@@ -481,7 +481,7 @@ impl MysqlConnector {
 }
 
 impl fmt::Debug for MysqlConnector {
-    /// Credential-safe `Debug` impl (CLAUDE.md rule 12). Emits host,
+    /// Credential-safe `Debug` impl (hard rule 12). Emits host,
     /// port, user, and database name — never password. The `conn`
     /// field is intentionally omitted (`finish_non_exhaustive`).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -758,7 +758,7 @@ fn decode_column(
         // separate PR.
         other => Err(DataFusionError::NotImplemented(format!(
             "MySQL type {col_type:?} (arrow target {other:?}) not yet supported by \
-             dataglot-federation; see docs/phases/phase-1/03-mysql-federation-connector.md"
+             dataglot-federation"
         ))),
     }
 }
@@ -1286,7 +1286,7 @@ fn decode_err<E: std::fmt::Display>(e: E) -> DataFusionError {
     ))))
 }
 
-// MULTI-TENANT NOTE (; spec at docs/phases/phase-3/02-adbc-connector.md).
+// MULTI-TENANT NOTE (; spec: the phase-3 `adbc-connector` plan).
 // `execute` below sends user-driven SQL on the single `Arc<Mutex<Conn>>`
 // shared across all pgwire sessions. Safe today because the federation
 // unparser only emits read-only `SELECT` statements. If you add pre/post
@@ -1431,7 +1431,7 @@ fn split_qualified(s: &str) -> Option<(String, String)> {
 /// at construction time — drop and rebuild the catalog to pick up
 /// DDL, mirroring the Postgres connector's behavior.
 ///
-/// Per CLAUDE.md rule 12, `Debug` does not surface anything from the
+/// Per hard rule 12, `Debug` does not surface anything from the
 /// underlying [`MysqlConnector`] other than its name.
 ///
 /// [`CatalogProvider`]: datafusion::catalog::CatalogProvider
@@ -1537,7 +1537,7 @@ mod tests {
         assert_impl::<MysqlConnector>();
     }
 
-    /// CLAUDE.md rule 12 — the literal DSN, including the password,
+    /// Hard rule 12 — the literal DSN, including the password,
     /// must never appear in the connector's `Debug` output.
     ///
     /// We don't actually open a connection here (no `MySQL` server is
@@ -1844,7 +1844,7 @@ mod tests {
         assert!(validate_identifier_literal("evil\\path").is_err());
     }
 
-    /// `MysqlConnector` must be `Send + Sync + 'static` (CLAUDE.md
+    /// `MysqlConnector` must be `Send + Sync + 'static` (hard
     /// rule 10). The compile-time assertion below catches any
     /// regression where a future field breaks one of those bounds.
     #[test]

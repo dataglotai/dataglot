@@ -75,7 +75,7 @@ use crate::codec::FederationLogicalCodec;
 /// migration) call `config.get_extension::<CredentialResolverExtension>()`
 /// then pull the inner `Arc<dyn CredentialResolver>`.
 ///
-/// `Debug` redacts to a presence marker per CLAUDE.md rule 12.
+/// `Debug` redacts to a presence marker per hard rule 12.
 #[derive(Clone)]
 pub struct CredentialResolverExtension(pub Arc<dyn CredentialResolver>);
 
@@ -848,7 +848,7 @@ ZVL5JFvWhG7ND6ny5tDh8X8Khv5wG7JLqTfL3rZW1eOk/uTGiqYf28Zl
         assert!(!args.tls.insecure);
     }
 
-    /// CLAUDE.md rule 12 — the `CredentialResolverExtension` `Debug` impl is
+    /// Hard rule 12 — the `CredentialResolverExtension` `Debug` impl is
     /// the enforcement point that keeps a resolver's secrets out of logs /
     /// plan reprs. Pin that it renders only the presence marker and never
     /// delegates to the inner resolver (which would risk leaking entries).

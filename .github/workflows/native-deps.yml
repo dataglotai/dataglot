@@ -1,6 +1,6 @@
 name: Native Dependency Hygiene
 
-# Keeps the production runtime Rust-only (CLAUDE.md rule 15). Fails when a
+# Keeps the production runtime Rust-only (hard rule 15). Fails when a
 # production crate (any crate without `publish = false`) gains a direct
 # non-Rust / native dependency — JVM (`jni`/`j4rs`), Python (`pyo3`), or
 # C/C++ (`*-sys`, native build tools, bundled-native crates) — that isn't

@@ -8,7 +8,7 @@
 //! These tests pin the Phase 1 "Federation breadth" claim that
 //! cross-source queries actually work — not just single-source
 //! pushdown. Per the spec at
-//! `docs/phases/phase-1/03-mysql-federation-connector.md`, the
+//! the phase-1 `mysql-federation-connector` plan, the
 //! join itself executes inside `DataFusion` (each side's filter /
 //! projection / limit pushes down to its source via the
 //! datafusion-federation unparser; the join is a `HashJoin` /

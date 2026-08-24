@@ -10,7 +10,7 @@
 //!
 //! # Why an endpoint (not a pgwire `EXPLAIN POLICY` statement)
 //!
-//! CLAUDE.md rule 4 forbids `dataglot-pgwire` depending on
+//! Hard rule 4 forbids `dataglot-pgwire` depending on
 //! `dataglot-policy` (no lateral deps), so a native `EXPLAIN POLICY`
 //! statement can't reach the enforcer from the wire handler. The endpoint
 //! lives in `dataglot-server`, which already owns both the `SessionContext`

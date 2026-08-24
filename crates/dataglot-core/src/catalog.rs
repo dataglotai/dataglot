@@ -11,7 +11,7 @@
 //! policy, and lineage event subtype.
 //!
 //! Architecture Decisions v3.0 §09. Spec:
-//! `docs/phases/phase-1/07-catalog-binding-enum.md`.
+//! the phase-1 `catalog-binding-enum` plan.
 //!
 //! # Informational-only in Phase 1
 //!
@@ -22,7 +22,7 @@
 //!
 //! # Credential isolation
 //!
-//! Per CLAUDE.md rule 12, bindings never carry credentials.
+//! Per hard rule 12, bindings never carry credentials.
 //! `LiveConnectorBinding::endpoint_hint` is what an operator can
 //! copy out of the catalog-service UI — a `host:port` or
 //! `s3://bucket/...` string — with passwords / access keys /
@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 pub enum CatalogBinding {
     /// Iceberg lakehouse table — materialized in the
     /// warehouse, served via `iceberg-datafusion`'s catalog
-    /// providers. Per CLAUDE.md rule 7, "Iceberg" never
+    /// providers. Per hard rule 7, "Iceberg" never
     /// surfaces in user-facing error messages or API
     /// responses; this variant is for internal classification
     /// (cache invalidation, lineage event subtype) only.
@@ -67,8 +67,8 @@ pub enum CatalogBinding {
 /// Binding for an Iceberg-cached catalog.
 ///
 /// `catalog_url` identifies the Iceberg REST catalog
-/// (Lakekeeper in Peaka deployments — never Polaris, see
-/// CLAUDE.md "What NOT to do"). `warehouse` is the catalog's
+/// (Lakekeeper in Peaka deployments — never Polaris, per the
+/// project's "What NOT to do" rules). `warehouse` is the catalog's
 /// warehouse name; `table_path` is the dotted reference
 /// inside the warehouse, populated lazily — empty at boot,
 /// filled per scan if the operator-facing catalog UI ever
