@@ -7,7 +7,7 @@
 //! latency histograms, or emitting `OpenLineage` `START`/`COMPLETE`
 //! event pairs (see `dataglot-server::lineage::LineageObserver`).
 //!
-//! Per hard rule 5 the dataglot-server metric types do not leak
+//! Per hard rule 4 the dataglot-server metric types do not leak
 //! into this crate; the observer is a Send+Sync trait object that
 //! pg wire calls without knowing what it does on the other side.
 //!

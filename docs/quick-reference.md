@@ -153,8 +153,14 @@ Subcommands: `dataglot init` (write a starter config) · `dataglot query "<SQL>"
   health, query history. **Served out of the box** by stock release binaries
   and the container image. A bare `cargo build` omits it — add
   `--features dashboard` for a local build; the `scripts/run-*.sh` launchers
-  already do. Bound at `--metrics-addr` (default `:9090`); Prometheus metrics
-  at `:9090/metrics`.
+  already do. Bound at `--metrics-addr` (default `127.0.0.1:9090`); Prometheus
+  metrics at `:9090/metrics`. In the container the image sets
+  `DATAGLOT_METRICS_ADDR=0.0.0.0:9090`, so just publish the port:
+
+  ```bash
+  docker run --rm -p 127.0.0.1:5432:5432 -p 127.0.0.1:9090:9090 \
+    ghcr.io/dataglotai/dataglot:latest
+  ```
 
 ## Auth modes
 

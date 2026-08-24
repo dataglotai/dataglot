@@ -49,7 +49,7 @@ tar xzf dataglot-<version>-<target>.tar.gz
 ## 4. Container image
 
 ```bash
-docker run --rm -p 5432:5432 ghcr.io/dataglotai/dataglot:latest
+docker run --rm -p 127.0.0.1:5432:5432 ghcr.io/dataglotai/dataglot:latest
 ```
 
 [QUICKSTART.md](../QUICKSTART.md) is the fastest path from any of these

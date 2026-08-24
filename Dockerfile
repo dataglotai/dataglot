@@ -180,8 +180,8 @@ COPY LICENSE /app/LICENSE
 COPY NOTICE /app/NOTICE
 COPY THIRD_PARTY_LICENSES.md /app/THIRD_PARTY_LICENSES.md
 
-# Expose PostgreSQL wire protocol port
-EXPOSE 5432
+# Expose PostgreSQL wire protocol port and the metrics/dashboard port
+EXPOSE 5432 9090
 
 # Health check via the binary itself. Distroless has no shell or `nc`,
 # so we lean on the `--healthcheck` flag — it does a TCP connect to
@@ -189,9 +189,14 @@ EXPOSE 5432
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["/app/dataglot", "--healthcheck"]
 
-# Environment variables with sensible defaults
+# Environment variables with sensible defaults. DATAGLOT_METRICS_ADDR
+# overrides the engine's loopback metrics/dashboard default so `/ui` and
+# `/metrics` are reachable from outside the container — but only when the
+# operator publishes the port (`-p 127.0.0.1:9090:9090`); with no `-p`
+# the container boundary keeps them private.
 ENV DATAGLOT_HOST=0.0.0.0 \
     DATAGLOT_PORT=5432 \
+    DATAGLOT_METRICS_ADDR=0.0.0.0:9090 \
     DATAGLOT_BATCH_SIZE=8192 \
     DATAGLOT_DEFAULT_CATALOG=dataglot \
     DATAGLOT_DEFAULT_SCHEMA=public \

@@ -11,7 +11,7 @@
 //! 3. Spawns an axum HTTP listener that serves `GET /metrics` (Prometheus
 //!    text exposition format) and `GET /health`.
 //!
-//! Per hard rule 5 the server crate does not reach into other crates to
+//! Per hard rule 4 the server crate does not reach into other crates to
 //! instrument them. Per-query counters require a hook in `dataglot-pgwire`
 //! that does not yet exist; see [`Metrics::queries_total`] for a TODO marker.
 

@@ -25,7 +25,7 @@
 //! outcome mapping, injection escaping) is unit-tested against an in-memory
 //! mock with **no live server**. The real client [`Ldap3Connection`] wraps the
 //! pure-Rust `ldap3` crate (hard rule 15) and its tokio backend, so every
-//! call is async and non-blocking (rule 11).
+//! call is async and non-blocking (hard rule 11).
 //!
 //! # Credential isolation (hard rule 12)
 //!

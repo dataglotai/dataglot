@@ -62,6 +62,10 @@ PR:
    `dataglot-pgwire` / `dataglot-federation` / `dataglot-policy` →
    `dataglot-core`. `dataglot-core` depends on nothing internal; no
    cycles, no lateral deps between the middle crates.
+   `dataglot-catalog` and `dataglot-ballista` join the graph under the
+   same no-cycles / strict-direction discipline (`dataglot-ballista`
+   sits above `dataglot-federation`; each crate documents its exact
+   position in its crate docs).
 5. **Single-crate scope per change.** Cross-crate changes are split
    into stacked PRs (see "Crate boundaries" above).
 6. **Policy enforcement at planning time.** Column masks and row
@@ -82,6 +86,10 @@ PR:
     execution time.
 13. **Schema inference is lazy.** No eager schema fetches from remote
     sources; resolve on first query or explicit `DESCRIBE`.
+    (Connection-health validation at boot or `CREATE CATALOG` is fine —
+    the rule bars schema fetching, not connectivity checks. Where a
+    connector must enumerate schemas eagerly, the exception is
+    documented at the site.)
 14. **Test coverage for public APIs.** Every public function, trait
     impl, and config option has at least one test.
 15. **Rust-only production runtime.** No JVM, Python, or C/C++

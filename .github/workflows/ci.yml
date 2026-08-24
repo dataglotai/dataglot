@@ -37,7 +37,7 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/.ghcup /usr/local/share/boost /usr/local/share/powershell \
             /usr/share/swift /usr/local/share/chromium /usr/share/miniconda \
-            /usr/local/lib/node_modules "$AGENT_TOOLSDIRECTORY/CodeQL" || true
+            /usr/local/lib/node_modules "${RUNNER_TOOL_CACHE:-/opt/hostedtoolcache}/CodeQL" || true
           sudo docker system prune -af >/dev/null 2>&1 || true
           df -h /
 
@@ -51,14 +51,21 @@ jobs:
         with:
           components: rustfmt
 
-      # Restored BEFORE the `cargo install` below so the registry cache
-      # serves that build too. Deliberately no `target` in this cache: the
+      # Restored BEFORE the `cargo install` below; ~/.cargo/bin is cached so
+      # the compiled taplo binary persists across runs instead of being
+      # rebuilt from source every time. The .crates*.json tracking files must
+      # ride along — with the binary restored but untracked, `cargo install`
+      # aborts with "binary already exists"; tracked, it exits early as
+      # already-installed. Deliberately no `target` in this cache: the
       # workspace target dir is tens of GB — restoring it would eat the disk
       # headroom freed above (and exceed the repo's cache quota anyway).
       - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
+            ~/.cargo/bin
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}

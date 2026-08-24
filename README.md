@@ -28,10 +28,11 @@ Homebrew (macOS / Linux):
 brew install dataglotai/tap/dataglot
 ```
 
-Container image:
+Container image (published on loopback only — the default auth mode
+trusts any local user):
 
 ```bash
-docker run --rm -p 5432:5432 ghcr.io/dataglotai/dataglot:latest
+docker run --rm -p 127.0.0.1:5432:5432 ghcr.io/dataglotai/dataglot:latest
 ```
 
 ## Quick start

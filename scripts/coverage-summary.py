@@ -124,7 +124,9 @@ def main() -> int:
     }
 
     dest = os.environ.get("COVERAGE_JSON_OUT", "target/coverage-summary.json")
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    dest_dir = os.path.dirname(dest)
+    if dest_dir:  # a bare filename means the CWD — makedirs("") would raise
+        os.makedirs(dest_dir, exist_ok=True)
     with open(dest, "w") as fh:
         json.dump(out, fh, indent=2)
         fh.write("\n")

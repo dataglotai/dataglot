@@ -11,10 +11,11 @@ via DDL, not JSON. (`tpch`/`lakehouse` still need file config until
 
 ## Prerequisites
 
-The demo source databases — `make demo-sources` in the private dev repo
-brings up postgres :5433, postgres-orders :5434, and mysql :3306; any
-Postgres/MySQL you already run works too (adjust the DSNs in
-[`seed.sql`](seed.sql)).
+The demo expects three source databases: postgres :5433,
+postgres-orders :5434, and mysql :3306. Point the DSNs in
+[`seed.sql`](seed.sql) at any Postgres/MySQL you already run.
+(Dataglot maintainers: `make demo-sources` in the private development
+repo brings up the canonical trio.)
 
 ## 1. Boot (bootstrap-only config)
 

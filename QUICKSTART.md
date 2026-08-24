@@ -11,16 +11,34 @@ Pick whichever channel you prefer (all of them ship the same prebuilt
 `dataglot` binary — see [docs/install.md](docs/install.md) for tarballs
 and `cargo binstall` too).
 
+First, a two-line config. It turns on the SQL-native control plane: the
+catalogs, secrets, and policies you create over `psql` are persisted in
+an embedded file-backed meta store (without it, the server still runs
+queries but rejects `CREATE CATALOG` with "catalog DDL requires a
+configured catalog_service"):
+
+```bash
+cat > dataglot.toml <<'EOF'
+[catalog_service]
+path = "dataglot-meta.json"
+EOF
+```
+
 Homebrew (macOS / Linux):
 
 ```bash
-brew install dataglotai/tap/dataglot && dataglot
+brew install dataglotai/tap/dataglot && dataglot -c dataglot.toml
 ```
 
-Or the container image:
+Or the container image — published on loopback only (the default auth
+mode trusts any local user; keep the port off other interfaces), with
+your working directory mounted so the config is readable and the meta
+store survives container restarts:
 
 ```bash
-docker run --rm -p 5432:5432 ghcr.io/dataglotai/dataglot:latest
+docker run --rm -p 127.0.0.1:5432:5432 \
+  -v "$PWD:/data" -w /data --user "$(id -u)" \
+  ghcr.io/dataglotai/dataglot:latest -c /data/dataglot.toml
 ```
 
 Started fresh, the server boots with **no catalogs** and prints a banner
@@ -43,7 +61,7 @@ port.)
 
 ## 3. Add your first source — with SQL
 
-No config file: a catalog is a federated data source, created against
+No config-file edit per source: a catalog is a federated data source, created against
 the running server and persisted across restarts.
 
 ```sql
@@ -52,6 +70,11 @@ CREATE CATALOG pg WITH (
   dsn  = 'host=localhost port=5433 user=me password=secret dbname=app'
 );
 ```
+
+(Running Dataglot in Docker? A source on your host machine is not
+`localhost` from inside the container — use `host.docker.internal` in
+the DSN; on Linux, add `--add-host=host.docker.internal:host-gateway`
+to the `docker run` command.)
 
 The source is validated before anything is persisted — an unreachable
 DSN fails the statement instead of leaving a half-registered catalog.
@@ -69,8 +92,22 @@ CREATE SECRET app_pg_dsn AS 'host=localhost port=5433 user=me password=secret db
 CREATE CATALOG pg WITH (kind = 'postgres', dsn_secret = 'app_pg_dsn');
 ```
 
-Add a second source the same way — MySQL, Oracle, Snowflake, Iceberg,
-or even a bare CSV/Parquet file — and JOIN across them in one statement:
+Add a second source the same way — MySQL, Snowflake, Iceberg, or even a
+bare CSV/Parquet file — and JOIN across them in one statement. (Oracle
+works too, but isn't in the prebuilt binaries: it needs a from-source
+build with `--features oracle` or the pure-Rust `oracle-pure` — see
+[docs/install.md](docs/install.md#building-from-source).)
+
+For the CSV example, first drop a file into the working directory you
+started the server from:
+
+```bash
+cat > segments.csv <<'EOF'
+user_id,segment
+7,enterprise
+42,self-serve
+EOF
+```
 
 ```sql
 CREATE CATALOG files WITH (
@@ -82,6 +119,10 @@ SELECT u.email, s.segment
 FROM   pg.public.users u
 JOIN   files.public.segments s ON u.id = s.user_id;
 ```
+
+(The `file:///data/…` URL matches the Docker mount from step 1; running
+the Homebrew binary instead, use the file's absolute path on your
+machine — e.g. `file:///Users/you/segments.csv`.)
 
 ## 4. Govern it — also with SQL
 
