@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# cargo-binstall renders its pkg-url's `{ repo }` from this field — without it
+# the prebuilt-tarball resolution silently falls back to a (doomed) source
+# build from crates.io.
+repository.workspace = true
 description = "Binary entrypoint — boots DataFusion, federation, and pg wire"
 
 # cargo-binstall metadata: resolves release tarballs straight
