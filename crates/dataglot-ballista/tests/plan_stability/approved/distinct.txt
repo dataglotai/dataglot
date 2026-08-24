@@ -1,0 +1,14 @@
+-- Optimized logical plan --
+Sort: items.category ASC NULLS LAST
+  Aggregate: groupBy=[[items.category]], aggr=[[]]
+    TableScan: items projection=[category]
+
+-- Physical plan --
+SortPreservingMergeExec: [category@0 ASC NULLS LAST]
+  SortExec: expr=[category@0 ASC NULLS LAST], preserve_partitioning=[true]
+    AggregateExec: mode=FinalPartitioned, gby=[category@0 as category], aggr=[]
+      RepartitionExec: partitioning=Hash([category@0], 4), input_partitions=4
+        AggregateExec: mode=Partial, gby=[category@0 as category], aggr=[]
+          RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+            DataSourceExec: file_groups={1 group: [[<DATA>/items.csv]]}, projection=[category], file_type=csv, has_header=true
+

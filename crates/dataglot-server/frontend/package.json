@@ -1,0 +1,24 @@
+{
+  "name": "dataglot-dashboard-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Production operational dashboard for the Dataglot engine. React + Vite SPA built to frontend/dist/ and embedded into dataglot-server via rust-embed, served at /ui behind the `dashboard` cargo feature. Deliberately lean: no comparator/editor deps — just the Cluster + Running-Queries operator views.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.3"
+  }
+}

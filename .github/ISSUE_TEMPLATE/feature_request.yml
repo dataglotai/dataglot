@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose a capability or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Dataglot is a read-path federation and governance engine. Please check
+        the [known limitations](../blob/main/docs/compatibility.md) and the
+        design rules in `CONTRIBUTING.md` before proposing large changes.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What are you trying to do, and why is it hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Dataglot to do? Sketch the shape if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you've tried or other approaches you weighed.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Sources/warehouses involved, scale, links, prior art.

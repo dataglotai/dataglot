@@ -1,0 +1,71 @@
+# Dataglot demo config (used by the locust load-test compose and the
+# `make`-documented demo run). Postgres + MySQL catalogs, static masks +
+# a row filter, and a few derived products. Secrets are never inline —
+# each catalog names a `dsn_env` the server reads at boot (rule 12).
+# Full reference: docs/configuration.md
+
+host = "0.0.0.0"
+port = 5432
+batch_size = 8192
+partitions = 4
+default_catalog = "pg"
+default_schema = "public"
+
+[catalogs.pg]
+kind = "postgres"
+dsn_env = "DEMO_PG_DSN"
+
+[catalogs.pg_orders]
+kind = "postgres"
+dsn_env = "DEMO_ORDERS_DSN"
+
+[catalogs.mysql_demo]
+kind = "mysql"
+dsn_env = "DEMO_MYSQL_DSN"
+
+# Plan-time column masks.
+[[masks]]
+table = "users"
+column = "email"
+mask_literal = "***@example.com"
+
+[[masks]]
+table = "addresses"
+column = "postal_code"
+mask_literal = "*****"
+
+# Row filter — the predicate is an internally-tagged enum (inline table).
+[[row_filters]]
+table = "users"
+predicate = { kind = "eq_string", column = "email", value = "bob@example.com" }
+
+# Derived products (views / materializations).
+[[derived_products]]
+name = "v_customer_emails"
+catalog = "pg"
+schema = "public"
+sql = "SELECT id, email FROM pg.public.users"
+
+[[derived_products]]
+name = "v_email_stats"
+catalog = "pg"
+schema = "public"
+sql = "SELECT upper(email) AS email_upper, count(*) AS n FROM pg.public.users GROUP BY upper(email)"
+
+[[derived_products]]
+name = "customer_360"
+catalog = "pg"
+schema = "public"
+sql = "SELECT u.id AS user_id, u.email, a.city, a.postal_code, COUNT(o.id) AS order_count, SUM(o.amount) AS lifetime_value FROM pg.public.users u LEFT JOIN pg.public.addresses a ON a.user_id = u.id LEFT JOIN pg_orders.public.orders o ON o.user_id = u.id GROUP BY u.id, u.email, a.city, a.postal_code"
+
+[[derived_products]]
+name = "order_analytics"
+catalog = "pg"
+schema = "public"
+sql = "SELECT c.name AS category, p.name AS product, SUM(oi.quantity) AS units, SUM(oi.quantity * oi.unit_price) AS revenue FROM pg_orders.public.order_items oi JOIN pg.public.products p ON p.id = oi.product_id JOIN pg.public.categories c ON c.id = p.category_id GROUP BY c.name, p.name"
+
+[[derived_products]]
+name = "segment_revenue"
+catalog = "pg"
+schema = "public"
+sql = "SELECT s.segment, s.region, COUNT(DISTINCT o.user_id) AS customers, SUM(o.amount) AS revenue FROM pg_orders.public.orders o JOIN mysql_demo.demo.customer_segments s ON s.user_id = o.user_id GROUP BY s.segment, s.region"

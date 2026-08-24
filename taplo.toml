@@ -1,0 +1,38 @@
+# Taplo TOML formatter configuration
+# https://taplo.tamasfe.dev/configuration/
+
+[formatting]
+# Align consecutive entries vertically
+align_entries = false
+# Align consecutive comments after entries
+align_comments = true
+# Maximum column width
+column_width = 100
+# Indent tables
+indent_tables = false
+# Indent array entries
+indent_entries = false
+# Use compact arrays for inline tables
+compact_arrays = true
+# Compact inline tables
+compact_inline_tables = false
+# Trailing newline at end of file
+trailing_newline = true
+# Allowed blank lines between entries
+allowed_blank_lines = 1
+# Reorder keys alphabetically
+reorder_keys = false
+# Reorder arrays
+reorder_arrays = false
+
+[[rule]]
+# Apply to all Cargo.toml files
+include = ["**/Cargo.toml"]
+keys = ["dependencies", "dev-dependencies", "build-dependencies"]
+formatting = { reorder_keys = true }
+
+[[rule]]
+# Keep workspace members in defined order
+include = ["Cargo.toml"]
+keys = ["workspace.members"]
+formatting = { reorder_arrays = false }

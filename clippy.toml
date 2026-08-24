@@ -1,0 +1,74 @@
+# clippy.toml — project-level Clippy configuration
+#
+# Workspace-wide lint *levels* live in the root `Cargo.toml`
+# under `[workspace.lints.clippy]`. This file holds the
+# *thresholds* and *named lists* those lints consume.
+
+# CLAUDE.md Rule 11: no blocking IO in async context.
+# Encode it as a lint so it fails CI instead of relying on review.
+# Extend opportunistically as we discover specific foot-guns.
+disallowed-methods = [
+  { path = "std::thread::sleep", reason = "Use tokio::time::sleep — never block the async runtime (CLAUDE.md Rule 11)." },
+  # A hard process::exit skips every Drop + the shutdown broadcast that
+  # drains pgwire connections and background tasks. Server/session
+  # paths must return an error and let `run()` shut down gracefully. The one
+  # legitimate use — the `healthcheck` subcommand's exit code — carries an
+  # explicit `#[allow(clippy::disallowed_methods)]`.
+  { path = "std::process::exit", reason = "Return an error and let the server shut down gracefully; process::exit bypasses drains + Drop." },
+]
+
+# Cap async state-machine size below the 16 KB default. Matches
+# DataFusion's threshold and keeps deep federation/pgwire call
+# chains from drifting into stack-overflow territory.
+future-size-threshold = 10000
+
+# Identifiers we use in docstrings — prevents `doc_markdown`
+# (warn via `pedantic`) from false-positiving on real product
+# and protocol names. The leading `".."` splices in clippy's
+# default allowlist (OAuth, JWT, IPv4, OpenSSL, …) so we extend
+# rather than replace.
+doc-valid-idents = [
+  "..",
+  "DataFusion",
+  "PostgreSQL",
+  "MySQL",
+  "ClickHouse",
+  "DuckDB",
+  "Iceberg",
+  "Lakekeeper",
+  "Polaris",
+  "Trino",
+  "Snowflake",
+  "SQLite",
+  "BigQuery",
+  "DBeaver",
+  "DataGrip",
+  "Metabase",
+  "Exadata",
+  "RisingWave",
+  "HotData",
+  "psql",
+  # Slice 5b — object-store-mediated scheduler HA references
+  # storage protocols, HTTP conditional-write semantics, and
+  # adjacent infrastructure by name. Allowlist them here once
+  # rather than backticking dozens of occurrences in the `ha`
+  # module's docstrings.
+  "ETag",
+  "If-None-Match",
+  "If-Match",
+  "RFC",
+  "ADLS",
+  "GCS",
+  "ZooKeeper",
+  "etcd",
+  "Redis",
+  "Kubernetes",
+  "Ballista",
+  "JobState",
+  "UUIDv4",
+  # Phase 4 OData connector — protocol/product names in docstrings.
+  "OData",
+  "EDMX",
+  "Dataverse",
+  "NetWeaver",
+]

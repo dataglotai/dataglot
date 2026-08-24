@@ -1,0 +1,214 @@
+name: Docker
+
+on:
+  # Nightly build at 2 AM UTC
+  schedule:
+    - cron: '0 2 * * *'
+
+  # Manual trigger with optional parameters
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: 'Push image to registry'
+        required: false
+        default: false
+        type: boolean
+      platforms:
+        description: 'Target platforms (comma-separated)'
+        required: false
+        default: 'linux/amd64'
+        type: string
+
+  # Only on push to main/tags (not on PRs)
+  push:
+    branches: [main]
+    tags: ['v*']
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ── Build and test Docker image ───────────────────────────────────────────
+  build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Container Registry
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push_image) || github.event_name == 'schedule'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=,suffix=,format=short
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push_image) || github.event_name == 'schedule' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: ${{ inputs.platforms || 'linux/amd64' }}
+
+  # ── Test the Docker image ─────────────────────────────────────────────────
+  test:
+    name: Test Docker image
+    runs-on: ubuntu-latest
+    needs: build
+    # Run tests on nightly builds and manual triggers (when not pushing to verify locally)
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.push_image)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image for testing
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: dataglot:test
+          cache-from: type=gha
+
+      - name: Start container
+        run: |
+          docker run -d --name dataglot-test \
+            -p 15432:5432 \
+            -e RUST_LOG=info \
+            dataglot:test
+
+      - name: Wait for container to be healthy
+        # Probe from the HOST against the published port (15432), not inside
+        # the container: the slim runtime image ships no `nc`, so
+        # `docker exec … nc` fails with "executable file not found" and the
+        # probe times out even when the server is healthy (the red streak of
+        # 2026-07-03..07). bash's /dev/tcp needs nothing installed.
+        run: |
+          timeout 60 bash -c 'until (exec 3<>/dev/tcp/localhost/15432) 2>/dev/null; do sleep 2; done'
+
+      - name: Test connection with psql
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          PGPASSWORD='' psql -h localhost -p 15432 -U postgres -c "SELECT 1 as test;" || echo "Connection test completed"
+
+      - name: Show container logs
+        if: always()
+        run: docker logs dataglot-test
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f dataglot-test || true
+
+  # ── Security scan ─────────────────────────────────────────────────────────
+  scan:
+    name: Security scan
+    runs-on: ubuntu-latest
+    needs: build
+    # Run security scan on push and nightly builds (when image is pushed)
+    if: github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.push_image)
+    permissions:
+      contents: read          # required: actions/checkout (the repo is private)
+      packages: read          # required: pull the just-pushed image from ghcr.io
+      actions: read           # required: codeql upload-sarif fetches run metadata (private-repo only)
+      security-events: write  # required: upload-sarif to the Security tab
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          # Reference by digest, not tag, so this works on any branch
+          # name (including branches containing '/' which Docker tags
+          # disallow) and pins exactly to the image the build job pushed.
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload SARIF as workflow artifact
+        # Always works (no GHAS required); downloadable from the run page for
+        # 30 days. This is the canonical place to grab findings.
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: trivy-results
+          path: trivy-results.sarif
+          retention-days: 30
+
+      - name: Upload Trivy scan results to Security tab
+        # Pushing SARIF to the GitHub Security tab requires GitHub Advanced
+        # Security (a paid add-on for private repos). If GHAS is not enabled,
+        # this step warns with "Code Security must be enabled for this
+        # repository" — that's expected, not a real failure. We continue-on-
+        # error so the job stays green; the SARIF artifact above is the source
+        # of truth either way. Remove `continue-on-error` once GHAS is enabled.
+        uses: github/codeql-action/upload-sarif@v4.37.7
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Print Trivy summary to job log
+        # Always print a human-readable summary in the Actions UI so reviewers
+        # don't have to download the artifact for routine checks.
+        uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+  # NOTE: release publishing is handled by the `build` job above. On a `v*`
+  # tag it pushes the semver tags ({{version}} / {{major}}.{{minor}} /
+  # {{major}}) plus `latest` for linux/amd64. A previous multi-arch `release`
+  # job added a linux/arm64 variant via QEMU, but the emulated `lto=fat`
+  # release build OOM-killed ("cannot allocate memory", SIGKILL) on every tag
+  # — so it never published and only burned ~2.5h per release. Removed. If
+  # native arm64 images are needed later, build them on a NATIVE arm64 runner
+  # (GitHub-hosted arm64 / depot / buildjet) and merge the manifest — never
+  # arm64-under-QEMU for a fat-LTO Rust release build.

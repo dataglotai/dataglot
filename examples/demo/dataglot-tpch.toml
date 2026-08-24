@@ -1,0 +1,30 @@
+# Dataglot config for the cross-engine TPC-H benchmark (testbench Phase 3.5).
+# A single `object_storage` (parquet) catalog `tpch1` over the 8 standard TPC-H
+# tables, so bare `FROM lineitem` in the vendored TPC-H queries resolves as
+# `tpch1.public.lineitem` (default_catalog=tpch1, default_schema=public). Seed the
+# parquet first:
+#   cargo run --example seed-tpch -p dataglot-tests -- --sf 1 --out /data/tpch
+# The file:// urls below assume that seed dir is mounted at /data/tpch (the
+# --container path). `run-testbench.sh --benchmark` (host mode) generates an
+# equivalent config with absolute host paths instead.
+# No masks/row_filters: the benchmark measures raw engine latency.
+
+host = "0.0.0.0"
+port = 5432
+batch_size = 8192
+partitions = 4
+default_catalog = "tpch1"
+default_schema = "public"
+
+[catalogs.tpch1]
+kind = "object_storage"
+tables = [
+  { name = "nation", url = "file:///data/tpch/nation.parquet", format = "parquet" },
+  { name = "region", url = "file:///data/tpch/region.parquet", format = "parquet" },
+  { name = "customer", url = "file:///data/tpch/customer.parquet", format = "parquet" },
+  { name = "orders", url = "file:///data/tpch/orders.parquet", format = "parquet" },
+  { name = "lineitem", url = "file:///data/tpch/lineitem.parquet", format = "parquet" },
+  { name = "part", url = "file:///data/tpch/part.parquet", format = "parquet" },
+  { name = "supplier", url = "file:///data/tpch/supplier.parquet", format = "parquet" },
+  { name = "partsupp", url = "file:///data/tpch/partsupp.parquet", format = "parquet" },
+]

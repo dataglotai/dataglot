@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The workspace's debug test binaries are dominated by debuginfo; with it on,
+  # the build overflows the standard runner's disk (the linker dies with SIGBUS
+  # mid-link). CI doesn't need DWARF — test failures still carry full panic
+  # messages and line numbers via the panic payload.
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  # Basic gate for the open-source repo: formatting, lints, and the non-Docker,
+  # non-Ballista test suite (unit + in-crate integration). Distributed execution
+  # (Ballista) needs protoc + a long compile and has its own `make ballista-ci`
+  # target; wire it into CI when you're ready.
+  build-lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The debug build + full test-binary set overflows the standard runner's
+      # ~14 GB free disk ("No space left on device"). Drop the preinstalled
+      # toolchains we never use (~35 GB: .NET, Android SDK, Haskell,
+      # PowerShell, Swift, Chromium, CodeQL, Docker images).
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /usr/local/share/boost /usr/local/share/powershell \
+            /usr/share/swift /usr/local/share/chromium /usr/share/miniconda \
+            /usr/local/lib/node_modules "$AGENT_TOOLSDIRECTORY/CodeQL" || true
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install nightly rustfmt (repo uses unstable rustfmt options)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Install taplo (TOML formatter)
+        run: cargo install --locked taplo-cli
+
+      # Deliberately no `target` in this cache: the workspace target dir is
+      # tens of GB — restoring it would eat the disk headroom freed above
+      # (and exceed the repo's cache quota anyway).
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Format + lint (fmt, taplo, clippy)
+        run: make check
+
+      - name: Build
+        run: make build
+
+      - name: Tests (unit + in-crate integration; excludes Ballista/Docker)
+        run: make test
+
+  # Belt-and-suspenders secret scan on the public repo itself, using the same
+  # .gitleaks.toml the publish pipeline uses — catches anything that ever lands
+  # here outside the scripted publish flow.
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gitleaks (checksum-verified)
+        run: |
+          set -euo pipefail
+          VERSION=8.30.1
+          BASE="https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}"
+          ASSET="gitleaks_${VERSION}_linux_x64.tar.gz"
+          curl -fsSL "$BASE/$ASSET" -o "$ASSET"
+          curl -fsSL "$BASE/gitleaks_${VERSION}_checksums.txt" -o checksums.txt
+          # Verify the download against the published checksum before trusting it.
+          grep " $ASSET\$" checksums.txt | sha256sum --check -
+          tar -xzf "$ASSET" gitleaks
+          sudo install gitleaks /usr/local/bin/gitleaks
+      - name: Scan working tree for secrets
+        run: gitleaks detect --no-git --redact --config .gitleaks.toml

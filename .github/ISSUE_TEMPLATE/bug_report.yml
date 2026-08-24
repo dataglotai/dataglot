@@ -1,0 +1,65 @@
+name: Bug report
+description: Report a defect in Dataglot
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill out the sections
+        below so we can reproduce and fix it quickly.
+
+        For suspected **security vulnerabilities**, do NOT open a public issue —
+        follow [SECURITY.md](../blob/main/SECURITY.md) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps, a query, and/or a config snippet that triggers it.
+      placeholder: |
+        1. Start the server with `dataglot serve --config …`
+        2. Connect with `psql …`
+        3. Run `SELECT …`
+        4. Observe …
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config / query
+      description: Your `dataglot.toml` (redact any credentials) and the SQL involved.
+      render: json
+  - type: input
+    id: version
+    attributes:
+      label: Dataglot version
+      description: Output of `dataglot --version`, a release tag, or a commit SHA.
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Execution mode
+      options:
+        - single-node
+        - distributed (Ballista)
+        - not sure
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      description: OS, and (if relevant) the source/warehouse being federated.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant server logs or client errors. Redact credentials.
+      render: shell

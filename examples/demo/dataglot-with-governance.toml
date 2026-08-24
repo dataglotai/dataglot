@@ -1,0 +1,34 @@
+host = "0.0.0.0"
+port = 5432
+batch_size = 8192
+partitions = 4
+default_catalog = "pg"
+default_schema = "public"
+
+[catalogs.pg]
+kind = "postgres"
+dsn_env = "DEMO_PG_DSN"
+
+[catalogs.pg_orders]
+kind = "postgres"
+dsn_env = "DEMO_ORDERS_DSN"
+
+[catalogs.mysql_demo]
+kind = "mysql"
+dsn_env = "DEMO_MYSQL_DSN"
+
+[governance]
+tags = [{ id = "pii", org = "acme", name = "PII" }]
+policies = [
+  { id = "mask-pii-analyst", org = "acme", tag = "pii", group = "analyst", rule = { kind = "mask", mask_literal = "***@example.com" } },
+  { id = "filter-pii-analyst", org = "acme", tag = "pii", group = "analyst", rule = { kind = "row_filter", predicate = { kind = "eq_string", column = "email", value = "bob@example.com" } } },
+]
+columns = [{ table = "users", column = "email", tags = ["pii"] }]
+
+[identities.alice]
+org = "acme"
+groups = ["analyst"]
+
+[identities.carol]
+org = "acme"
+groups = ["auditor"]

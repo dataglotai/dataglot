@@ -1,0 +1,46 @@
+# Homebrew formula template for Dataglot.
+#
+# Rendered by the release workflow with the tag's version + artifact
+# sha256s and attached to the GitHub Release as `dataglot.rb`. To
+# publish: copy the rendered file into `dataglotai/homebrew-tap` at
+# `Formula/dataglot.rb` (manual today; becomes a push step when the
+# tap repo exists — see docs/install.md).
+#
+# Install (after the tap exists and the repo is public):
+#   brew install dataglotai/tap/dataglot
+class Dataglot < Formula
+  desc "Rust-native federated SQL engine with plan-time governance"
+  homepage "https://github.com/dataglotai/dataglot"
+  version "__VERSION__"
+  license "Apache-2.0"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/dataglotai/dataglot/releases/download/v__VERSION__/dataglot-__VERSION__-aarch64-apple-darwin.tar.gz"
+      sha256 "__SHA_MAC_ARM__"
+    end
+    on_intel do
+      url "https://github.com/dataglotai/dataglot/releases/download/v__VERSION__/dataglot-__VERSION__-x86_64-apple-darwin.tar.gz"
+      sha256 "__SHA_MAC_X86__"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/dataglotai/dataglot/releases/download/v__VERSION__/dataglot-__VERSION__-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "__SHA_LINUX_ARM__"
+    end
+    on_intel do
+      url "https://github.com/dataglotai/dataglot/releases/download/v__VERSION__/dataglot-__VERSION__-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "__SHA_LINUX_X86__"
+    end
+  end
+
+  def install
+    bin.install "dataglot"
+  end
+
+  test do
+    assert_match "dataglot", shell_output("#{bin}/dataglot --help")
+  end
+end

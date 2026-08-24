@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Pre-commit hook — fast format checks before any commit lands.
+#
+# Catches the two drift modes that bit us most often:
+#   * `taplo fmt --check` — TOML drift in Cargo.toml et al.
+#     Wrapped feature arrays, trailing-comma quirks. Caught
+#     #158's two-line whitespace miss before the first push.
+#   * `cargo +nightly fmt --all -- --check` — Rust drift.
+#     Multi-line call expression rewraps, etc.
+#
+# Only runs the relevant tool when the relevant files are
+# actually staged. That keeps the hook sub-2-second and
+# side-steps Windows CRLF/LF interactions with taplo when no
+# TOML is being committed.
+#
+# We deliberately do NOT run clippy or tests here — those are
+# slow enough that you'd start avoiding `git commit`. The full
+# pre-PR gate stays in `make ci`. This hook's job is to catch
+# the specific 80% of drift that's sub-2-second to detect.
+#
+# Install via `make install-hooks` (which sets
+# `git config core.hooksPath scripts/git-hooks` so this directory
+# becomes the active hooks path for the clone).
+
+set -e
+
+# Files staged in THIS commit. `--diff-filter=ACMR` covers
+# Added / Copied / Modified / Renamed; deletions don't need
+# format checking. `-z` + `tr` is the safe way to handle paths
+# with spaces, but for our codebase plain newline-split is fine.
+CHANGED_TOML=$(git diff --cached --name-only --diff-filter=ACMR -- '*.toml')
+CHANGED_RUST=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')
+
+if [ -n "$CHANGED_TOML" ]; then
+    echo "[pre-commit] taplo fmt --check (staged TOML)"
+    # shellcheck disable=SC2086
+    echo "$CHANGED_TOML" | xargs taplo fmt --check
+fi
+
+if [ -n "$CHANGED_RUST" ]; then
+    # rustfmt operates on whole crates, not single files, so we
+    # run it workspace-wide whenever any .rs file is touched.
+    # Still well under 2 seconds with cargo's incremental cache.
+    echo "[pre-commit] cargo +nightly fmt --all -- --check"
+    cargo +nightly fmt --all -- --check
+fi
+
+# Nothing relevant staged ⇒ nothing to check. Silent success.
+exit 0

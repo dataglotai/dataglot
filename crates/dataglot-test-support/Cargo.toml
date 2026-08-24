@@ -1,0 +1,16 @@
+[package]
+name = "dataglot-test-support"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared test-only helpers for the Dataglot workspace (dev tooling, never published)"
+
+[lib]
+name = "dataglot_test_support"
+path = "src/lib.rs"
+
+# Intentionally dependency-free (std only) so it stays a leaf dev-dependency
+# any crate can pull in without risking a cycle or a version-graph split.
+[dependencies]

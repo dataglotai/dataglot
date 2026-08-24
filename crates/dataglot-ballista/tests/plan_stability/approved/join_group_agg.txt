@@ -1,0 +1,24 @@
+-- Optimized logical plan --
+Sort: r.region ASC NULLS LAST
+  Projection: r.region, sum(i.price) AS t
+    Aggregate: groupBy=[[r.region]], aggr=[[sum(i.price)]]
+      Projection: i.price, r.region
+        Inner Join: i.id = r.id
+          SubqueryAlias: i
+            TableScan: items projection=[id, price]
+          SubqueryAlias: r
+            TableScan: regions projection=[id, region]
+
+-- Physical plan --
+SortPreservingMergeExec: [region@0 ASC NULLS LAST]
+  SortExec: expr=[region@0 ASC NULLS LAST], preserve_partitioning=[true]
+    ProjectionExec: expr=[region@0 as region, sum(i.price)@1 as t]
+      AggregateExec: mode=FinalPartitioned, gby=[region@0 as region], aggr=[sum(i.price)]
+        RepartitionExec: partitioning=Hash([region@0], 4), input_partitions=4
+          AggregateExec: mode=Partial, gby=[region@1 as region], aggr=[sum(i.price)]
+            HashJoinExec: mode=Partitioned, join_type=Inner, on=[(id@0, id@0)], projection=[price@1, region@3]
+              RepartitionExec: partitioning=Hash([id@0], 4), input_partitions=1
+                DataSourceExec: file_groups={1 group: [[<DATA>/items.csv]]}, projection=[id, price], file_type=csv, has_header=true
+              RepartitionExec: partitioning=Hash([id@0], 4), input_partitions=1
+                DataSourceExec: file_groups={1 group: [[<DATA>/regions.csv]]}, projection=[id, region], file_type=csv, has_header=true
+

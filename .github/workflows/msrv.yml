@@ -1,0 +1,44 @@
+name: MSRV
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+
+env:
+  CARGO_TERM_COLOR: always
+  # MSRV defined in workspace Cargo.toml rust-version field
+  MSRV: "1.94"
+
+jobs:
+  msrv:
+    name: MSRV Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Verify MSRV
+        run: |
+          echo "Checking compilation with Rust $MSRV (minimum supported version)"
+          # `dataglot-ballista` excluded — Apache Ballista's transitive
+          # `substrait` dep requires `protoc` on $PATH at build time,
+          # which the MSRV job intentionally doesn't install. The Phase
+          # 2 ballista job in ci.yml provides MSRV-equivalent stable
+          # coverage with protoc available.
+          cargo +$MSRV check --workspace --exclude dataglot-ballista --all-targets

@@ -1,0 +1,52 @@
+# Rust
+/target/
+**/*.rs.bk
+# Coverage (cargo-llvm-cov) — reports live under target/, but the raw
+# instrumentation files can land in the workspace root on interrupted runs.
+*.profraw
+*.profdata
+# Cargo.lock is committed for reproducible builds (binary project)
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Cloudflare Wrangler local state (auth tokens, cache)
+.wrangler/
+
+# Node — only the testbench's vendoring pipeline uses npm.
+# The rolled-up bundle at static/vendor/codemirror.js IS committed.
+# package-lock.json IS committed too so `npm ci` produces a
+# deterministic bundle in CI; without it, registry drift can fail
+# unrelated PRs on the bundle-staleness check.
+node_modules/
+
+# Local testbench config at repo root (operator-specific DSNs /
+# credentials). Use `testbench.example.toml` as a template.
+/testbench.toml
+
+# Operator-specific *.local.toml (real accounts / DSNs). The committed
+# `*.toml` next to each is the placeholder template — copy it to
+# `*.local.toml` and fill in. E.g. examples/demo/dataglot-with-snowflake.toml
+# → dataglot-with-snowflake.local.toml.
+*.local.toml
+
+# Claude Code local settings (.claude/agents/ is intentionally tracked)
+.claude/settings.json
+.claude/settings.local.json
+.claude/*.lock
+
+# Golden sidecar files pinned via the testbench (slice 3c) — local, not committed
+*.golden.json
+.claude/worktrees/

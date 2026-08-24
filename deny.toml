@@ -1,0 +1,95 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+version = 2
+# Ignore advisories for transitive dependencies we can't control
+ignore = [
+  "RUSTSEC-2024-0436", # paste unmaintained - used by DataFusion
+  "RUSTSEC-2025-0134", # rustls-pemfile unmaintained - used by datafusion-postgres
+  # `instant` (unmaintained) — transitively via
+  # `snowflake-api → reqwest-retry → parking_lot 0.11 / wasm-timer → instant`.
+  # Advisory recommends `web-time` as the replacement; out of our control
+  # (reqwest-retry is the boundary). Pulled in only with `--features snowflake`.
+  "RUSTSEC-2024-0384",
+  # `rsa 0.9.x` Marvin Attack timing sidechannel — transitively via
+  # `snowflake-api → snowflake-jwt → rsa`. No safe upgrade exists yet; the
+  # crate is currently migrating to a constant-time implementation.
+  #
+  # **Exposure model for Dataglot:** the Phase 1 spec MVP uses
+  # username + password auth, not RSA-key-pair JWT auth, so we never
+  # execute the vulnerable RSA private-key operation. The `rsa` crate is
+  # pulled in transitively because `snowflake-api`'s `cert-auth` feature
+  # is required to compile (upstream cfg bug — see the comment in
+  # `crates/dataglot-federation/Cargo.toml` on the `snowflake-api` dep).
+  # Revisit this advisory when (a) `rsa` ships its constant-time fix,
+  # (b) `snowflake-api` fixes its `cert-auth` cfg gating so we can compile
+  # without it, or (c) we add JWT-key-pair auth — at which point Dataglot
+  # itself becomes exposed and this ignore must be removed.
+  "RUSTSEC-2023-0071",
+  # `quick-xml` DoS advisories (RUSTSEC-2026-0194 quadratic duplicate-attr
+  # check; RUSTSEC-2026-0195 unbounded namespace-declaration allocation),
+  # published 2026-07. Fixed in quick-xml >= 0.41.0, but four distinct
+  # semver ranges (0.37/0.38/0.39/0.40) are pulled transitively and all
+  # pinned below 0.41 by their parents — `object_store 0.14` (ballista),
+  # the AWS SDK XML deserializers, and `iceberg` — so no `cargo update`
+  # reaches the fix until those dependents release against 0.41.
+  #
+  # **Exposure:** quick-xml here only parses XML from object-store / S3
+  # control-plane responses (semi-trusted infra endpoints), never arbitrary
+  # end-user input, and both advisories are availability-only (parse-time
+  # DoS) — no RCE / data disclosure. Revisit when object_store / aws-sdk /
+  # iceberg bump to quick-xml >= 0.41.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "MPL-2.0",
+  "BSL-1.0",                        # Boost license
+  "CC0-1.0",                        # Public domain
+  "CDLA-Permissive-2.0",            # Permissive Linux Foundation license (webpki-roots 1.x)
+  "bzip2-1.0.6",                    # bzip2 license (used by async-compression)
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"        # Allow path dependencies in workspace
+# No `skip = [...]` entries needed today — `datafusion-federation`
+# now resolves to the same versions of arrow / parquet / sqlparser
+# as the workspace's DataFusion, and the hashbrown / arrow-* duplicates
+# the earlier entries guarded against have collapsed to single versions.
+# Add a `skip` entry here again only if a real duplicate appears in
+# `cargo tree --workspace --duplicates --depth 0`.
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+  # Apache Iceberg Rust SDK — pinned by rev in dataglot-federation/Cargo.toml.
+  # Released versions still target datafusion 52; we follow main until a release
+  # with the datafusion 53.1 bump is published.
+  "https://github.com/apache/iceberg-rust",
+  # Peaka's fork of `andrusha/snowflake-rs` — pinned by branch in
+  # dataglot-federation/Cargo.toml. The fork carries a 3-line `arrow` 57→58
+  # bump so the crate aligns with our workspace; retires the moment upstream
+  # ships its own arrow-58 release. See
+  # docs/phases/phase-1/05-snowflake-connector.md.
+  "https://github.com/peakacom/snowflake-rs",
+  # tpchgen-rs (Phase 2 task 03 baseline harness). Crates.io's latest 2.0.2
+  # release (Dec 2025) targets arrow 57; upstream PR #246 bumped `main` to
+  # arrow 58 in March 2026 but no 2.1.x has shipped. Same shape as the
+  # Ballista / iceberg-rust / peakacom/snowflake-rs pins.
+  "https://github.com/clflushopt/tpchgen-rs",
+]

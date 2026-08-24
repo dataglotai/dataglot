@@ -1,0 +1,351 @@
+[package]
+name = "dataglot-ballista"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Distributed-execution wiring for Dataglot, on Apache Ballista (Phase 2)"
+
+[lib]
+name = "dataglot_ballista"
+path = "src/lib.rs"
+
+#  — distributing Oracle / ADBC federated sources. OFF by default so
+# the stock `dataglot-ballista-executor` build stays lean: Postgres, MySQL,
+# Snowflake, and Iceberg distribute unconditionally (pure-Rust / always
+# compiled), while Oracle and ADBC are opt-in because they carry a backend the
+# base build shouldn't pull.
+#
+# `oracle-pure` enables the **pure-Rust** Oracle backend (no native dep — the
+# OCI `oracle` feature is intentionally not exposed here, so a distributed
+# executor never needs the Instant Client). `adbc` enables the driver-manager
+# backend; each executor host must have the operator-configured driver `.so`
+# at the same `driver_path` (that per-host requirement is why ADBC was
+# single-node-only before this issue). Build the executor with
+# `--features oracle-pure,adbc` to distribute those catalogs.
+[features]
+oracle-pure = ["dataglot-federation/oracle-pure"]
+adbc = ["dataglot-federation/adbc"]
+
+# Apache Ballista 54.0.0 (crates.io) pins DataFusion 54 + Arrow 58 —
+# exact match for the workspace after the coordinated DataFusion 54
+# ecosystem bump (, 2026-07-25). Bumped from 53.0.0; all four
+# ballista* crates move together and Cargo unifies them via the
+# crates.io source. See `docs/phases/phase-2/02-ballista-distributed-execution.md`
+# under "Upstream release watch" for the release-watch history.
+#
+# The `standalone` feature is what brings the in-process executor +
+# scheduler into the binary; it's what slice 1's smoke test boots.
+[dependencies]
+# `#[async_trait]` is needed to implement DataFusion's `QueryPlanner`
+# (an async-trait) in `plan_guard.rs` — the distributed-plan
+# serialization guard (DEV-3719). Previously dev-only.
+async-trait = { workspace = true }
+# Apache Ballista 54.0.0 (crates.io) — DataFusion 54 + Arrow 58,
+# matching the workspace after the  ecosystem bump. The DF54
+# API churn touched our wrappers (`as_any` removed from `ExecutionPlan`
+# etc.; `partition_statistics` → `Result<Arc<Statistics>>`); the codec
+# and cancel-on-drop plan wrappers were updated accordingly.
+ballista = { version = "54.1.0", default-features = false, features = ["standalone"] }
+# Phase 2 slice 4a — `BallistaLogicalExtensionCodec` lives in
+# `ballista-core` but isn't re-exported by the `ballista` client
+# crate. Declaring it directly lets us construct the codec for the
+# `FederationLogicalCodec` wrapper. Same version as the `ballista`
+# dep above; Cargo unifies the two via the crates.io source.
+ballista-core = { version = "54.1.0", default-features = false }
+# Phase 2 slice 5a — the standalone executor binary
+# (`src/bin/dataglot-ballista-executor.rs`) wraps Ballista's own
+# executor library entry points: `ExecutorProcessConfig` configures
+# the executor's network + concurrency surface, and
+# `start_executor_process` runs the gRPC + Arrow Flight services
+# until shutdown. We turn `build-binary` off because we define our
+# own CLI (with our `--credentials-config` flag on top of Ballista's
+# stock fields); `mimalloc` stays on for production runtime
+# performance parity with Ballista's stock executor binary. Same
+# version as the umbrella `ballista` dep; Cargo unifies them.
+ballista-executor = { version = "54.1.0", default-features = false, features = [
+  "arrow-ipc-optimizations",
+  "mimalloc",
+] }
+# Phase 2 slice 5a — `dataglot-ballista-executor` binary's CLI is
+# defined via clap's derive macro. Workspace doesn't carry clap yet;
+# declaring directly here keeps the dep contained to the crate that
+# needs it.
+clap = { workspace = true }
+# Phase 2 slice 8.2a — the scheduler binary wraps Ballista's
+# `start_server` from the `ballista-scheduler` lib crate. Promoted
+# from the dev-dep used by slice 5a.2's integration test to a
+# regular dep so `cargo build --bin dataglot-ballista-scheduler`
+# picks it up. Same version as the umbrella `ballista` dep.
+#
+# `rest-api` + `graphviz-support` power the in-process scheduler
+# observability endpoint (`monitor.rs`): upstream's standalone boot
+# discards the `SchedulerServer` handle and never mounts its REST
+# routes, so we replicate the boot and serve `api::get_routes` (jobs /
+# executors / stages / DOT graphs) ourselves for the testbench's
+# cluster view. `graphviz-rust` is pure Rust; its SVG endpoint shells
+# out to a `dot` binary at request time and degrades per-request when
+# absent (the DOT-text endpoint always works).
+ballista-scheduler = { version = "54.1.0", default-features = false, features = [
+  "rest-api",
+  "graphviz-support",
+  # `/api/metrics` Prometheus exposition: without this the
+  # collector is a no-op and the endpoint answers 204. Pure-Rust deps
+  # (`prometheus` + `once_cell`) — rule 15 compatible.
+  "prometheus-metrics",
+  # DF54/Ballista 54 bump: ballista-scheduler 54.0.0's
+  # `rest-api` api module (`api/handlers.rs`, `api/routes.rs`) calls
+  # `tracing::` unconditionally, but upstream gates the optional
+  # `tracing` dep behind `build-binary` (which we keep off). Enable
+  # the `tracing` feature directly so `rest-api` links its logging
+  # deps without pulling the whole binary feature set. Not a version
+  # change — feature-only workaround for an upstream packaging gap.
+  "tracing",
+] }
+# Serves the scheduler REST router (`monitor.rs`). Same axum the
+# `ballista-scheduler` routes are built with — Cargo unifies on the
+# workspace 0.8 line.
+axum = { workspace = true }
+# `cancel_on_drop` implements `Stream` for its guard wrapper.
+# Promoted from dev-dep — tests also use it (`multi_source_union`'s
+# concurrent container bring-up via `futures::future::join_all`).
+futures = { workspace = true }
+# `monitor.rs` replicates upstream's standalone scheduler bring-up,
+# which feeds the bound TCP listener to tonic via
+# `TcpListenerStream`. Already transitive through ballista; declared
+# direct because we now name the type ourselves. Version matches the
+# transitive resolve.
+tokio-stream = { workspace = true }
+# Phase 2 slice 5b — object-store ETag scheduler HA. The `ha`
+# module uses `PutMode::Create` for first-claim and
+# `PutMode::Update(UpdateVersion{e_tag, ..})` for heartbeats to
+# implement the leader-election state machine. Version pinned to
+# `0.13` to match what the workspace's transitive graph already
+# resolves via Ballista + DataFusion (Cargo unifies). `features =
+# ["aws"]` enables S3 — the canonical production backend per
+# Architecture §12's "no etcd / ZK / Redis" commitment.
+object_store = { version = "0.14", features = ["aws"] }
+# Phase 2 slice 5b — the HA scheduler parses the `--ha-state-uri`
+# flag with `object_store::parse_url`, which takes a `url::Url`.
+# Already transitive via object_store; declaring direct so the
+# call site is explicit. Version pinned to `2` to match the
+# transitive resolve.
+url = { workspace = true }
+# UUIDv4 — each scheduler instance picks a random holder_id at
+# startup so the lease can disambiguate "I'm still the holder"
+# from "another scheduler took over." Already a dataglot-core dep
+# (lineage RunId); declaring directly here makes the slice-5b
+# use site explicit.
+uuid = { workspace = true }
+# `chrono` for the lease payload's `expires_at` timestamp
+# (serialized as RFC 3339 UTC in the on-disk JSON). Already pulled
+# transitively via Ballista + DataFusion; declaring directly so the
+# slice 5b use site is explicit.
+chrono = { workspace = true }
+# Phase 2 slice 7a — client-side mTLS plumbing. `tls.rs` reads PEM
+# files into `tonic::transport::{Certificate, Identity, ClientTlsConfig}`
+# and threads the resulting `ClientTlsConfig` into Ballista's
+# `override_create_grpc_client_endpoint` hook. Versions pinned to
+# the ones already resolved in the workspace via Ballista's
+# transitive graph (tonic 0.14, rustls 0.23, rustls-pemfile 2);
+# declaring direct keeps the call sites explicit.
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tonic = { workspace = true, features = ["tls-ring"] }
+# Phase 2 slice 7b — `server.rs` builds the scheduler and executor
+# servers manually (bypassing `start_server` / `start_executor_process`)
+# so it can attach `ServerTlsConfig` via `tonic::transport::Server::builder()`.
+# This pulls in the Arrow Flight server crate for the executor's data-
+# plane listener — it's already transitive via Ballista but declaring
+# direct keeps the call site explicit.
+arrow-flight = { workspace = true }
+# Phase 2 slice 5a — the executor binary sets up a `tracing_subscriber`
+# fmt subscriber at startup (Ballista's `start_executor_process` emits
+# tracing events; without a subscriber installed nothing surfaces).
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Phase 2 slice 5a — the executor binary's `#[tokio::main]`. Was a
+# dev-dep before; the binary target needs the runtime as a regular
+# dep so `cargo build -p dataglot-ballista` picks it up. The lib
+# itself has no runtime requirement on tokio.
+tokio = { workspace = true }
+# Phase 2 slice 5a.2 — `catalogs_config::CatalogsConfig` derives
+# `Serialize`/`Deserialize` for the JSON-on-disk shape the executor
+# binary's `--catalogs-config` flag points at, and uses `thiserror`
+# for the typed `CatalogsConfigError` variants. `serde_json` parses
+# the file at boot.
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Slice 2: `BallistaContextFactory` takes the same `SessionConfig`
+# `dataglot-core::SessionContextFactory` accepts, so single-node →
+# distributed swap is a one-line factory change at boot. Crate
+# dependency direction OK per CLAUDE.md rule 4
+# (`dataglot-ballista → dataglot-core`).
+dataglot-core = { path = "../dataglot-core" }
+# Federation analyzer rules + `FederatedQueryPlanner`. Mirror the
+# single-node `create_federated_context()` shape so any federated
+# query that plans on the single-node side plans the same way through
+# Ballista.
+datafusion-federation = { workspace = true, features = ["sql"] }
+# Phase 2 slice 4a — the `LogicalExtensionCodec` trait the
+# `FederationLogicalCodec` wrapper implements. `datafusion-proto` is
+# already in the transitive dep graph via both `datafusion-federation`
+# (workspace) and `ballista-core` (crates.io); declaring it directly here
+# makes the trait import explicit. Version tracks the workspace
+# `datafusion` 54 line — Cargo unifies the three sources.
+datafusion-proto.workspace = true
+# Phase 2 slice 4b.2 — the `FederationLogicalCodec` encoder/decoder
+# uses `FederatedPlanNode` (federation's UDLN) and the
+# `ConnectorRegistry` from `dataglot-federation` to plumb federation
+# queries across the Ballista wire. `datafusion-federation` is
+# already declared above (slice 2 wires its analyzer rules);
+# `dataglot-federation` is new here as a direct dep so the codec
+# can import `ConnectorRegistry` + `DynConnectorRegistry` directly.
+#
+# Phase 2 slice 5a.2 — the executor binary's `--catalogs-config`
+# flag builds an `InMemoryConnectorRegistry` from the JSON file,
+# which requires `PostgresConnector::connect(...)`. That's behind
+# the `postgres` feature, promoted from dev-only to a regular
+# feature so `cargo build --bin dataglot-ballista-executor` picks
+# it up. Same feature set the server-side `build_executor_registry`
+# uses; keeps the two paths' connector capabilities aligned.
+# `iceberg` for: the codec serializes warehouse (Iceberg)
+# table scans for distributed dispatch.
+dataglot-federation = { path = "../dataglot-federation", features = [
+  "postgres",
+  "mysql",
+  "iceberg",
+  "snowflake",
+] }
+# `prost` derives the protobuf envelope (`LogicalCodecPayload`) the
+# logical codec writes onto the Ballista wire. Already in the
+# transitive graph via `datafusion-proto` and `ballista-core`;
+# declaring it directly so the `#[derive(prost::Message)]`
+# annotation surfaces explicitly. Version pinned to the one
+# `datafusion-proto 53` resolves to so Cargo unifies.
+prost.workspace = true
+# Re-export DataFusion types in our public surface (notably the
+# `SessionContext` the factory returns). We use the same
+# `ballista::datafusion` re-export the smoke test does for type
+# compatibility — the workspace `datafusion` workspace dep would
+# pull a parallel version graph.
+#
+# NOTE: keep this in lock-step with whatever `ballista`'s re-exported
+# datafusion version is; the alternative is per-call `use
+# ballista::datafusion as datafusion` aliases at every call site.
+
+[dev-dependencies]
+#  — the distributed-lakehouse e2e builds an in-memory Iceberg
+# catalog (temp-dir storage) and writes seed rows via the iceberg
+# writer, so the full codec path runs without Docker.
+iceberg = { workspace = true }
+# Phase 2 slice 5a — `tests/executor_binary_cli.rs` exec's the
+# dataglot-ballista-executor binary as a subprocess to assert
+# fail-fast paths (missing credentials file, malformed JSON, --help)
+# without standing up a scheduler. `predicates` is the matcher
+# library `assert_cmd` integrates with.
+#
+# Phase 2 slice 5a.2 — `tests/executor_multi_process_federation.rs`
+# also uses `assert_cmd::cargo::cargo_bin(...)` to locate the
+# compiled binary, then drives it via `tokio::process::Command`
+# (long-lived child requires `try_wait`/`kill`/`kill_on_drop` which
+# `assert_cmd::Command` doesn't expose).
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+# `ballista-scheduler` is in `[dependencies]` (slice 8.2a's scheduler
+# binary needs the `start_server` lib). Tests inherit access from
+# there, so it's not re-declared under `[dev-dependencies]`.
+# Phase 2 slice 8.1 — `benches/four_worker_throughput.rs` is the
+# 4-worker exit-criterion benchmark. Seeds a TPC-H SF1 warehouse
+# into a tempdir (same shape `dataglot-tests::tpch_baseline` uses)
+# and runs the same 22 queries through a Ballista standalone
+# cluster with `with_standalone_parallelism(4)`. The bench file
+# `include_str!`s the SQL bodies from
+# `crates/dataglot-tests/queries/tpch/` so the query catalog
+# stays single-sourced.
+tpchgen = { workspace = true }
+tpchgen-arrow = { workspace = true }
+# Phase 2 slice 8.1 — the bench reads `tpch-baseline.json` for the
+# single-node denominator and writes `phase2-benchmarks.json` in
+# the same `Report` shape. `parquet` is needed for the
+# `ArrowWriter` used to seed the tempdir warehouse — `arrow` is
+# already a transitive dep so this just unlocks the parquet sink.
+parquet.workspace = true
+# Phase 2 slice 8.1 — `benches/four_worker_throughput.rs` swapped
+# from the slice-4c criterion-based scaffold to a procedural
+# median-of-N runner mirroring `dataglot-tests::tpch_baseline`'s
+# shape. Procedural makes the JSON output trivial and lets the
+# nightly workflow run the bench as a plain binary; criterion is
+# tuned for microbench statistics that don't apply to multi-second
+# TPC-H queries. The decision is co-located in the bench file's
+# module doc.
+# (`async-trait` moved to [dependencies] — needed by plan_guard.rs's
+# QueryPlanner impl, and still available to the codec.rs tests.)
+# Phase 2 slice 5a.2 — the `postgres` feature on dataglot-federation
+# is now a regular dep (executor binary's --catalogs-config needs
+# PostgresConnector). The dev-dep declaration was removed; the
+# regular dep above carries the feature for all targets including
+# tests like ballista_federation_codec.rs and multi_source_union.rs.
+# Phase 2 slice 6 — `tests/governance_parity.rs` constructs
+# `ColumnMaskingEnforcer` + `RowFilterEnforcer` (composed via
+# `CompositeEnforcer`) wrapped in a `PolicyOptimizerRule`, and runs
+# the rewritten plan through both the single-node SessionContext and
+# the Ballista cluster to assert governance parity end-to-end. The
+# dep is dev-only — production wiring of policy lives in
+# `dataglot-server`, which keeps the lateral-crate hygiene from
+# CLAUDE.md rule 4 intact (no library cycle between sibling crates).
+dataglot-policy = { path = "../dataglot-policy" }
+tempfile = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+# tokio is in `[dependencies]` (slice 5a's executor binary needs the
+# runtime). Tests inherit access from there, so it's not re-declared
+# under `[dev-dependencies]`.
+tokio-postgres = { workspace = true }
+
+# Phase 2 slice 8.1 — 4-worker exit-criterion benchmark
+# (in-process 4-slot cut). Runs the 22 TPC-H queries through a
+# Ballista standalone cluster with `with_standalone_parallelism(4)`,
+# emits JSON in the same shape as `tpch-baseline.json` plus a
+# speedup-ratio field. `harness = false` because the bench is a
+# plain `fn main()` procedural runner, not a criterion harness;
+# the bench file's module doc carries the rationale.
+[[bench]]
+name = "four_worker_throughput"
+harness = false
+
+# Phase 2 slice 8.2b — 4-worker exit-criterion benchmark
+# (multi-process cluster). Connects via `SessionContext::remote`
+# to a Ballista scheduler container (brought up by
+# `docker-compose.bench.yml`), runs the same 22 TPC-H queries
+# across 4 executor containers. Where Phase 2 exit criterion #3
+# (≥5× single-node throughput) formally closes. Requires Docker
+# + a pre-running compose stack; see the bench file's module
+# doc for the operator workflow.
+[[bench]]
+name = "four_worker_multiprocess"
+harness = false
+
+# Phase 2 slice 5a — the standalone executor binary. Boots a
+# Ballista executor process that registers with a separate scheduler
+# (multi-process target). Carries the `--credentials-config` flag
+# consuming the resolver plumbing slice 3b landed; fail-fasts before
+# any RPC if the config file is missing or malformed.
+[[bin]]
+name = "dataglot-ballista-executor"
+path = "src/bin/dataglot-ballista-executor.rs"
+
+# Phase 2 slice 8.2a — the standalone scheduler binary. Boots a
+# Ballista scheduler that accepts gRPC executor registrations on a
+# configurable bind address (vs slice 3a's embedded scheduler which
+# `standalone_with_state` hard-codes to localhost). The companion
+# to `dataglot-ballista-executor` for the docker-compose
+# multi-process cluster shape.
+[[bin]]
+name = "dataglot-ballista-scheduler"
+path = "src/bin/dataglot-ballista-scheduler.rs"
+
+[lints]
+workspace = true

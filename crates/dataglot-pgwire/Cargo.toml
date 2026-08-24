@@ -1,0 +1,53 @@
+[package]
+name = "dataglot-pgwire"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "PostgreSQL wire protocol interface — pgwire + datafusion-postgres"
+
+[dependencies]
+arrow.workspace = true
+async-trait.workspace = true
+datafusion.workspace = true
+datafusion-postgres.workspace = true
+dataglot-core = { path = "../dataglot-core" }
+futures.workspace = true
+# JWT (`jwt` auth mode, ) + LDAP/AD (`ldap` auth mode) directory-group
+# resolution. Both pure-Rust (rule 15); see the workspace-dep notes.
+jsonwebtoken.workspace = true
+ldap3.workspace = true
+serde_json.workspace = true
+# `server-api-ring` enables pgwire's rustls TLS-negotiation path (the
+# `_ring` cfg on `negotiate_tls`) + the `TlsAcceptor` alias, so the
+# pgwire *ingress* socket can terminate TLS. Additive over the
+# default aws-lc-rs feature; we build the acceptor with the ring provider
+# to match the rest of the workspace (pg_tls / mysql_tls / ballista).
+pgwire = { workspace = true, features = ["server-api-ring"] }
+rand.workspace = true
+# Build the ingress `rustls::ServerConfig` (ring) + parse the operator's
+# PEM cert/key. Same TLS stack the federation connectors use.
+rustls = { workspace = true }
+rustls-pemfile.workspace = true
+# Pre-plan validation of client SQL (reject pathological compound
+# identifiers that panic datafusion's planner — ). Same version
+# datafusion 53 resolves to; `visitor` enables the AST walk. Already in
+# the tree transitively via datafusion.
+sqlparser = { version = "0.62", features = ["visitor"] }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Capturing subscriber for the auth-failure audit-emission unit test.
+tracing-subscriber.workspace = true
+# Temp cert/key files for the server_tls error-path tests.
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+# cargo-machete: arrow used via re-exported array/schema types (machete miss).
+[package.metadata.cargo-machete]
+ignored = ["arrow"]

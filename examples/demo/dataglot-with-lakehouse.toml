@@ -1,0 +1,39 @@
+host = "0.0.0.0"
+port = 5432
+batch_size = 8192
+partitions = 4
+default_catalog = "pg"
+default_schema = "public"
+
+[catalogs.pg]
+kind = "postgres"
+dsn_env = "DEMO_PG_DSN"
+
+[catalogs.pg_orders]
+kind = "postgres"
+dsn_env = "DEMO_ORDERS_DSN"
+
+[catalogs.lakehouse]
+kind = "warehouse"
+catalog_url = "http://lakekeeper:8181/catalog"
+warehouse = "main"
+credentials = { kind = "static", access_key_id = "minioadmin", secret_access_key_env = "DEMO_MINIO_SECRET" }
+s3_endpoint = "http://minio:9000"
+s3_region = "us-east-1"
+
+[[masks]]
+table = "users"
+column = "email"
+mask_literal = "***@example.com"
+
+[[row_filters]]
+table = "users"
+predicate = { kind = "eq_string", column = "email", value = "bob@example.com" }
+
+[[derived_products]]
+name = "customer_360_mart"
+catalog = "pg"
+schema = "public"
+sql = "SELECT u.id AS user_id, u.email, a.city, COUNT(o.id) AS order_count, SUM(o.amount) AS lifetime_value FROM pg.public.users u LEFT JOIN pg.public.addresses a ON a.user_id = u.id LEFT JOIN pg_orders.public.orders o ON o.user_id = u.id GROUP BY u.id, u.email, a.city"
+backing = "materialized"
+materialization = { warehouse = "lakehouse", namespace = "mart", table = "customer_360", refresh_every = "15m" }

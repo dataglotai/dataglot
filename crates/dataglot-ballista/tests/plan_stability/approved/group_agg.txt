@@ -1,0 +1,16 @@
+-- Optimized logical plan --
+Sort: items.category ASC NULLS LAST
+  Projection: items.category, count(Int64(1)) AS count(*) AS c, sum(items.qty) AS s
+    Aggregate: groupBy=[[items.category]], aggr=[[count(Int64(1)), sum(items.qty)]]
+      TableScan: items projection=[category, qty]
+
+-- Physical plan --
+SortPreservingMergeExec: [category@0 ASC NULLS LAST]
+  SortExec: expr=[category@0 ASC NULLS LAST], preserve_partitioning=[true]
+    ProjectionExec: expr=[category@0 as category, count(Int64(1))@1 as c, sum(items.qty)@2 as s]
+      AggregateExec: mode=FinalPartitioned, gby=[category@0 as category], aggr=[count(Int64(1)), sum(items.qty)]
+        RepartitionExec: partitioning=Hash([category@0], 4), input_partitions=4
+          AggregateExec: mode=Partial, gby=[category@0 as category], aggr=[count(Int64(1)), sum(items.qty)]
+            RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+              DataSourceExec: file_groups={1 group: [[<DATA>/items.csv]]}, projection=[category, qty], file_type=csv, has_header=true
+

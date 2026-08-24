@@ -1,0 +1,7 @@
+{
+  "host": "127.0.0.1",
+  "port": 15432,
+  "catalog_service": { "path": "/tmp/dataglot-fileless-meta.json" },
+  "auth": { "mode": "md5" },
+  "identities": { "admin": { "password_env": "DG_ADMIN_PW" } }
+}

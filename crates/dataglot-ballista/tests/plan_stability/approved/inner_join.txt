@@ -1,0 +1,18 @@
+-- Optimized logical plan --
+Sort: i.id ASC NULLS LAST
+  Projection: i.id, r.region, i.price
+    Inner Join: i.id = r.id
+      SubqueryAlias: i
+        TableScan: items projection=[id, price]
+      SubqueryAlias: r
+        TableScan: regions projection=[id, region]
+
+-- Physical plan --
+SortPreservingMergeExec: [id@0 ASC NULLS LAST]
+  SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]
+    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(id@0, id@0)], projection=[id@0, region@3, price@1]
+      RepartitionExec: partitioning=Hash([id@0], 4), input_partitions=1
+        DataSourceExec: file_groups={1 group: [[<DATA>/items.csv]]}, projection=[id, price], file_type=csv, has_header=true
+      RepartitionExec: partitioning=Hash([id@0], 4), input_partitions=1
+        DataSourceExec: file_groups={1 group: [[<DATA>/regions.csv]]}, projection=[id, region], file_type=csv, has_header=true
+

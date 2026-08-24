@@ -1,0 +1,367 @@
+[workspace]
+members = [
+  "crates/dataglot-ballista",
+  "crates/dataglot-catalog",
+  "crates/dataglot-core",
+  "crates/dataglot-federation",
+  "crates/dataglot-pgwire",
+  "crates/dataglot-policy",
+  "crates/dataglot-server",
+  "crates/dataglot-test-support",
+]
+# `dataglot-ballista` (Phase 2) brings in the full Apache Ballista
+# scheduler + executor + gRPC stack. The transitive dep `substrait`
+# requires a `protoc` binary at build time, and the compile alone
+# takes ~8 minutes on a cold cache. The spec
+# (`docs/phases/phase-2/02-ballista-distributed-execution.md`) calls
+# this out explicitly: "Ballista's dep tree is heavy and would
+# dominate the default workspace build path."
+#
+# Excluding it from `default-members` keeps every contributor's
+# bare `cargo build` / `cargo test` light and free of the protoc
+# prerequisite; Phase 2 work opts in via `cargo build -p
+# dataglot-ballista` (and Makefile target `ballista-ci`). The CI
+# workspace-wide jobs do the same via `--exclude dataglot-ballista`,
+# with a dedicated `ballista` job covering it.
+default-members = [
+  "crates/dataglot-catalog",
+  "crates/dataglot-core",
+  "crates/dataglot-federation",
+  "crates/dataglot-pgwire",
+  "crates/dataglot-policy",
+  "crates/dataglot-server",
+  "crates/dataglot-test-support",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.5.0"
+edition = "2021"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/dataglotai/dataglot"
+
+[workspace.dependencies]
+# Arrow ecosystem
+# ADBC driver-manager stack ( `adbc` feature on dataglot-federation
+# + dev-dep fixture seeding there and in dataglot-server). Pre-1.0 pin;
+# 0.24 accepts arrow >=58,<60. arrow-schema MUST stay at 58 to match the
+# workspace arrow 58 (and datafusion 54, which caps arrow-schema <59):
+# adbc pulls arrow-array + arrow-schema as separate deps, and an
+# arrow-schema=59 pin cross-wires adbc's FFI (arrow-array 58 + schema 59),
+# breaking adbc_ffi's `FFI_ArrowSchema` conversions.
+adbc_core = "0.24"
+adbc_driver_manager = "0.24"
+arrow = { version = "58", features = ["prettyprint"] }
+arrow-schema = "58"
+# Flight (gRPC Arrow transport). Base version only; consumers add features:
+# dataglot-ballista (plan shipping) and dataglot-server (`flight_sql` egress,
+# which adds `flight-sql-experimental`).
+arrow-flight = "58"
+
+# DataFusion
+datafusion = "54"
+# datafusion-federation 0.5.5 targets DataFusion 54 (upstream #176). The
+#  `<0.5.4` cap was retired by the coordinated DataFusion 54
+# ecosystem bump: datafusion 54 + federation 0.5.5 + ballista 54
+# + datafusion-postgres 0.18 + a df54 iceberg-rust rev, all in lockstep.
+datafusion-federation = "0.5.5"
+
+# Iceberg (stubbed for now)
+# iceberg = "0.4"
+# iceberg-datafusion = "0.4"
+
+# pg wire
+pgwire = "0.40"
+datafusion-postgres = "0.18"
+# `setup_pg_catalog()` — registers `pg_catalog.pg_settings`,
+# `pg_class`, `pg_namespace`, etc. so psql / JDBC introspection
+# (`\d`, `\dt`, `\dn`) works against `dataglot-server`. Pinned to
+# the matching `datafusion-postgres` minor; both crates ship from
+# the same upstream repo and share their `0.17.x` release cadence.
+# Wired by `dataglot-core::SessionContextFactory`.
+datafusion-pg-catalog = "0.18"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+# base64 — `dataglot-testbench` (report assets) + the `dataglot-server`
+# `flight_sql` feature (decode the `Authorization: Basic` header). Hoisted
+# here as the single version source of truth (workspace-deps hygiene).
+base64 = "0.23"
+
+# Secret envelope encryption — `dataglot-server` encrypts
+# `CREATE SECRET` values at rest in the meta store. Pure-Rust RustCrypto AEAD
+# (no `*-sys`, no C toolchain — CLAUDE.md rule 15 clean), same family as the
+# `hmac`/`sha2` already used for MD5 auth. XChaCha20-Poly1305 is used with a
+# random 192-bit nonce (safe to generate randomly, unlike a 96-bit nonce).
+chacha20poly1305 = "0.11"
+
+# Randomness — MD5 auth challenge salt (`dataglot-pgwire`). Already a
+# transitive dep via pgwire's `RandomPidSecretKeyGenerator`; declared
+# here so the auth path can mint its own per-connection 4-byte salt.
+rand = "0.10"
+
+# JWT verification for the `jwt` connection-auth mode — the client
+# presents a signed JWT as its password and `dataglot-pgwire` verifies the
+# signature (HS256 / RS256 / ES256) + `exp`/`nbf`/`iat` + `iss`/`aud` before
+# extracting the `groups` claim into the session identity. Pure-Rust (ring +
+# RustCrypto `rsa`), already resolved in `Cargo.lock` transitively.
+# jsonwebtoken 11 added a `CryptoProvider` abstraction: a build must enable a
+# crypto backend feature or verification panics at runtime. `rust_crypto` is the
+# pure-Rust backend (HS256/RS256/ES256) — chosen over native `aws_lc_rs` to keep
+# the Rust-only runtime (rule 15); `use_pem` (default) stays for PEM key loaders.
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+
+# LDAP / Active Directory directory-group resolution for the `ldap`
+# connection-auth mode. Pure-Rust async LDAP client (CLAUDE.md
+# rule 15 clean — no `*-sys`, no C toolchain): default features are turned
+# OFF to drop the native-TLS (`openssl-sys`) path, and LDAPS is served by the
+# pure-Rust `tls-rustls` feature (same rustls/ring stack as pgwire ingress).
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
+
+# TLS (rustls, ring provider) — shared by dataglot-ballista's cluster
+# mTLS and dataglot-federation's Postgres source-connection TLS. Declared
+# at the workspace so both crates pin one version (workspace-dep hygiene).
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Embedded single-file meta store ( slice A / ). Pure-Rust,
+# ACID/MVCC, no `*-sys` or C toolchain — the rule-15-clean equivalent of the
+# SQLite backend RisingWave uses for its local meta store. Backs
+# `dataglot_catalog::RedbMetaStore`; the whole-file JSON `EmbeddedMetaStore`
+# it replaces stays only as a test double for now.
+redb = "4"
+# TOML config format (server bootstrap config + testbench config). Version
+# source of truth for both crates.
+toml = "1.1"
+
+# Cryptographic primitives — used by `dataglot-server::webhook`
+# for HMAC-SHA256 verification of the inbound governance
+# (Interface 3) payload signature. RustCrypto org maintainers;
+# both crates have zero `unsafe` on the hot path. See
+# `docs/phases/phase-2/04-inbound-governance-integration.md`.
+hmac = "0.13"
+sha2 = "0.11"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# URL parsing. Object-store registration keys (`s3://bucket`) in
+# `dataglot-server` and the scheduler URL in `dataglot-ballista`. One 2.x
+# pin across the workspace.
+url = "2"
+
+# Unique IDs — used by `dataglot-core::lineage` for OpenLineage
+# `run.runId` (UUIDv4). The `v4` feature pulls the random
+# generator; `serde` is needed because run IDs cross JSON
+# boundaries (HTTP emitter payload). See
+# `docs/phases/phase-1/06-openlineage-emitter.md`.
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Used by `dataglot-server::lineage` to format `eventTime` as
+# RFC3339 UTC strings for OpenLineage `RunEvent` payloads.
+# Already in the lockfile transitively via tokio-postgres'
+# `with-chrono-0_4` feature; promoting to a workspace dep
+# makes the usage explicit. Default features off — we only
+# need DateTime + RFC3339 formatting, not the clock crate.
+chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
+
+# Testing - Unit & Integration
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+rstest = "0.26"
+
+# Testing - Property-based
+proptest = "1.4"
+
+# Testing - Benchmarking
+criterion = { version = "0.8", features = ["html_reports"] }
+
+# Testing - DataFusion sqllogictest
+sqllogictest = "0.29"
+
+# Testing - Engine integration (testcontainers)
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres", "mysql", "minio"] }
+
+# Testing - E2E (postgres client)
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
+
+# rustls-backed TLS connector for `tokio-postgres`. Used by
+# `dataglot-federation`'s Postgres source-TLS path (optional, behind the
+# `postgres` connector's TLS support) and by `dataglot-tests`' pgwire
+# ingress-TLS e2e client. Tracks `tokio-postgres` 0.7's API; bump together.
+tokio-postgres-rustls = "0.14"
+
+# Async Postgres pool. Used by `dataglot-catalog` (Phase 1 task 08)
+# for the catalog-service registry — low-concurrency, idle-mostly
+# workload that benefits from a pool with idle eviction over
+# raw `tokio_postgres::connect` per call. Pinned to the major
+# version that tracks `tokio-postgres` 0.7's API; bump together.
+deadpool-postgres = "0.14"
+
+# Concurrent hashmap. Used by `dataglot-catalog::cache` (Phase 1
+# task 09) — reader-mostly workload, low contention; DashMap's
+# shard-by-hash keeps per-key contention bounded without the
+# read-write coordination cost of `RwLock<HashMap>`. Already
+# pulled in transitively via `datafusion`, so promoting to a
+# workspace dep makes the usage explicit.
+dashmap = "6"
+
+# rust_decimal turns on tokio-postgres's NUMERIC FromSql support via
+# the `db-tokio-postgres` feature. Used by `dataglot-federation`'s
+# Postgres connector to decode NUMERIC columns into Arrow Decimal128
+# (and as a fallback when PG returns NUMERIC for SUM/AVG of integer
+# columns where DataFusion's planner expected Int64).
+rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
+
+# HTTP client. Runtime dep for `dataglot-server::lineage`
+# (OpenLineage HTTP emitter POSTs RunEvents) and dev-dep for
+# integration tests. `rustls` keeps us off the system OpenSSL
+# tree for a leaner container image; `json` turns on serde_json
+# integration so the emitter can `.json()` a `serde_json::Value`.
+# MySQL wire client. Version source of truth for the federation
+# connector and dataglot-server's Docker-gated e2e seeding; per-crate
+# features stay in each crate's own declaration.
+mysql_async = { version = "0.37", default-features = false }
+# Oracle wire client (kubo/rust-oracle, ODPI-C). Version source of truth
+# for the federation `oracle` connector and the dataglot-tests Oracle e2e
+#. Each crate adds `optional = true` in its own declaration.
+oracle = { version = "0.6", features = ["chrono"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+# Embeds a built frontend (frontend/dist/) into a binary. Used by the
+# dataglot-testbench UI and the dataglot-server dashboard.
+rust-embed = { version = "8", features = ["mime-guess"] }
+
+# HTTP mock server for unit-testing the OpenLineage emitter
+# against a real reqwest client without booting Marquez.
+# Marquez itself runs only in the Docker-gated integration
+# test; wiremock covers the per-call shape pinning.
+wiremock = "0.6"
+
+# XML pull-parser for the OData `$metadata` (EDMX) schema document
+# (Phase 4 `odata` connector, ). Pure Rust — no native XML lib.
+quick-xml = "0.41"
+
+# Shared across ≥2 crates — kept here as the single version source of
+# truth (enforced by scripts/check-workspace-deps.sh). parquet /
+# datafusion-proto / prost must track the workspace `arrow` / `datafusion`
+# majors; the iceberg-rust git rev must stay in lockstep across all four
+# sub-crates. clap's base feature set is `derive`; crates that also need
+# `env` add it via `clap = { workspace = true, features = ["env"] }`.
+parquet = "58"
+datafusion-proto = "54"
+prost = "0.14"
+# gRPC stack shared by dataglot-ballista and the dataglot-server `flight_sql`
+# egress. Base versions only; consumers add features (ballista: tonic
+# `tls-ring`; server: tokio-stream `net`).
+tonic = "0.14"
+tokio-stream = "0.1"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+tower = { version = "0.5", features = ["util"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+mockito = "1"
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "3a5613fef0a911d43e5c63b4591fe40877a90f36" }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "3a5613fef0a911d43e5c63b4591fe40877a90f36" }
+iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "3a5613fef0a911d43e5c63b4591fe40877a90f36" }
+iceberg-storage-opendal = { git = "https://github.com/apache/iceberg-rust", rev = "3a5613fef0a911d43e5c63b4591fe40877a90f36", default-features = true }
+# TPC-H data generator (Ballista 4-worker bench + the dataglot-tests
+# baseline) — pinned by git rev; kept here so the two consumers can't
+# drift to different revs.
+tpchgen = { git = "https://github.com/clflushopt/tpchgen-rs.git", rev = "5cde819660fa563b0f3517de40ffcf768ede412b" }
+tpchgen-arrow = { git = "https://github.com/clflushopt/tpchgen-rs.git", rev = "5cde819660fa563b0f3517de40ffcf768ede412b" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+# `pedantic` is `deny` (not `warn`) so a local `cargo clippy` matches CI's
+# `-D warnings` exactly — no "clean locally, red in CI" gap. (The codebase is
+# already pedantic-clean; CI has enforced it via `-D warnings` all along.)
+pedantic = { level = "deny", priority = -1 }
+cast_possible_truncation = "allow"
+module_name_repetitions = "allow"
+
+# Tier 1 — async-safety + ship-readiness lints. These encode three CLAUDE.md
+# commitments as enforceable lints:
+#   - Rule 11 (no blocking IO in async context) — paired with clippy.toml
+#     `disallowed-methods`.
+#   - Long-running server posture — `dbg!()` and `todo!()` must never reach
+#     a release binary.
+#   - Async-first traits + tokio multi-thread runtime — `await_holding_lock`
+#     deadlocks are a real bug class for a query server holding `RwLock`s
+#     across `.await` points.
+#   - `large_futures` matches DataFusion's threshold (clippy.toml) to catch
+#     async state-machine bloat before it causes stack overflows in deep
+#     federation/pgwire call chains.
+dbg_macro = "deny"
+todo = "deny"
+await_holding_lock = "deny"
+# `await_holding_lock` only covers `std`/`parking_lot` guards — it
+# deliberately ignores `tokio::sync::Mutex` (those are *meant* to cross
+# `.await`). `significant_drop_tightening` closes that blind spot: it
+# flags a guard (incl. tokio's) held past its last use, which is the
+# shape of the re-entrant `Mutex<Client>` deadlock fixed in the testbench
+# DataglotEngine (a guard held across a self-call that re-locked it).
+# Keeping guards tight makes that class structurally hard to reintroduce.
+significant_drop_tightening = "deny"
+large_futures = "warn"
+
+# CI profile: faster builds, smaller artifacts, better cache efficiency
+[profile.ci]
+inherits = "dev"
+incremental = false
+debug = 0
+strip = "debuginfo"
+
+# Release profile tuned for the Phase 0 sub-500MB container budget
+# (Strategy v3.0 / ). The settings below trade build time for
+# binary size; the resulting `dataglot` server binary is what ships
+# inside the production Docker image.
+#
+# - `lto = "fat"`: cross-crate inlining + dead-code elimination.
+#   The single biggest size win for this workspace's deps tree
+#   (datafusion + iceberg-rust + tokio = lots of generic
+#   monomorphisation surface to fold).
+# - `codegen-units = 1`: maximises LTO opportunity by giving the
+#   linker one big bag instead of many. Slower compile, smaller
+#   output.
+# - `strip = "symbols"`: drop debug + symbol tables from the final
+#   binary. The Dockerfile also runs `strip` post-build as a
+#   belt-and-braces step; this entry makes the artifact small even
+#   when the binary is consumed outside Docker.
+#
+# `opt-level` stays at 3. `"s"`/`"z"` (size-first) trade query
+# throughput for marginal extra size reduction, which is the wrong
+# trade-off for an OLAP engine binary.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+# Fast optimized profile for local dev tooling (the `run-testbench.sh` demo /
+# load runs) and any "optimized but iterate fast" need. Mirrors DataFusion's
+# `release-nonlto`: skip LTO and fan codegen back out to many units. Runtime is
+# close to `release` (fat- vs no-LTO is low-single-digit % for this workload),
+# but it skips the whole-program LTO link — measured ~2x faster on a cold build
+# and several times faster on incremental rebuilds. NOT for the shipped
+# container — that stays on `release` (fat-LTO) for the sub-500MB size budget.
+# See.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false

@@ -1,0 +1,316 @@
+[package]
+name = "dataglot-federation"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Federation layer — FederatedTableProvider and SQL pushdown"
+
+[features]
+default = []
+# Generic ADBC connector (, spec at docs/phases/phase-3/02-adbc-connector.md).
+# BYO-driver: the operator supplies the path to an ADBC driver shared library
+# (`.so` / `.dylib` / `.dll`) plus a mandatory `dialect` from the strict
+# whitelist of DataFusion-shipped unparser dialects. The `adbc_core` +
+# `adbc_driver_manager` crates are pure Rust (driver loading goes through
+# `libloading`/dlopen at RUNTIME — the native code is the user's driver, never
+# our build), so rule-15 native-dependency hygiene is unaffected. Held as
+# bedrock-tier deps (Apache-maintained alongside arrow/datafusion); exempt
+# from the federation-crate health tripwire per the spec.
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager"]
+# PostgreSQL data source connector.
+# Pulls `tokio-postgres` (wire client). Both this feature and the
+# `mysql` feature share `chrono` (date/timestamp decoding) and
+# `rust_decimal` (NUMERIC / DECIMAL decoding) — the optional deps
+# are declared once and turned on by either connector.
+postgres = [
+  "dep:tokio-postgres",
+  "dep:chrono",
+  "dep:rust_decimal",
+  # TLS for the Postgres source connection (rustls, ring provider — the
+  # same provider dataglot-ballista standardizes on). All pure-Rust /
+  # transitive-native (ring is transitive under rustls, not a direct dep),
+  # so the native-dependency-hygiene gate is unaffected.
+  "dep:tokio-postgres-rustls",
+  "dep:rustls",
+  "dep:rustls-native-certs",
+  "dep:rustls-pemfile",
+  "dep:webpki-roots",
+]
+# MySQL data source connector.
+# Pulls `mysql_async` (wire client, async via tokio). Shares
+# `chrono` (DATETIME/TIMESTAMP decoding) and `rust_decimal`
+# (DECIMAL decoding) with the `postgres` feature — see the
+# comment on `postgres` above.
+# `dep:rustls` is pulled so the MySQL TLS path can install the ring
+# crypto provider as the process default (mysql_async builds its rustls
+# ClientConfig from that default; without it, a MySQL-only TLS deployment
+# panics). Same ring provider the postgres connector + ballista use.
+mysql = ["dep:mysql_async", "dep:chrono", "dep:rust_decimal", "dep:rustls"]
+# OData v2 generic federation connector (Phase 4, ) — a direct
+# `TableProvider` (rule 3: OData is REST, not SQL). `quick-xml` parses the
+# `$metadata` EDMX schema document → Arrow schema. Pure Rust (native-dep
+# hygiene unaffected). The `reqwest` HTTP client + `TableProvider` scan land
+# in the next slice.
+odata = ["dep:quick-xml", "dep:serde_json", "dep:reqwest"]
+# Generic REST/JSON connector (Phase 4, ) — a direct `TableProvider`
+# (rule 3: REST is not SQL), sibling of `odata`. Shares the `serde_json`
+# decode + `reqwest` HTTP client. Salesforce / Athena Health API sources.
+rest = ["dep:serde_json", "dep:reqwest"]
+# Lakehouse warehouse table format support (Apache Iceberg under the hood).
+#
+# Per CLAUDE.md rule 7 the user-facing surface never says "Iceberg".
+# Internally we depend on iceberg-rust (`iceberg`, `iceberg-catalog-rest`,
+# `iceberg-datafusion`, `iceberg-storage-opendal`) pinned to a specific
+# commit on `apache/iceberg-rust` main. The published crate releases up
+# to and including v0.9.0 / v0.9.1-rc.3 still target datafusion 52, so
+# until a release that includes the datafusion 53.1 bump (commit
+# 1b6400956da02d6b564db527edf5d7ea8feca0d3) is published we have to
+# pin git. This is not a fork — we vendor an upstream release commit.
+iceberg = [
+  "dep:iceberg",
+  "dep:iceberg-catalog-rest",
+  "dep:iceberg-datafusion",
+  "dep:iceberg-storage-opendal",
+  # the materialize write path builds parquet via the iceberg writer's
+  # ParquetWriterBuilder, which takes `parquet::WriterProperties`.
+  "dep:parquet",
+]
+# Snowflake data source connector — stub. The crate dep is wired
+# in (via the Peaka arrow-58 fork of `andrusha/snowflake-rs`) so
+# downstream consumers can opt in early, but no `SQLExecutor`
+# implementation lands until the Phase 2 federation-breadth
+# follow-up to `docs/phases/phase-1/05-snowflake-connector.md`.
+snowflake = ["dep:snowflake-api"]
+# Oracle data source connector (, bespoke — Exadata displacement).
+# Pulls the `oracle` crate (kubo/rust-oracle, an ODPI-C wrapper). NOTE:
+# ODPI-C compiles at build time (needs only a C compiler), but it
+# dlopen's the **Oracle Instant Client** (libclntsh, 11.2+) at RUNTIME —
+# so a host/container that *runs* with `--features oracle` must have
+# Instant Client installed (LD_LIBRARY_PATH / DYLD_LIBRARY_PATH). Shares
+# chrono / rust_decimal with pg/mysql. Excluded from `all` (like
+# `snowflake`) so default builds never pull the C dep or imply the
+# Instant Client runtime requirement.
+oracle = ["dep:oracle", "dep:chrono", "dep:rust_decimal"]
+# Pure-Rust Oracle backend — the `oracle-rs` crate reimplements
+# the Oracle TTC/TNS protocol in Rust: NO ODPI-C, no C compiler, no Oracle
+# Instant Client at runtime, async-native. Opt-in alongside or instead of
+# `oracle`; the connector dispatches between the two behind one
+# `SQLExecutor`. Shares chrono / rust_decimal with the OCI decode. Excluded
+# from `all` (off by default) like `oracle`. Adds NO native dependency, so
+# it needs no entry in scripts/check-native-deps.py.
+oracle-pure = ["dep:oracle-rs", "dep:chrono", "dep:rust_decimal"]
+# Enable all production connectors. `snowflake` + `oracle` are
+# intentionally excluded — `snowflake` is stub-only today, and `oracle`
+# carries an Oracle-Instant-Client *runtime* dependency. Flipping either
+# into `all` would silently pull a heavy dep (and, for oracle, imply the
+# C client at runtime) into every `--features all` build. Opt in
+# explicitly with `--features snowflake` / `--features oracle`.
+all = ["postgres", "mysql", "iceberg", "odata", "rest"]
+
+[dependencies]
+# ADBC driver-manager stack for the `adbc` feature. Pre-1.0: the
+# spec pinned "0.24" at drafting time but 0.23.0 is the latest published
+# release (2026-04); retire the 0.x pin when 1.0 ships. Both crates accept
+# `arrow >=53.1,<59`, which unifies with the workspace `arrow = 58` /
+# datafusion 53 pair — no parallel arrow major.
+adbc_core = { workspace = true, optional = true }
+adbc_driver_manager = { workspace = true, optional = true }
+arrow.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+# `chrono` is shared between the `postgres` and `mysql` connectors for
+# DATE/DATETIME/TIMESTAMP decoding. Pulled in by either feature.
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+datafusion.workspace = true
+# The `sql` feature enables the SQL-source federation module
+# (`SQLExecutor`, `SQLFederationProvider`, `SQLTableSource`) that the
+# Postgres connector is built on.
+datafusion-federation = { workspace = true, features = ["sql"] }
+# Used by `codec::FederationPlanCodec` to serialise the inner
+# `LogicalPlan` of a `VirtualExecutionPlan` across the Ballista
+# wire format. Phase 2 prerequisite — see
+# `docs/phases/phase-2/01-federation-codec-impl.md`. Version
+# tracks `datafusion` (both crates must share the same proto
+# schema).
+datafusion-proto.workspace = true
+dataglot-core = { path = "../dataglot-core" }
+futures.workspace = true
+# `prost` derives the envelope `Message` struct that wraps the
+# inner `LogicalPlanNode` bytes + the connector-name string the
+# codec uses to look up the worker-side executor. Already in the
+# workspace lockfile transitively via `datafusion-proto`; declared
+# directly here so the `#[derive(prost::Message)]` annotation is
+# explicit at the call site.
+prost.workspace = true
+# Lakehouse / Iceberg deps — pinned to the upstream commit that bumped
+# datafusion to 53.1.0 (the version this workspace uses). Released
+# crates.io versions of `iceberg-datafusion` <=0.9.0 still pull in
+# datafusion 52, which would silently produce a second parallel
+# `TableProvider` type incompatible with our SessionContext. See the
+# `iceberg` feature in `[features]` for more context.
+#
+# Pinning by `rev` (not `branch`) so `cargo update` cannot move us to a
+# breaking commit. To roll forward, update the rev explicitly.
+iceberg = { workspace = true, optional = true }
+iceberg-catalog-rest = { workspace = true, optional = true }
+iceberg-datafusion = { workspace = true, optional = true }
+iceberg-storage-opendal = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+# `mysql_async` is the async MySQL wire client used by the `mysql`
+# connector. We disable the default features (native-tls + native zlib)
+# and pick `minimal-rust` plus the rustls TLS stack (see the feature
+# comment below) so the dep tree stays small and the TLS provider matches
+# the rest of the workspace (ring). We decode DATE/DATETIME/TIMESTAMP from
+# the raw `Value::Date(...)` variant so we don't need `mysql_async`'s
+# optional `chrono` feature; `chrono` itself is shared with the Postgres
+# connector for the Arrow side of the conversion.
+mysql_async = { workspace = true, features = [
+  "minimal-rust",
+  # TLS for the MySQL source connection. `rustls-tls` pulls rustls +
+  # tokio-rustls + webpki-roots (bundled Mozilla roots) but no provider;
+  # `ring` selects the ring provider (matching the Postgres connector +
+  # dataglot-ballista). `tls12` broadens server compatibility. mysql_async
+  # drives the whole TLS handshake, so no direct rustls dep is needed here.
+  "rustls-tls",
+  "ring",
+  "tls12",
+], optional = true }
+# `oracle` (kubo/rust-oracle) — the Oracle wire client for the `oracle`
+# connector. Wraps ODPI-C (compiles at build with a C compiler);
+# dlopen's Oracle Instant Client at runtime. Synchronous API — every call
+# runs under `tokio::task::spawn_blocking` (CLAUDE.md rule 11).
+oracle = { workspace = true, optional = true }
+# `oracle-rs` (stiang/oracle-rs) — pure-Rust Oracle wire client for the
+# `oracle-pure` backend. Reimplements TTC/TNS in Rust: no ODPI-C,
+# no Instant Client, async/Tokio-native. v0.1.x — opt-in + off by default;
+# the differential harness is the correctness gate.
+oracle-rs = { version = "0.1", optional = true }
+# `rust_decimal` is shared between the `postgres` and `mysql`
+# connectors. The `db-tokio-postgres` feature wires up the
+# `FromSql` impls Postgres needs for NUMERIC; the same crate is
+# used by the MySQL connector for DECIMAL decoding (DECIMAL support
+# itself is a follow-up — the MVP rejects DECIMAL columns at the
+# decoder per the spec).
+rust_decimal = { workspace = true, optional = true }
+# EDMX (`$metadata`) XML pull-parser for the `odata` connector. Pure Rust.
+quick-xml = { workspace = true, optional = true }
+# JSON decode for the `odata` connector's entity-set responses. Also a
+# dev-dependency (iceberg integration test); the optional entry here makes it
+# available to the `odata` lib code without pulling it into a default build.
+serde_json = { workspace = true, optional = true }
+# HTTP client for the `odata`/`rest` connectors (rustls TLS — the workspace
+# default, no native-tls). `query` adds `RequestBuilder::query` for the OData
+# `$select`/`$filter`/`$top` params. `http2` enables HTTP/2 (incl. prior-knowledge
+# `h2c`) so the REST connector can multiplex many in-flight requests over a few
+# connections under high concurrency — `h2` is already in the graph,
+# so this only flips feature flags, adding no new crate. Pure Rust; native-dep
+# hygiene unaffected.
+reqwest = { workspace = true, optional = true, features = ["query", "http2"] }
+# Snowflake wire client. Pinned to Peaka's `peakacom/snowflake-rs`
+# fork — the only delta from upstream `andrusha/snowflake-rs@v0.14.0`
+# is a 3-line `arrow-array` / `arrow-ipc` / `arrow-schema` bump from
+# `57` to `58` so the crate's Arrow surface aligns with our workspace
+# `arrow = "58"`. The downgrade-the-workspace alternative was rejected
+# (would force `datafusion 53 → 52` and `datafusion-federation 0.5 →
+# 0.4`, losing ~4 months of upstream feature work). The fork retires
+# the moment upstream ships its own arrow-58 release. See
+# `docs/phases/phase-1/05-snowflake-connector.md` § "Implementation
+# prerequisite — `snowflake-rs` fork".
+#
+# Pinning by `rev` (not `branch`) so `cargo update` cannot move us to
+# a breaking commit — same convention as the `iceberg` deps above.
+# To roll forward (e.g. when upstream lands a new bug fix on the
+# fork's `arrow-58` branch), update the rev explicitly. The current
+# rev also carries the  async result-polling fix (the client
+# now follows Snowflake's `getResultUrl` ping-pong instead of failing
+# to decode the in-progress response).
+#
+# `cert-auth` is upstream's default feature and is *required* to
+# compile cleanly — `session.rs` references `cert_request_body()`
+# unconditionally at the call site even when the method itself is
+# gated behind the `cert-auth` cfg, so `default-features = false`
+# without re-enabling `cert-auth` breaks the build. This is an
+# upstream cfg-gating bug, not a fork bug; revisit when upstream
+# fixes it (or when we switch to a release that does).
+# `polars` we deliberately leave OFF — it pulls polars-core +
+# polars-io (≈2 minutes of compile + several MB) and we don't
+# need DataFrame interop; we consume RecordBatches directly.
+snowflake-api = { git = "https://github.com/peakacom/snowflake-rs", rev = "ec8d5814aba35bdfe7c2b996f83bb596ad33e181", default-features = false, features = [
+  "cert-auth",
+], optional = true }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres = { workspace = true, optional = true }
+# TLS for the Postgres connector (`postgres` feature). rustls + rustls-pemfile
+# inherit from the workspace (shared with dataglot-ballista's cluster mTLS;
+# `ring` provider — matches its `install_default_crypto_provider`). `ring` is
+# transitive under rustls (not a direct dep), so rule-15 native hygiene is
+# unaffected. webpki-roots (Mozilla bundle) + rustls-native-certs (OS/corporate
+# store) + rustls-pemfile (private-CA file parsing) cover the three trust-root
+# sources operators need; the federation-only ones stay declared here.
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+# Provider is fixed by the `rustls::ClientConfig` we build (ring), so no
+# provider feature is selected here.
+tokio-postgres-rustls = { workspace = true, optional = true }
+tracing.workspace = true
+webpki-roots = { version = "1.0", optional = true }
+
+[dev-dependencies]
+# Raw ADBC driver-manager access for seeding the DuckDB fixture database
+# in tests/adbc_integration.rs (the test file itself is gated on
+# `#![cfg(feature = "adbc")]`; dev-deps can't be optional, but both
+# crates are tiny and pure Rust so the unconditional dev build is cheap).
+adbc_core.workspace = true
+adbc_driver_manager.workspace = true
+# Needed by the postgres integration test (tests/postgres_integration.rs)
+# which runs behind the `postgres` feature flag and spins up a PostgreSQL
+# testcontainer.
+testcontainers.workspace = true
+# The `oracle` module (gvenzl/oracle-free) is added on top of the
+# workspace feature set (`postgres`/`mysql`/`minio`) for the Oracle
+# integration tests. NOTE: that module is `#[cfg(not(aarch64))]`
+# upstream — Oracle DB has no ARM image, so `tests/oracle_integration.rs`
+# and `tests/oracle_postgres_cross_source.rs` are x86-only (CI runs them;
+# they can't run on Apple-Silicon dev machines). The workspace `postgres`
+# feature backs the Postgres side of the Oracle×Postgres cross-source
+# JOIN test ( exit criterion #3).
+testcontainers-modules = { workspace = true, features = ["oracle"] }
+# Needed by the warehouse integration test
+# (tests/iceberg_integration.rs) which uses the in-memory iceberg
+# catalog with a temp warehouse directory.
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-postgres.workspace = true
+
+# Needed by the Lakekeeper-backed integration tests
+# (tests/iceberg_integration.rs, the `lakekeeper_*` tests). These tests
+# stand up a real Lakekeeper + MinIO + Postgres testcontainer stack and
+# drive the management API over HTTP.
+#
+# `reqwest` is used to POST the bootstrap, project, and warehouse-creation
+# requests against Lakekeeper, and to wait for MinIO/Lakekeeper readiness.
+# `json` enables `RequestBuilder::json` and `Response::json`.
+reqwest = { workspace = true, features = ["json"] }
+serde_json = { workspace = true }
+# Mock HTTP server for the `odata` connector's end-to-end test (serve
+# `$metadata` + a JSON entity set, then assert the pushed request URL).
+wiremock = { workspace = true }
+
+# `parquet` is needed to seed a warehouse table via the iceberg-rust
+# writer API: it provides `WriterProperties` and the
+# `PARQUET_FIELD_ID_META_KEY` metadata key the writer requires on the
+# Arrow schema. Pinned to v58 to match `arrow` and the iceberg-rust
+# git rev — mismatched majors yield two parallel `WriterProperties`
+# types neither of which satisfies the writer API.
+parquet.workspace = true
+
+[lints]
+workspace = true
+
+# cargo-machete: arrow-schema used via re-exported types; thiserror via #[derive(Error)] (macro-only — invisible to machete).
+[package.metadata.cargo-machete]
+ignored = ["arrow-schema", "thiserror"]

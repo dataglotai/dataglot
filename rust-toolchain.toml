@@ -1,0 +1,11 @@
+# Pin the toolchain contributors build with. CI builds on stable
+# (dtolnay/rust-toolchain@stable), so this keeps local builds consistent
+# with CI. The workspace MSRV (minimum supported Rust) is 1.94, declared
+# once in the root Cargo.toml `rust-version` field and verified separately
+# by the MSRV CI job — building on current stable satisfies that floor.
+#
+# `make fmt` explicitly uses `+nightly` for rustfmt; that override wins
+# over this default, so nightly is only pulled when you format.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]

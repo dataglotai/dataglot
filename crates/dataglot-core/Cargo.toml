@@ -1,0 +1,50 @@
+[package]
+name = "dataglot-core"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared types, traits, and DataFusion SessionContext setup"
+
+[dependencies]
+arrow.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+datafusion.workspace = true
+datafusion-federation = { workspace = true, features = ["sql"] }
+# `setup_pg_catalog()` registers the `pg_catalog.*` tables every
+# psql client introspects on connect (`pg_settings`, `pg_class`,
+# `pg_namespace`, `pg_attribute`, `pg_type`, ...). Without this,
+# `\d` / `\dt` / `\dn` fail with `table 'dataglot.pg_catalog.*'
+# not found`. Called from `SessionContextFactory` so every
+# session — pg-wire, Ballista worker, test — gets the same
+# pg-compatibility surface..
+datafusion-pg-catalog.workspace = true
+serde.workspace = true
+# Phase 2 slice 5a — `credentials::CredentialResolverConfig::from_json_file`
+# parses the JSON the executor binary's `--credentials-config` flag
+# points at. Promoted from dev-dep to a regular dep so the production
+# surface (the executor's resolver-construction fail-fast path) can
+# consume it. Same workspace pin; the dep was already in the
+# compile graph transitively.
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+# Session construction, UDF registration, and pg_catalog setup emit
+# `debug` traces so "wrong results" investigations (wrong
+# `current_database()`, empty `\dt`, missing UDFs) have something to
+# inspect; the pg_catalog build-invariant failure logs `error` before
+# it panics.
+tracing.workspace = true
+# Used by `lineage::QueryStartContext::run_id` for OpenLineage run
+# identifiers (UUIDv4). Cross-crate consumers (`dataglot-server`'s
+# HTTP emitter, future audit-trail hooks in `dataglot-policy`) treat
+# `RunId` as opaque — only the trait surface depends on the type.
+uuid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

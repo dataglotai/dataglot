@@ -1,0 +1,33 @@
+[package]
+name = "dataglot-policy"
+publish = false
+description = "Policy enforcement for Dataglot — column masking, row filtering, credential management"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+# DataFusion (for Expr types)
+datafusion.workspace = true
+
+# Arrow
+arrow.workspace = true
+
+# Async
+tokio.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

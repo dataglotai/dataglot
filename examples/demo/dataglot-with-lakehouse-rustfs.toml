@@ -1,0 +1,31 @@
+host = "0.0.0.0"
+port = 5432
+batch_size = 8192
+partitions = 4
+default_catalog = "pg"
+default_schema = "public"
+
+[catalogs.pg]
+kind = "postgres"
+dsn_env = "DEMO_PG_DSN"
+
+[catalogs.pg_orders]
+kind = "postgres"
+dsn_env = "DEMO_ORDERS_DSN"
+
+[catalogs.lakehouse]
+kind = "warehouse"
+catalog_url = "http://lakekeeper:8181/catalog"
+warehouse = "rustfs"
+credentials = { kind = "static", access_key_id = "rustfsadmin", secret_access_key_env = "DEMO_RUSTFS_SECRET" }
+s3_endpoint = "http://rustfs:9000"
+s3_region = "us-east-1"
+
+[[masks]]
+table = "users"
+column = "email"
+mask_literal = "***@example.com"
+
+[[row_filters]]
+table = "users"
+predicate = { kind = "eq_string", column = "email", value = "bob@example.com" }

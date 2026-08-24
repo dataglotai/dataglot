@@ -1,0 +1,70 @@
+name: Coverage
+
+# Coverage is heavier (cargo-llvm-cov + protoc + the Ballista integration tier),
+# so run it on pushes to main and on demand rather than every PR.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The instrumented target dir is dominated by debuginfo, and llvm-cov's
+  # line/region mapping comes from -C instrument-coverage (embedded in the
+  # binaries), not DWARF — so drop debuginfo to keep the build inside the
+  # standard runner's disk.
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The instrumented all-features build overflows the standard runner's
+      # ~14 GB free disk ("No space left on device"). Drop the preinstalled
+      # toolchains we never use (~35 GB: .NET, Android SDK, Haskell,
+      # PowerShell, Swift, Chromium, CodeQL, Docker images).
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /usr/local/share/boost /usr/local/share/powershell \
+            /usr/share/swift /usr/local/share/chromium /usr/share/miniconda \
+            /usr/local/lib/node_modules "$AGENT_TOOLSDIRECTORY/CodeQL" || true
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Rust + llvm-tools
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install protoc (Ballista/substrait)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install cargo-llvm-cov
+        run: cargo install --locked cargo-llvm-cov
+
+      # Deliberately no `target` in this cache: the instrumented target dir is
+      # tens of GB — restoring it would eat the disk headroom freed above.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Generate coverage summary
+        run: make coverage-json COVERAGE_JSON_OUT=target/coverage-summary.json
+
+      - name: Upload coverage summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary
+          path: target/coverage-summary.json

@@ -1,0 +1,26 @@
+host = "0.0.0.0"
+port = 5432
+batch_size = 8192
+partitions = 4
+default_catalog = "pg"
+default_schema = "public"
+
+[catalogs.pg]
+kind = "postgres"
+dsn_env = "DEMO_PG_DSN"
+
+[catalogs.saas]
+kind = "rest"
+schema = "public"
+
+[[catalogs.saas.tables]]
+name = "accounts"
+url = "http://127.0.0.1:8182/services/data/v59.0/accounts"
+records_path = "records"
+pagination = { kind = "next_link", next_path = "nextRecordsUrl" }
+columns = [
+  { name = "Id", type = "utf8", nullable = false },
+  { name = "Name", type = "utf8" },
+  { name = "Industry", type = "utf8" },
+  { name = "AnnualRevenue", type = "int64" },
+]

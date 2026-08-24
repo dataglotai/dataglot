@@ -1,0 +1,275 @@
+[package]
+name = "dataglot-server"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Binary entrypoint — boots DataFusion, federation, and pg wire"
+
+# cargo-binstall metadata: resolves release tarballs straight
+# from GitHub Releases — no crates.io publishing required. The crate is
+# NOT on crates.io (workspace path-deps + a git-forked snowflake dep;
+# decision documented in docs/install.md), so invoke with --git:
+#   cargo binstall --git https://github.com/dataglotai/dataglot dataglot-server
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/dataglot-{ version }-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+bin-dir = "dataglot-{ version }-{ target }/{ bin }{ binary-ext }"
+
+[[bin]]
+name = "dataglot"
+path = "src/main.rs"
+
+[features]
+default = []
+
+#  slice 3 — embed the operational dashboard SPA (frontend/dist/,
+# built by build.rs) and serve it at /ui via rust-embed. Off by default
+# so the core crate's build stays fast and Node-free; the release build
+# enables it. build.rs runs the vite build only when this feature is set
+# and gracefully stubs when Node is absent.
+dashboard = ["dep:rust-embed"]
+# Phase 2 spec 02 slice 3a — bring in the `dataglot-ballista` dep
+# graph so `ServerConfig::ballista = Some(...)` is honoured at boot.
+# Default builds skip this entirely.
+# Slice 4b.5 — also pulls in `datafusion-proto` (already in the
+# transitive lockfile via dataglot-ballista) so the ballista module
+# can name the `LogicalExtensionCodec` / `PhysicalExtensionCodec`
+# trait types for the factory's codec slots.
+ballista = ["dep:dataglot-ballista", "dep:datafusion-proto"]
+
+# Phase 3 spec 04 — Oracle federation source. Turns on the
+# `oracle` feature on `dataglot-federation`, which pulls the `oracle`
+# (ODPI-C) crate. Default builds skip this entirely: ODPI-C compiles
+# with a C compiler at build time AND dlopen's the Oracle Instant
+# Client (libclntsh) at RUNTIME, so a host running `--features oracle`
+# must provision Instant Client. Kept opt-in (unlike `snowflake`, which
+# is a pure-Rust dep compiled in unconditionally) precisely because of
+# that C-runtime requirement. The `CatalogConfig::Oracle` config surface
+# itself is always compiled; without this feature, a configured
+# `kind = "oracle"` catalog is rejected at boot with a clear error.
+oracle = ["dataglot-federation/oracle"]
+
+# Phase 3 — pure-Rust Oracle backend. Turns on the
+# `oracle-pure` feature on `dataglot-federation`, which pulls `oracle-rs`
+# (a pure-async-Rust reimplementation of the Oracle TTC/TNS protocol):
+# NO ODPI-C, NO Instant Client, NO C compiler. Opt-in and off by default
+# like `oracle`, but adds zero native code, so it needs no native-dep
+# allow-list entry (rule 15). With this feature a `kind = "oracle"`
+# catalog can set `driver = "pure"`; with `oracle` it can set
+# `driver = "oci"`. Either, both, or neither may be compiled.
+oracle-pure = ["dataglot-federation/oracle-pure"]
+
+# Phase 3 spec 02 — generic ADBC connector (BYO driver). Turns
+# on the `adbc` feature on `dataglot-federation` (pure-Rust
+# `adbc_core` + `adbc_driver_manager`; the native code is the *user's*
+# driver, dlopen'd at runtime from the configured `driver_path`).
+# Opt-in and off by default like the Oracle backends: a default build
+# should not imply the BYO-driver surface. The `CatalogConfig::Adbc`
+# config surface itself is always compiled; without this feature, a
+# configured `kind = "adbc"` catalog is rejected at boot with a clear
+# error.
+adbc = ["dataglot-federation/adbc"]
+
+# Phase 4 spec 04 — Arrow Flight SQL egress on :32010, the
+# native-Arrow half of the dual-egress commitment. Pulls `arrow-flight`
+# (with the Flight SQL server surface) + `tonic` (gRPC) + `tokio-stream`
+# (serve on a pre-bound listener for fail-fast bind). All already in the
+# transitive lockfile via `dataglot-ballista`, so this adds a direct,
+# version-unified edge — no new external ecosystem. Off by default: a
+# configured `[flight_sql]` block without this feature is rejected at
+# boot with a clear error (same posture as the connector features).
+flight_sql = ["dep:arrow-flight", "dep:tonic", "dep:tokio-stream", "dep:prost"]
+
+# Library target so integration tests (and any future in-process consumer)
+# can drive `DataglotServer::run()` directly. The binary at `src/main.rs`
+# is still the production entry point; it just consumes the lib like any
+# other caller.
+[lib]
+name = "dataglot_server"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+# Used by `dataglot-server::lineage::OpenLineageHttpEmitter`
+# to implement `dataglot_core::LineageEmitter` — the trait is
+# `#[async_trait]`-flavoured so cross-crate impls need the
+# macro too.
+async-trait.workspace = true
+# axum 0.8 is already pulled in transitively via testcontainers; using it here
+# keeps the routing for /metrics + /health to a few lines without adding a
+# heavier framework. hyper alone would also work but axum's Router is cheaper
+# to read and ships free with tokio integration we already have.
+axum.workspace = true
+#  slice 3 — embeds the built dashboard SPA (frontend/dist/) into
+# the binary for serving at /ui. Optional: only pulled by the `dashboard`
+# feature. `mime-guess` sets Content-Type per asset extension.
+rust-embed = { workspace = true, optional = true }
+# Used by `dataglot-server::lineage` to format the OpenLineage
+# `eventTime` field as RFC3339 UTC. Already in the workspace
+# lockfile transitively via tokio-postgres + tracing-subscriber.
+chacha20poly1305.workspace = true
+chrono.workspace = true
+# Used by `dataglot-server::governance` to drain the
+# `BindingChangeStream` (Stream::next via StreamExt) for the
+# data-product re-publish loop — Phase 1 §11 Interface #2
+# slice 3.
+clap = { workspace = true, features = ["env"] }
+# Shell-completion generation for the `dataglot completions <shell>` subcommand.
+# Matches the workspace clap 4.x; pure-Rust, no new native deps.
+clap_complete = "4"
+datafusion.workspace = true
+futures.workspace = true
+# Object storage for the `object_storage` catalog kind. Pinned
+# to 0.13 to match DataFusion 53.1's transitive `object_store` exactly —
+# a version skew would make our `Arc<dyn ObjectStore>` a different type
+# than the one DataFusion's RuntimeEnv accepts. The `aws` feature adds
+# the S3 client (reqwest + rustls/ring — all pure-Rust / already in the
+# tree, so native-dep hygiene is unaffected). `url` parses the `s3://`
+# bucket into the object-store registration key.
+object_store = { version = "0.13", features = ["aws"] }
+url = { workspace = true }
+# Phase 1 catalog control plane (task 08). Optional integration —
+# `DataglotServer::new` only constructs the service when
+# `config.catalog_service` is `Some`. The empty-config path
+# stays bit-identical to pre-#188 behaviour (no Postgres
+# dependency at boot when no operator opted in).
+dataglot-catalog = { path = "../dataglot-catalog" }
+dataglot-core = { path = "../dataglot-core" }
+# Wire the federation connectors into the server binary. All three
+# are needed at runtime to honour the `[catalogs.*]` config block:
+# `kind = "postgres"` instantiates a `PostgresConnector`,
+# `kind = "mysql"` instantiates a `MysqlConnector`, and
+# `kind = "warehouse"` instantiates a `WarehouseConnector` (Iceberg-backed
+# under the hood — never surfaced to users per CLAUDE.md rule 7).
+dataglot-federation = { path = "../dataglot-federation", features = [
+  "postgres",
+  "mysql",
+  "iceberg",
+  "snowflake",
+  # OData / SAP S/4HANA. Pure-Rust (reqwest+rustls, quick-xml), so
+  # it's always compiled — no server-level feature gate like `oracle` needs.
+  "odata",
+  # Generic REST/JSON connector. Pure-Rust (reqwest+rustls,
+  # serde_json), same posture as `odata` — always compiled in.
+  "rest",
+] }
+dataglot-pgwire = { path = "../dataglot-pgwire" }
+dataglot-policy = { path = "../dataglot-policy" }
+# Phase 2 spec 02 slice 3a — optional Ballista distributed-execution
+# wiring. Default builds skip this entirely (no `protoc` prereq, no
+# ~8-min cold compile); operators wanting distributed bring
+# `--features ballista`. The feature pulls in the heavy ballista dep
+# graph; the `[ballista]` config-block surface in `config.rs` compiles
+# regardless of the flag so JSON parsing stays uniform, but a
+# `Some(...)` ballista config with the feature OFF is rejected at
+# `DataglotServer::new`.
+dataglot-ballista = { path = "../dataglot-ballista", optional = true }
+# Phase 2 slice 4b.5 — only used by the ballista-gated codec wiring
+# in `src/ballista.rs`. Optional so default builds don't pull it.
+# Version matches the workspace `datafusion` pin and the transitive
+# graph the ballista feature already drags in.
+datafusion-proto = { workspace = true, optional = true }
+# Arrow Flight SQL egress (, `flight_sql` feature). Versions inherit
+# from `[workspace.dependencies]` (single source of truth, shared with
+# dataglot-ballista). `flight-sql-experimental` turns on
+# `arrow_flight::sql::server::FlightSqlService`; `net` gives tokio-stream the
+# `TcpListenerStream` we serve on.
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"], optional = true }
+tokio-stream = { workspace = true, features = ["net"], optional = true }
+# `tls-ring` gives `tonic::transport::ServerTlsConfig` on the
+# ring provider — the same crypto backend `[pgwire_tls]` / ballista mTLS use.
+tonic = { workspace = true, optional = true, features = ["tls-ring"] }
+# Pack the Flight SQL `TicketStatementQuery` into a `Ticket` (Any → bytes).
+prost = { workspace = true, optional = true }
+# Decode the `Authorization: Basic <base64(user:password)>` metadata on Flight
+# SQL requests ( slice 2 identity extraction). Pure Rust; already in the
+# transitive graph, promoted to a direct optional dep here.
+# Always-on now: the secret envelope key is a base64
+# env var, and the `flight_sql` feature decodes `Authorization: Basic`.
+base64.workspace = true
+# Phase 2 spec 04 slice 1 — HMAC-SHA256 verification of the inbound
+# governance (Interface 3) webhook payload signature. RustCrypto's
+# `hmac` + `sha2` are the de facto standard for HMAC in Rust, both
+# with zero `unsafe` on the hot path. The webhook handler compares
+# signatures in constant time via `hmac::Mac::verify_slice` so a
+# timing oracle on the shared secret stays closed.
+hmac.workspace = true
+sha2.workspace = true
+# Phase 2 spec 04 slice 3 — `governance::datahub::AdapterError` is
+# a typed error returned by the inbound webhook adapter so the
+# handler can map per-variant onto structured HTTP error bodies.
+# `anyhow` remains the surface elsewhere; this is the only typed
+# error needed in `dataglot-server`.
+thiserror.workspace = true
+# rust-prometheus over metrics-exporter-prometheus: we have a small static
+# metric set with no need for the `metrics` facade across crates yet, and
+# `prometheus` ships its own text encoder so we avoid a second runtime.
+prometheus = "0.14"
+# HTTP client for the OpenLineage HTTP emitter
+# (`dataglot-server::lineage::OpenLineageHttpEmitter`). Pulled
+# in as a runtime dep here rather than core because core
+# stays minimum-dep per CLAUDE.md rule 4. Was a dev-dep prior
+# to the lineage emitter slice.
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# TOML bootstrap-config parsing. JSON still loads via extension
+# dispatch, but TOML is the canonical/emitted format.
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+# Add the `chrono` feature on top of the workspace defaults so we can emit
+# ISO-8601 UTC timestamps in both human-readable and JSON log formats.
+tracing-subscriber = { workspace = true, features = ["chrono"] }
+
+[dev-dependencies]
+#: one race-hardened loopback-port helper, shared across the
+# workspace's tests (replaces the copy-pasted `ephemeral_port` fns).
+dataglot-test-support = { path = "../dataglot-test-support" }
+#: sign test JWTs for the `JwtGroupResolver` unit tests
+# (src/group_resolver.rs). Same crate the pgwire verifier uses.
+jsonwebtoken.workspace = true
+# Raw ADBC driver-manager access for seeding the DuckDB fixture in the
+# distributed-mode adbc test (tests/ballista_e2e.rs; the test itself is
+# gated on the `adbc` feature + ADBC_DRIVER_DUCKDB_PATH). Pure Rust,
+# tiny — same pattern as dataglot-federation's dev-deps.
+adbc_core.workspace = true
+adbc_driver_manager.workspace = true
+# `parquet` is needed by the object-storage integration test
+# (tests/object_storage_e2e.rs) to seed a tempdir with a real
+# parquet file that the connector then registers as a queryable
+# table. Pinned to v58 to match `arrow` and the rest of the
+# workspace's parquet usage in `dataglot-tests`.
+parquet.workspace = true
+tempfile.workspace = true
+# Test-only: the materialization tests (src/materialization.rs) build an
+# in-memory warehouse (MemoryCatalog + LocalFs) to exercise the refresh
+# orchestration against a real WarehouseConnector. Dev-only — the production
+# server reaches iceberg solely through dataglot-federation (rule 7).
+iceberg.workspace = true
+# tokio-postgres lets the e2e test in `tests/pgwire_metrics_e2e.rs`
+# drive a real `DataglotServer` over the wire and assert that
+# /metrics reflects the queries.
+tokio-postgres.workspace = true
+# tower brings ServiceExt::oneshot for in-process router tests.
+tower = { workspace = true }
+# Mock HTTP server for `dataglot-server::lineage::tests` —
+# pins the OpenLineage HTTP emitter's POST shape and the
+# failure-isolation contract (5xx / connection refused do
+# not propagate). Marquez covers the same surface under the
+# Docker-gated integration test in a follow-up slice.
+wiremock.workspace = true
+# Docker-gated Postgres for the catalog-service e2e test
+# (`tests/catalog_service_e2e.rs`). Mirrors the catalog
+# crate's own integration-test dep pair.
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+# Seeds the MySQL testcontainer in `tests/ballista_e2e.rs`'s
+# Docker-gated cross-source test (the regression net for the
+# mysql-in-distributed codec-registry gap).
+mysql_async = { workspace = true, features = ["minimal-rust"] }
+
+[lints]
+workspace = true

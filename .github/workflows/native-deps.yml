@@ -1,0 +1,35 @@
+name: Native Dependency Hygiene
+
+# Keeps the production runtime Rust-only (CLAUDE.md rule 15). Fails when a
+# production crate (any crate without `publish = false`) gains a direct
+# non-Rust / native dependency — JVM (`jni`/`j4rs`), Python (`pyo3`), or
+# C/C++ (`*-sys`, native build tools, bundled-native crates) — that isn't
+# on the sanctioned-exceptions allow-list. Dev/tooling crates set
+# `publish = false` and are exempt. Stable toolchain, no build (pure
+# manifest parse). See scripts/check-native-deps.py +
+# docs/native-dependency-policy.md.
+
+on:
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - 'scripts/check-native-deps.py'
+      - '.github/workflows/native-deps.yml'
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-deps:
+    name: native dependency hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # tomllib is stdlib on Python 3.11+ (the runner ships ≥3.12).
+      - name: Check production crates are Rust-only
+        run: python3 scripts/check-native-deps.py

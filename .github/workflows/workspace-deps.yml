@@ -1,0 +1,34 @@
+name: Workspace Dependency Hygiene
+
+# Enforces single-source-of-truth dependency versions: a dep pinned with
+# an inline version in ≥2 crates (or inline despite a
+# `[workspace.dependencies]` entry) is rejected, with a message to hoist
+# it to `[workspace.dependencies]` + `{ workspace = true }`. Prevents the
+# version drift that bloats the dep tree (relevant to the 500 MB image
+# budget). Stable toolchain, no build (pure manifest parse) — cheap
+# enough for every PR. See scripts/check-workspace-deps.py.
+
+on:
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - 'scripts/check-workspace-deps.py'
+      - '.github/workflows/workspace-deps.yml'
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  workspace-deps:
+    name: workspace dependency hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # tomllib is stdlib on Python 3.11+ (the runner ships ≥3.12).
+      - name: Check workspace dependency inheritance
+        run: python3 scripts/check-workspace-deps.py

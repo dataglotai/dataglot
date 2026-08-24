@@ -1,0 +1,19 @@
+# gitleaks configuration for the OSS snapshot secret scan (scripts/publish-oss.sh)
+# and the public repo's own tripwire. Extends gitleaks' default rules and adds a
+# narrow allowlist for known TEST-ONLY fixtures — keyed to the exact fixture
+# content so any *other* secret is still detected.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Test-only P-256 EC private key used in dataglot-ballista TLS unit tests (a generated fixture in #[cfg(test)] modules — const KEY / TEST_KEY_PEM — not a real secret)."
+# Match against the detected secret's content, not a path, so this exempts ONLY
+# this specific fixture key wherever it appears; a real private key anywhere still
+# trips the scan.
+regexTarget = "secret"
+regexes = [
+  # const KEY / TEST_KEY_PEM (executor.rs, tls.rs)
+  '''MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgXcGqzKZ''',
+  # const REAL_KEY_PEM (tls.rs) — a second generated test key in the same suite
+  '''MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg39O4wyy9L1tFEkod''',
+]

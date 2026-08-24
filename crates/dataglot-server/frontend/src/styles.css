@@ -1,0 +1,338 @@
+/* Dataglot engine dashboard — styled after the  review artifact.
+   Light palette, fixed (does NOT auto-switch to dark on the OS preference):
+   operators reported the dark auto-theme was hard to follow. Utility-lean:
+   one stylesheet, no framework. */
+
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --panel-2: #eef1f5;
+  --ink: #1a1f29;
+  --ink-2: #4a5566;
+  --ink-3: #78849a;
+  --line: #dfe4ec;
+  --line-2: #ccd3de;
+  --accent: #2f7d6e;
+  --accent-ink: #1c5a4e;
+  --run: #1f9d57;
+  --queue: #c98a13;
+  --fail: #c0392b;
+  --idle: #8a94a6;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font-family: var(--sans); font-size: 14px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1100px; margin: 0 auto; padding: 0 20px 64px; }
+
+/* top bar */
+.bar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 20px; border-bottom: 1px solid var(--line);
+  background: var(--panel); position: sticky; top: 0; z-index: 5;
+}
+.bar .brand { font-family: var(--mono); font-weight: 700; letter-spacing: -0.01em; }
+.bar .brand .dim { color: var(--ink-3); font-weight: 400; }
+.bar .meta { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar .status { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--ink-3); display: flex; align-items: center; gap: 6px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.dot.ok { background: var(--run); } .dot.off { background: var(--idle); }
+
+/* tabs */
+.tabs { display: flex; gap: 4px; padding: 10px 20px 0; max-width: 1100px; margin: 0 auto; }
+.tab {
+  font-family: var(--mono); font-size: 13px; padding: 8px 16px; cursor: pointer;
+  border: 1px solid transparent; border-bottom: none; border-radius: 8px 8px 0 0;
+  color: var(--ink-2); background: transparent;
+}
+.tab.active { background: var(--panel); border-color: var(--line); color: var(--ink); font-weight: 600; }
+
+/* stat cards */
+.stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin: 18px 0; }
+.stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.stat .k { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3); }
+.stat .v { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; margin-top: 2px; }
+.stat .v small { font-size: 12px; color: var(--ink-3); font-weight: 400; }
+
+/* executor strip */
+.section-h { font-size: 12px; font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); margin: 22px 0 8px; }
+.exec-strip { display: flex; gap: 10px; flex-wrap: wrap; }
+.exec { border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; background: var(--panel); min-width: 150px; }
+.exec .id { font-family: var(--mono); font-size: 13px; font-weight: 650; }
+.exec .m { font-family: var(--mono); font-size: 11px; color: var(--ink-3); margin-top: 3px; }
+.slots { display: flex; gap: 3px; margin-top: 6px; flex-wrap: wrap; }
+.slots i { width: 14px; height: 8px; border-radius: 2px; background: var(--line-2); }
+.slots i.on { background: var(--run); }
+/* capacity pips: neutral — they represent total task slots, not usage */
+.slots i.cap { background: var(--line-2); }
+.exec .id .hb-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-right: 6px; vertical-align: middle;
+}
+
+/* scheduler status card */
+.sched-card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px 14px; margin-bottom: 12px;
+}
+.sched-grid { display: flex; flex-wrap: wrap; gap: 18px 26px; }
+.sched-grid .k {
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--ink-3);
+}
+.sched-grid .v { font-size: 13px; color: var(--ink); margin-top: 2px; }
+
+/* live cluster topology graph */
+.topo-wrap {
+  overflow-x: auto; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--panel); padding: 8px 8px 4px;
+}
+.topo { display: block; max-width: 100%; height: auto; }
+.topo-edge { stroke: var(--line-2); stroke-width: 1.5; }
+.topo-edge.active { stroke: var(--accent); stroke-opacity: 0.8; }
+.topo-sched {
+  fill: var(--panel); stroke: var(--accent); stroke-width: 2;
+}
+.topo-sched.active { fill: color-mix(in srgb, var(--accent) 8%, var(--panel)); }
+.topo-exec { fill: var(--panel); stroke: var(--line-2); stroke-width: 2; }
+.topo-exec.stale { stroke-dasharray: 5 3; }
+.topo-slot { fill: var(--line-2); }
+.topo-role {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+  fill: var(--accent-ink); font-weight: 700;
+}
+.topo-id { font-family: var(--mono); font-size: 12px; font-weight: 650; fill: var(--ink); }
+.topo-sub { font-family: var(--mono); font-size: 10.5px; fill: var(--ink-3); }
+
+/* stage-flow diagram — Cluster tab job drill-down: stage nodes connected
+   left-to-right by arrows labelled with shuffle partitions (data movement). */
+.stage-flow { display: flex; align-items: stretch; overflow-x: auto; padding-bottom: 4px; }
+.stage-node { min-width: 190px; flex: 0 0 auto; }
+.stage-edge {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 0 8px; color: var(--ink-3); flex: 0 0 auto;
+}
+.stage-edge .arrow { font-size: 18px; line-height: 1; }
+.stage-edge .parts { font-family: var(--mono); font-size: 10px; margin-top: 2px; }
+
+/* tables */
+.tbl-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+table { border-collapse: collapse; width: 100%; min-width: 560px; }
+th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--line); }
+th { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-3); }
+tbody tr:last-child td { border-bottom: none; }
+td.mono, .mono { font-family: var(--mono); }
+td.sql { max-width: 460px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* pills */
+.pill { font-family: var(--mono); font-size: 10.5px; padding: 2px 8px; border-radius: 20px; font-weight: 600; white-space: nowrap; }
+.pill.run { color: #fff; background: var(--run); }
+.pill.queue { color: #3d2e05; background: var(--queue); }
+.pill.fail { color: #fff; background: var(--fail); }
+.pill.idle { color: #fff; background: var(--idle); }
+
+/* clickable job rows + stage progress */
+.row-click { cursor: pointer; }
+.row-click:hover { background: var(--panel-2); }
+.row-open { cursor: pointer; background: var(--panel-2); }
+.progress { margin-top: 8px; height: 8px; border-radius: 4px; background: var(--line-2); overflow: hidden; }
+.progress span { display: block; height: 100%; background: var(--run); transition: width 0.4s ease; }
+
+/* federation source chips */
+.src-chips { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.chip {
+  font-family: var(--mono); font-size: 10.5px; padding: 2px 7px; border-radius: 5px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent-ink);
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--line));
+}
+
+/* ranked bar rows (History federation-load breakdown) */
+.bar-row {
+  display: grid; grid-template-columns: 160px 1fr 44px; align-items: center;
+  gap: 10px; padding: 4px 0;
+}
+.bar-row-label { font-size: 12px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-row-val { font-size: 12px; color: var(--ink-2); text-align: right; font-variant-numeric: tabular-nums; }
+
+/* available-but-not-configured connector cards (Connectors tab) */
+.exec-avail { max-width: 300px; opacity: 0.9; }
+.exec-avail .avail-note { white-space: normal; margin-top: 6px; max-width: 270px; line-height: 1.4; }
+
+/* connector "Check now" button (Connectors tab) */
+.btn-check {
+  font-family: var(--mono); font-size: 11px; color: var(--accent-ink);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--line));
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  padding: 3px 10px; border-radius: 6px; cursor: pointer;
+}
+.btn-check:hover { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.btn-check:disabled { opacity: 0.5; cursor: default; }
+
+/* kill button */
+.kill {
+  font-family: var(--mono); font-size: 11px; color: var(--fail);
+  border: 1px solid color-mix(in srgb, var(--fail) 40%, transparent);
+  background: transparent; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+}
+.kill:hover { background: color-mix(in srgb, var(--fail) 12%, transparent); }
+.kill:disabled { opacity: 0.5; cursor: default; }
+
+/* empty / unavailable states */
+.empty { border: 1px dashed var(--line-2); border-radius: 10px; padding: 28px; text-align: center; color: var(--ink-3); background: var(--panel); }
+.empty b { color: var(--ink-2); }
+.err { color: var(--fail); font-family: var(--mono); font-size: 12px; }
+.muted { color: var(--ink-3); }
+.caption { font-size: 12.5px; line-height: 1.5; }
+
+/* charts — hand-authored inline SVG, light palette */
+.chart-grid { display: flex; flex-wrap: wrap; gap: 10px; }
+.chart-card {
+  flex: 1 1 300px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 12px 14px;
+}
+.chart-card.chart-wide { flex: 3 1 460px; }
+.chart-card.fanout { margin-bottom: 10px; }
+.metric-head {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--ink-3); margin-bottom: 6px;
+}
+.metric-head .mono { text-transform: none; letter-spacing: 0; color: var(--ink-2); font-size: 11px; }
+.spark { display: block; width: 100%; height: auto; }
+.hist { display: block; width: 100%; height: auto; }
+.fillbar { height: 8px; border-radius: 4px; background: var(--line-2); overflow: hidden; }
+.fillbar span { display: block; height: 100%; transition: width 0.4s ease; }
+
+/* resource-limits panel: "used / limit" meters */
+.limit-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px 20px; }
+.limit-meter { min-width: 0; }
+.limit-track { height: 8px; border-radius: 4px; background: var(--line-2); overflow: hidden; }
+.limit-track span { display: block; height: 100%; transition: width 0.4s ease, background 0.4s ease; }
+.limit-track.limit-unlimited { background: repeating-linear-gradient(90deg, var(--line-2) 0 6px, transparent 6px 12px); opacity: 0.5; }
+.limit-meter .caption { margin-top: 4px; }
+
+/* executor card grows to hold its sparkline + disk bar */
+.exec-wide { min-width: 230px; flex: 1 1 230px; max-width: 340px; }
+.exec-wide .metric-head { margin-top: 10px; margin-bottom: 4px; }
+
+/* outcome donut */
+.donut-card { flex: 1 1 200px; }
+.donut-wrap { display: flex; align-items: center; gap: 14px; }
+.donut { flex: 0 0 auto; }
+.donut-center { font-family: var(--mono); font-size: 20px; font-weight: 700; fill: var(--ink); }
+.legend { display: flex; flex-direction: column; gap: 4px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); }
+.legend.legend-row { flex-direction: row; gap: 16px; margin-top: 8px; }
+.legend span { display: flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+/* lineage graph (Governance tab) — column-lineage DAG, mask propagation */
+.lineage-wrap {
+  overflow-x: auto; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--panel); padding: 6px;
+}
+.lineage { display: block; }
+.ln-tbl { font-family: var(--mono); font-size: 8.5px; fill: var(--ink-3); }
+.ln-fld { font-family: var(--mono); font-size: 12px; font-weight: 650; fill: var(--ink); }
+
+/* Security / governance posture badges in the header (dashboard gap #1/#2). */
+.posture b.ok { color: var(--ok, #34d399); font-weight: 600; }
+.posture b.warn { color: var(--warn, #fbbf24); font-weight: 600; }
+
+/* Policy-posture panel on the Governance tab (dashboard gap #1). */
+.posture-panel { margin-bottom: 1rem; }
+.posture-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.25rem;
+  font-size: 0.85rem;
+}
+.posture-grid b { font-weight: 600; }
+
+/* ── query-profile treeview ─────────────────────────── */
+
+/* run_id button that opens the profile overlay (a real button for keyboard
+   + screen-reader access; styled as an inline link) */
+.run-link {
+  font: inherit; padding: 0; background: none; border: none; cursor: pointer;
+  color: var(--accent-ink); text-decoration: underline dotted; text-underline-offset: 2px;
+}
+.run-link:hover { color: var(--accent); }
+.run-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+/* overlay + panel */
+.overlay {
+  position: fixed; inset: 0; z-index: 20;
+  background: color-mix(in srgb, #0b1220 45%, transparent);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 40px 16px; overflow-y: auto;
+}
+.profile {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  width: 100%; max-width: 860px; box-shadow: 0 12px 40px rgba(11, 18, 32, 0.22);
+}
+.profile-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 18px; border-bottom: 1px solid var(--line);
+}
+.profile-title { font-weight: 700; letter-spacing: -0.01em; }
+.profile-runid { font-size: 11.5px; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; }
+.profile-x {
+  margin-left: auto; font-size: 15px; line-height: 1; color: var(--ink-3);
+  background: transparent; border: none; cursor: pointer; padding: 2px 6px;
+}
+.profile-x:hover { color: var(--ink); }
+.refresh-btn {
+  margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--accent-ink);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--line));
+  background: transparent; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+}
+.refresh-btn:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.refresh-btn + .profile-x { margin-left: 0; }
+.profile-msg { padding: 14px 18px; }
+.fail-text { color: var(--fail); }
+
+/* query summary */
+.profile-summary { padding: 14px 18px; border-bottom: 1px solid var(--line); }
+.profile-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; }
+.profile-sql { margin: 10px 0 0; }
+.profile-err { margin: 8px 0 0; font-size: 11.5px; white-space: pre-wrap; }
+
+/* the tree */
+.tree { list-style: none; margin: 0; padding: 14px 18px 4px; }
+.tree .tree { padding: 0 0 0 20px; border-left: 1px solid var(--line-2); margin-left: 6px; }
+.tree-node { position: relative; margin-bottom: 12px; }
+.tree .tree .tree-node::before {
+  content: ""; position: absolute; left: -14px; top: 16px;
+  width: 12px; height: 1px; background: var(--line-2);
+}
+.tree-root > .tree-branch { background: var(--panel-2); }
+.tree-branch {
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--panel);
+}
+.pd-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pd-source { font-size: 12.5px; font-weight: 600; color: var(--ink); }
+.pd-metrics { margin-left: auto; font-size: 11.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+
+/* time-share bar under a pushdown head */
+.pd-bar { height: 5px; border-radius: 3px; background: var(--line-2); overflow: hidden; margin: 8px 0 0; }
+.pd-bar span { display: block; height: 100%; background: var(--accent); }
+
+/* the dialect SQL sent to the source */
+.pd-sql {
+  margin: 8px 0 0; padding: 9px 11px; border-radius: 6px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  font-size: 11.5px; line-height: 1.5; color: var(--ink);
+  white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto;
+}
+
+/* per-connector accent on the kind chip */
+.chip.kind-snowflake { background: color-mix(in srgb, #29b5e8 16%, transparent); color: #0b6a8f; border-color: color-mix(in srgb, #29b5e8 34%, var(--line)); }
+.chip.kind-postgres  { background: color-mix(in srgb, #336791 15%, transparent); color: #2a4d6e; border-color: color-mix(in srgb, #336791 32%, var(--line)); }
+.chip.kind-mysql     { background: color-mix(in srgb, #c9820c 16%, transparent); color: #8a5a06; border-color: color-mix(in srgb, #c9820c 32%, var(--line)); }
+.chip.kind-oracle    { background: color-mix(in srgb, #c0392b 14%, transparent); color: #9a2f24; border-color: color-mix(in srgb, #c0392b 30%, var(--line)); }
+.chip.kind-adbc      { background: color-mix(in srgb, #6c5ce7 14%, transparent); color: #4b3fb0; border-color: color-mix(in srgb, #6c5ce7 30%, var(--line)); }

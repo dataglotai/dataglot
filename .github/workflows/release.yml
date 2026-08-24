@@ -1,0 +1,155 @@
+# Release — GitHub Release with server binaries on v* tags.
+#
+# Companion to docker.yml (which builds + pushes the semver-tagged
+# container images on the same tags). This workflow adds the
+# non-container distribution channel: a GitHub Release carrying
+# dataglot-server binaries for linux x86_64 + aarch64 and macOS
+# arm64 + x86_64, a rendered Homebrew formula, and the
+# annotated tag message as the release body with a CHANGELOG pointer.
+#
+# Trigger a release by tagging the release PR's MERGE COMMIT — never
+# repo HEAD. The CI auto-commits that follow every merge carry
+# "[skip ci]", which GitHub honors for tag pushes too: a tag pointing
+# at one fires NO workflows (learned the hard way on v0.4.0).
+#
+#   mc=$(gh pr view <release-pr> --json mergeCommit -q .mergeCommit.oid)
+#   git tag -a v0.X.Y "$mc" -m "..." && git push origin v0.X.Y
+#
+# Full procedure: docs/instructions/pull-requests.md → "Cutting a release".
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      # One arch failing must not cancel the other — partial artifacts
+      # still tell us which side broke.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          # macOS: Apple Silicon natively on the arm64
+          # runner; Intel macs cross-compiled from the same runner
+          # (same SDK, different codegen target - pure-Rust workspace,
+          # nothing to cross beyond `rustup target add`).
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-14
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    env:
+      # The workspace release profile is lto="fat" + codegen-units=1,
+      # which OOM-kills the 7 GB hosted runners at the final link
+      # (exit 143 "runner has received a shutdown signal" — observed
+      # twice on v0.4.0). The binary channel overrides to thin LTO;
+      # the container images (docker.yml) keep the fat-LTO profile.
+      CARGO_PROFILE_RELEASE_LTO: thin
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      #: the dashboard bundle is built by dataglot-server's build.rs
+      # via vite (needs Node 20 for vite 6). Node ships on GitHub runners, but
+      # pin it so the release always embeds the real /ui rather than build.rs's
+      # stub fallback. build.rs runs on the host regardless of --target, so the
+      # cross-compiled artifacts get the bundle too.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      - name: Build dataglot-server (release)
+        # Explicit --target everywhere so the artifact path is uniform
+        # (and the Intel-mac cross-build from the arm64 runner just
+        # works). --features dashboard ships /ui in the binary.
+        run: cargo build --release -p dataglot-server --locked --features dashboard --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # The dataglot-server crate names its [[bin]] "dataglot".
+          name="dataglot-${version}-${{ matrix.target }}"
+          mkdir "${name}"
+          cp "target/${{ matrix.target }}/release/dataglot" "${name}/"
+          cp LICENSE NOTICE README.md "${name}/"
+          tar czf "${name}.tar.gz" "${name}"
+          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dataglot-*.tar.gz
+            dataglot-*.tar.gz.sha256
+          retention-days: 7
+
+  release:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Extract annotated tag message
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          {
+            git tag -l --format='%(contents)' "${GITHUB_REF_NAME}"
+            echo ""
+            echo "---"
+            echo ""
+            echo "Full change list: [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md)"
+            echo "Container image: \`ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME#v}\`"
+          } > release-notes.md
+
+      - name: Render Homebrew formula
+        #: fill the template with this tag's version + artifact
+        # sha256s and ship it as a release asset. Publishing = copying
+        # the rendered file into dataglotai/homebrew-tap (docs/install.md);
+        # kept manual until the tap repo exists.
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          sha() { cut -d' ' -f1 "dist/dataglot-${version}-$1.tar.gz.sha256"; }
+          sed -e "s/__VERSION__/${version}/g" \
+              -e "s/__SHA_MAC_ARM__/$(sha aarch64-apple-darwin)/" \
+              -e "s/__SHA_MAC_X86__/$(sha x86_64-apple-darwin)/" \
+              -e "s/__SHA_LINUX_ARM__/$(sha aarch64-unknown-linux-gnu)/" \
+              -e "s/__SHA_LINUX_X86__/$(sha x86_64-unknown-linux-gnu)/" \
+              packaging/homebrew/dataglot.rb.template > dist/dataglot.rb
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            dist/*

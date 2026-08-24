@@ -1,0 +1,62 @@
+# Dataglot demo config — Snowflake federation.
+#
+# Registers one Snowflake catalog so you can run manual queries against
+# Snowflake *through Dataglot's federation* (pg wire → DataFusion →
+# Snowflake pushdown), not just straight to Snowflake. Pairs with
+# `examples/demo/testbench-snowflake.toml` for the web editor.
+#
+# ── Run it ────────────────────────────────────────────────────────────
+#   1. Keep your Snowflake credentials in an env file that is NOT committed,
+#      e.g. ~/.dataglot-sf.env:
+#        export SNOWFLAKE_PASSWORD="…"          # PAT or account password
+#   2. `account` and `user` below are not secrets, but keep a real customer
+#      account out of git: copy this file to
+#      `dataglot-with-snowflake.local.toml` (git-ignored) and fill them in
+#      there.
+#   3. source ~/.dataglot-sf.env
+#   4. cargo run -p dataglot-server --features dashboard -- \
+#        --config examples/demo/dataglot-with-snowflake.local.toml --port 5432
+#      `--features dashboard` serves the operational UI at
+#      http://127.0.0.1:9090/ui (the startup log prints the exact URL; the
+#      SPA mounts at /ui, not /). Drop the flag for pgwire only.
+#
+# Then point the testbench at it (see testbench-snowflake.toml) or just:
+#   psql "host=localhost port=5432 user=analyst dbname=snowflake" \
+#     -c "select n_name from nation order by n_name limit 5"
+#
+# Rule 12: the password is never inline — only `password_env` names the
+# environment variable the server reads at boot.
+
+host = "0.0.0.0"
+port = 5432
+batch_size = 8192
+# Single partition so the dashboard's per-query pushdown-SQL treeview
+# (Queries → detail at :9090/ui) populates: the pushdown-correlation
+# task-local doesn't survive DataFusion's multi-partition task spawns
+#. Fine for a testing/tracking box; raise it for a compute-heavy
+# deployment (the treeview then just stays empty — sources + SQL still show).
+partitions = 1
+
+# Unqualified references resolve here, so `SELECT … FROM nation` works.
+# DataFusion lowercases unquoted identifiers; the Snowflake connector
+# lowercases catalog/schema/column names to match, so use lowercase here.
+default_catalog = "snowflake"
+default_schema = "tpch_sf1"
+
+[catalogs.snowflake]
+kind = "snowflake"
+account = "YOUR-ACCOUNT"            # org-account form, e.g. "ABCDEFG-HI12345"
+user = "YOUR_SERVICE_USER"          # Snowflake service-account username
+warehouse = "COMPUTE_WH"            # a warehouse the user can resume
+database = "SNOWFLAKE_SAMPLE_DATA"  # every account ships this read-only DB
+schema = "TPCH_SF1"                 # TPC-H SF1: nation/region/customer/orders/lineitem
+password_env = "SNOWFLAKE_PASSWORD"
+# role = "ACCOUNTADMIN"              # optional — set if the default role lacks access
+
+# Operational-dashboard query tracking. With this on, the dashboard's
+# Queries tab (:9090/ui) records every query and — via the per-source
+# pushdown profile — shows the EXACT dialect SQL Dataglot sent to Snowflake
+# (and its pushed / partial / not-pushed outcome). Off by default because it
+# plans each query once up front; worth it for a testing/tracking setup.
+[observability]
+capture_query_sources = true

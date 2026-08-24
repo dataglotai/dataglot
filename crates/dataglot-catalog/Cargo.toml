@@ -1,0 +1,49 @@
+[package]
+name = "dataglot-catalog"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Peaka Catalog Service (Phase 1 task 08) — Postgres-backed control plane for CatalogBinding"
+
+[dependencies]
+# `MetaStore` is an object-safe async trait (`Arc<dyn MetaStore>` so the
+# server swaps the Postgres vs embedded backend by config) — needs
+# `#[async_trait]`. Already in the workspace graph via core/pgwire/etc.
+async-trait.workspace = true
+# `CatalogProvider` trait the cache (task 09) hands back; the
+# cache promises the consumer can register the result with a
+# `SessionContext`, which means the value must be exactly
+# DataFusion's own `dyn CatalogProvider`.
+dashmap.workspace = true
+datafusion.workspace = true
+dataglot-core = { path = "../dataglot-core" }
+deadpool-postgres.workspace = true
+# Used by `CatalogService::subscribe` to pump the dedicated
+# LISTEN connection's `poll_message` stream into a tokio
+# channel the caller consumes. Keeping the futures dep here
+# (not just transitive via tokio-postgres) makes the use
+# explicit.
+futures.workspace = true
+# Single-file embedded meta-store engine for `RedbMetaStore` ( slice A /
+# ). Pure-Rust ACID/MVCC KV — rule-15 clean.
+redb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+# `BroadcastStream` adapts the embedded store's in-process broadcast
+# channel into the same `Stream<Item = BindingChange>` the Postgres
+# LISTEN/NOTIFY pump produces. Already in the workspace graph.
+tokio-stream.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+
+[lints]
+workspace = true
