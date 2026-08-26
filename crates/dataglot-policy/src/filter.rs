@@ -756,11 +756,12 @@ mod tests {
     /// Pin the contract the module docs promise: a row-filter
     /// predicate evaluates against **un-masked** column values
     /// even when a `ColumnMaskingEnforcer` for the same column is
-    /// active in the same session. The two enforcers touch
-    /// disjoint parts of the plan (`Filter` wraps `TableScan`;
-    /// the column mask rewrites only `Projection.expr`), so they
-    /// commute and the row-filter sees real data regardless of
-    /// rewrite order.
+    /// active in the same session. Column masking never rewrites a
+    /// `Filter` predicate ( masks only output-reaching
+    /// expressions — projection/aggregate/sort — and skips
+    /// `Filter`/`Join`), so the row-filter predicate keeps its real
+    /// value regardless of enforcer order, while the projected
+    /// column still comes back masked.
     ///
     /// Setup:
     ///   - row-filter rule: `email LIKE 'alice%'`

@@ -53,7 +53,7 @@ use std::collections::HashMap;
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
+use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::sql::TableReference;
 
 use crate::{Identity, PolicyEnforcer};
@@ -253,59 +253,54 @@ impl ColumnMaskingEnforcer {
         self.masks.values().map(Vec::len).sum()
     }
 
-    /// Rewrite a single projection-level expression.
+    /// Look up a mask by column. Tries the column's relation as
+    /// reported by the planner first (strict match — the documented
+    /// semantics); on miss, retries under the alias-resolved
+    /// underlying table. The alias fallback handles
+    /// `SELECT u.email FROM users u` and the join cases that surface
+    /// it (`FROM users u JOIN orders o ON …`), where the planner
+    /// stamps the column relation as the SQL alias rather than the
+    /// original table.
+    /// Mask every reference to a masked column inside one node-level
+    /// expression, **preserving the expression's output field name**.
     ///
-    /// For top-level `Expr::Column` matching a rule, wraps the mask
-    /// in `Expr::alias_qualified(relation, name)` so the projected
-    /// schema's field keeps both the column name AND the original
-    /// table qualifier (`SELECT email FROM users` ⇒ output field is
-    /// still `users.email`, not unqualified `email`). The qualifier
-    /// matters because `DataFusion`'s per-rule invariant checker
-    /// compares schemas via `DFSchema::compatible`, which fails on
-    /// `Some(table) → None` qualifier transitions; downstream rules
-    /// like `optimize_projections` then trip
-    /// `Internal("Assertion failed: compatible: Failed due to a
-    /// difference in schemas")` and the query fails. Plain `alias`
-    /// (qualifier=None) was the shape used by the pre-server-wiring
-    /// MVP — its tests called `enforcer.rewrite` directly and
-    /// bypassed the optimizer pipeline, so this never surfaced.
-    /// For nested column references (e.g., `UPPER(email)`),
-    /// substitutes the mask directly — `DataFusion` derives the new
-    /// output name from the rewritten expression and there's no
-    /// top-level qualifier to preserve.
-    ///
-    /// `aliases` is a precomputed map of `SubqueryAlias → underlying
-    /// TableReference` collected from the plan's input subtree. If a
-    /// column's relation doesn't hit a rule directly, we retry under
-    /// the alias's underlying table — so a rule on `users.email`
-    /// masks `SELECT u.email FROM users u`.
-    fn mask_projection_expr(
+    /// A top-level `Expr::Column` matching a rule becomes the mask aliased
+    /// with the original `(qualifier, name)`, so `SELECT email` still outputs
+    /// the field `users.email`. A nested reference (`UPPER(email)`,
+    /// `max(email)`) has the mask substituted *inside* the expression and the
+    /// whole result aliased back to its ORIGINAL derived name
+    /// (`upper(users.email)`, `max(users.email)`) whenever the substitution
+    /// would otherwise change that name. Keeping every field name stable means
+    /// the enclosing node's output schema is byte-identical before and after —
+    /// DataFusion requires an optimizer rule to preserve schema, and preserving
+    /// it is exactly what avoids the `optimize_projections` invariant panic on
+    /// an un-aliased masked expression. Because this is pure
+    /// expression substitution (no new plan node, no re-scoping subquery), the
+    /// rewritten plan unparses to valid SQL for federated pushdown.
+    fn mask_expr(
         &self,
         expr: Expr,
         alias_map: &HashMap<TableReference, TableReference>,
         identity: &Identity,
     ) -> Result<Transformed<Expr>, DataFusionError> {
-        // Top-level Column branch — preserve both the projected name
-        // and the original table qualifier.
+        // Top-level column: preserve both the projected name and qualifier.
         if let Expr::Column(c) = &expr {
             if let Some(rel) = &c.relation {
                 if let Some(mask) = self.lookup_mask(rel, &c.name, alias_map, identity) {
-                    // Ranger audit parity: every mask decision is
-                    // recorded with the session identity (`crate::audit`).
                     crate::audit::record_decision("mask", identity, &format!("{rel}.{}", c.name));
-                    let aliased = mask
-                        .clone()
-                        .alias_qualified(Some(rel.clone()), c.name.clone());
-                    return Ok(Transformed::yes(aliased));
+                    return Ok(Transformed::yes(
+                        mask.clone()
+                            .alias_qualified(Some(rel.clone()), c.name.clone()),
+                    ));
                 }
             }
             return Ok(Transformed::no(expr));
         }
 
-        // Otherwise recurse: substitute any nested matching column
-        // without preserving names — DataFusion will derive the new
-        // output column name from the rewritten expression tree.
-        expr.transform_down(|e| {
+        // Nested reference: substitute the mask, then alias back to the
+        // original derived name if the substitution changed it.
+        let original_name = expr.schema_name().to_string();
+        let out = expr.transform_down(|e| {
             if let Expr::Column(c) = &e {
                 if let Some(rel) = &c.relation {
                     if let Some(mask) = self.lookup_mask(rel, &c.name, alias_map, identity) {
@@ -319,17 +314,17 @@ impl ColumnMaskingEnforcer {
                 }
             }
             Ok(Transformed::no(e))
-        })
+        })?;
+        if !out.transformed {
+            return Ok(Transformed::no(out.data));
+        }
+        if out.data.schema_name().to_string() == original_name {
+            Ok(Transformed::yes(out.data))
+        } else {
+            Ok(Transformed::yes(out.data.alias(original_name)))
+        }
     }
 
-    /// Look up a mask by column. Tries the column's relation as
-    /// reported by the planner first (strict match — the documented
-    /// semantics); on miss, retries under the alias-resolved
-    /// underlying table. The alias fallback handles
-    /// `SELECT u.email FROM users u` and the join cases that surface
-    /// it (`FROM users u JOIN orders o ON …`), where the planner
-    /// stamps the column relation as the SQL alias rather than the
-    /// original table.
     fn lookup_mask(
         &self,
         rel: &TableReference,
@@ -640,58 +635,60 @@ impl PolicyEnforcer for ColumnMaskingEnforcer {
                 })
             })?;
 
-            // (2) Main-tree projection masking (unchanged semantics).
-            let LogicalPlan::Projection(proj) = node else {
+            // (2) Mask references to a masked column in this node's own
+            // expressions — but ONLY in output-reaching positions (projection,
+            // aggregate, window, …), NEVER in a predicate. These node types are
+            // skipped deliberately:
+            //
+            // * `Filter` — its predicate is either the user's `WHERE` or,
+            //   critically, an admin **row-filter (RLS)** predicate inserted by
+            //   `RowFilterEnforcer`. Masking it would evaluate the mask instead
+            //   of the real value (`email LIKE 'alice%'` → `'***' LIKE 'alice%'`)
+            //   and silently break RLS, order-independently.
+            // * `TableScan` — after predicate pushdown an RLS/`WHERE` predicate
+            //   lives in `TableScan.filters`, which `map_expressions` also visits.
+            //   Masking those would reopen the same RLS bypass on a later
+            //   optimizer pass; the scan has no output-reaching expressions to
+            //   mask anyway (its columns are masked in the projection above).
+            // * `Join` keys stay on real values so joins still match.
+            // * `Sort` — an `ORDER BY <masked col>` sorts by the real value (no
+            //   cleartext is emitted); masking here would also try to alias-wrap
+            //   an `Expr::Sort`, which is not a valid sort expression.
+            //
+            // Substituting in place (not a scan-wrapping subquery) keeps the plan
+            // federation-safe — the unparser renders `max('***')` as ordinary
+            // SQL — and reaching aggregates closes the cleartext bypass
+            //. Each rewrite is aliased back to its original derived
+            // field name so the node's output schema is unchanged, which is what
+            // avoids the `optimize_projections` invariant panic on an un-aliased
+            // `UPPER(email)`. Predicates on a masked column therefore
+            // evaluate on the real value (industry "option A" for predicates —
+            // a slight probe-leak addressed at the access-control layer, far
+            // preferable to a broken RLS guarantee).
+            if matches!(
+                node,
+                LogicalPlan::Filter(_)
+                    | LogicalPlan::Join(_)
+                    | LogicalPlan::TableScan(_)
+                    | LogicalPlan::Sort(_)
+            ) {
                 return Ok(if sub_changed {
                     Transformed::yes(node)
                 } else {
                     Transformed::no(node)
                 });
-            };
-
-            let Projection {
-                expr: exprs,
-                input,
-                schema,
+            }
+            let Transformed {
+                data: node,
+                transformed: masked,
                 ..
-            } = proj;
+            } = node.map_expressions(|e| self.mask_expr(e, &alias_map, identity))?;
 
-            let mut any_changed = sub_changed;
-            let mut new_exprs: Vec<Expr> = Vec::with_capacity(exprs.len());
-            for e in exprs {
-                let Transformed {
-                    data,
-                    transformed,
-                    tnr: _,
-                } = self.mask_projection_expr(e, &alias_map, identity)?;
-                if transformed {
-                    any_changed = true;
-                }
-                new_exprs.push(data);
-            }
-
-            // Use `try_new_with_schema` rather than `try_new` so the
-            // *original* DFSchema (with its field qualifiers — e.g.
-            // `Some(TableReference::Bare("users"))` for `users.email`)
-            // is preserved across the rewrite. DataFusion runs a
-            // per-rule invariant checker that compares output schemas
-            // for compatibility; an `Expr::Alias(literal, "email")`
-            // recomputes a field with qualifier `None` and trips
-            // `Internal("Assertion failed: compatible: Failed due to a
-            // difference in schemas")`. The mask preserves field name
-            // and data type by construction (the rule's `Expr` is
-            // chosen by the operator to match the masked column's
-            // type), so reusing the original schema is safe.
-            if any_changed {
-                let new_proj = Projection::try_new_with_schema(new_exprs, input, schema)?;
-                Ok(Transformed::yes(LogicalPlan::Projection(new_proj)))
+            Ok(if masked || sub_changed {
+                Transformed::yes(node)
             } else {
-                // No change ⇒ reconstruct unchanged so input ownership
-                // balances. `try_new_with_schema` is semantically a
-                // no-op when the expressions match the schema.
-                let proj = Projection::try_new_with_schema(new_exprs, input, schema)?;
-                Ok(Transformed::no(LogicalPlan::Projection(proj)))
-            }
+                Transformed::no(node)
+            })
         })
     }
 }
@@ -931,10 +928,14 @@ mod tests {
 
     #[tokio::test]
     async fn column_mask_filter_evaluates_on_real_data() {
-        // Pins option A: predicates evaluate against the *original*
-        // column values, the projection returns the masked literal.
+        // Predicates are NOT masked (they may be admin row-filter/RLS predicates
+        // — masking those would break governance). So a user `WHERE` on a masked
+        // column evaluates on the real value: filtering by Alice's real address
+        // returns her row, and the projected `email` comes back masked. (Option
+        // A for predicates; the aggregate/projection bypass is what  fixed.)
         let (ctx, users) = ctx_with_users();
         let enforcer = ColumnMaskingEnforcer::new([mask_email_literal(&users)]).expect("build");
+
         let plan = rewrite_sql(
             &ctx,
             &enforcer,
@@ -942,10 +943,95 @@ mod tests {
         )
         .await;
         let rows = execute_plan(&ctx, plan).await;
-        // Predicate sees real data ⇒ exactly the alice row matches.
-        assert_eq!(rows.len(), 1, "filter on real data returns 1 row");
-        // Projection returns masked value.
-        assert_eq!(rows[0][0], "***@example.com");
+        assert_eq!(rows.len(), 1, "predicate sees the real value ⇒ Alice's row");
+        assert_eq!(rows[0][0], "***@example.com", "projection is masked");
+    }
+
+    ///  (Urgent) — masking must NOT be bypassable through an aggregate.
+    /// The mask now reaches aggregate arguments, so `max(email)` aggregates over
+    /// masked values and the result is the mask, never cleartext PII. Pre-fix
+    /// this leaked the real max email because masking only touched the final
+    /// `Projection`.
+    #[tokio::test]
+    async fn column_mask_not_bypassed_by_aggregate() {
+        let (ctx, users) = ctx_with_users();
+        let enforcer = ColumnMaskingEnforcer::new([mask_email_literal(&users)]).expect("build");
+
+        // Bare aggregate.
+        let plan = rewrite_sql(&ctx, &enforcer, "SELECT max(email) AS m FROM users").await;
+        let rows = execute_plan(&ctx, plan).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0][0], "***@example.com",
+            "max() over a masked column must not leak cleartext; got {rows:?}"
+        );
+
+        // The reported GROUP BY shape.
+        let plan = rewrite_sql(
+            &ctx,
+            &enforcer,
+            "SELECT id, max(email) AS m FROM users GROUP BY id ORDER BY id",
+        )
+        .await;
+        let rows = execute_plan(&ctx, plan).await;
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert_eq!(
+                row[1], "***@example.com",
+                "grouped max(email) must be masked; got {rows:?}"
+            );
+        }
+    }
+
+    ///  (High) — a scalar function on a masked column WITHOUT an alias
+    /// must not crash the optimizer. Source-level masking keeps the column name
+    /// at the scan, so `upper(email)` derives its usual field name and
+    /// DataFusion's schema-invariant checker is satisfied. Pre-fix the
+    /// projection-level rewrite changed the derived name to `upper(Utf8("***"))`
+    /// and panicked `optimize_projections`.
+    #[tokio::test]
+    async fn column_mask_unaliased_scalar_fn_does_not_crash_optimizer() {
+        let (ctx, users) = ctx_with_users();
+        let enforcer = ColumnMaskingEnforcer::new([mask_email_literal(&users)]).expect("build");
+        let plan = rewrite_sql(&ctx, &enforcer, "SELECT UPPER(email) FROM users ORDER BY 1").await;
+        let rows = execute_plan(&ctx, plan).await;
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert_eq!(
+                row[0], "***@EXAMPLE.COM",
+                "upper() over the masked value; got {rows:?}"
+            );
+        }
+    }
+
+    /// `ORDER BY <masked column>` must not crash: `Sort` nodes are skipped by
+    /// masking (sorting by the real value emits no cleartext, and alias-wrapping
+    /// an `Expr::Sort` is invalid). The query plans, executes, and the masked
+    /// column is never projected as cleartext.
+    #[tokio::test]
+    async fn column_mask_order_by_masked_column_does_not_crash() {
+        let (ctx, users) = ctx_with_users();
+        let enforcer = ColumnMaskingEnforcer::new([mask_email_literal(&users)]).expect("build");
+        // ORDER BY the masked column (not projected) — must not panic.
+        let plan = rewrite_sql(&ctx, &enforcer, "SELECT id FROM users ORDER BY email").await;
+        let rows = execute_plan(&ctx, plan).await;
+        assert_eq!(rows.len(), 3, "all rows returned; got {rows:?}");
+        // And when the masked column IS projected alongside the ORDER BY, it is
+        // still masked in the output.
+        let plan = rewrite_sql(
+            &ctx,
+            &enforcer,
+            "SELECT id, email FROM users ORDER BY email",
+        )
+        .await;
+        let rows = execute_plan(&ctx, plan).await;
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert_eq!(
+                row[1], "***@example.com",
+                "projected email masked; got {rows:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1752,9 +1838,10 @@ mod tests {
     }
 
     /// (b) `IN (subquery)`: the subquery projecting the masked column is
-    /// rewritten to the mask literal. Observable effect — the outer (un-masked,
-    /// predicate-position) email can no longer be `IN` a set of masked
-    /// literals, so the row set collapses; without descent all 3 rows match.
+    /// rewritten to the mask literal (a projection). The outer `email` sits in a
+    /// `WHERE … IN` predicate, which is NOT masked (predicates keep real values),
+    /// so the real outer email is no longer `IN` a set of masked literals and the
+    /// row set collapses to 0 — the observable proof the subquery was masked.
     #[tokio::test]
     async fn mask_applies_inside_in_subquery() {
         let (ctx, users) = ctx_with_users();

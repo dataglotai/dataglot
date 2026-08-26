@@ -104,11 +104,18 @@ reconnect); role membership resolves at connect time. Full DDL:
 Once a read is authorized, governance decides what the rows actually contain.
 Three enforcers, all plan-time, all in `crates/dataglot-policy/`:
 
-- **Column masks** (`mask.rs`) — a matching column is replaced by its mask
-  expression **only in the output projection**. Predicates, joins, sorts, and
-  aggregates see the *unmasked* value (industry-standard "option A" semantics,
-  matching Snowflake / BigQuery / Databricks). So `WHERE email = 'alice@…'`
-  still finds Alice's row even though `email` comes back masked in the result.
+- **Column masks** (`mask.rs`) — the mask expression is substituted for a
+  matching column in every **output-reaching** position: the output projection,
+  **aggregate** arguments, and window functions. So `SELECT max(email)`
+  returns the mask, never cleartext (the aggregate operates on masked values).
+  Predicates, join keys, and sort keys are **not** masked: `Filter` (user `WHERE`
+  *and* admin row-filter RLS predicates) and `Join` keys keep their real values
+  — masking a governance predicate would silently break RLS and masking a join
+  key would break the join — and `Sort` orders by the real value (nothing is
+  emitted, so no cleartext leaks; `ORDER BY email` may therefore order by the
+  unmasked value). So `WHERE email = 'alice@…'` still finds Alice's row while the
+  projected `email` comes back masked. (Amended from the original
+  projection-only rule, which leaked PII through aggregates —.)
 - **Row filters** (`filter.rs`) — a mandatory boolean predicate is baked into
   every scan of the target table. Predicate pushdown collapses it into the
   source scan where possible; where not, it is evaluated locally. Either way it

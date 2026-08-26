@@ -276,12 +276,12 @@ async fn explain_is_empty_when_no_policy_applies() {
     );
 }
 
-/// Mask-in-predicate **option A** (adapted from Trino TestColumnMask): a
-/// predicate on a masked column matches the row by its **real** value, while
-/// the output projection is masked. The mask is applied only to the projection,
-/// never to the `WHERE` — so filtering by the true email finds alice's row and
-/// the returned email is `***`. (If the mask leaked into the predicate,
-/// `'***' = 'alice@x.com'` would match nothing and the result would be empty.)
+/// Mask-in-predicate: predicates are NOT masked (they may carry admin
+/// row-filter/RLS logic — masking those would break governance), so a `WHERE`
+/// on a masked column evaluates against the **real** value while the projected
+/// column comes back masked. Filtering by Alice's true email finds her row and
+/// returns `***`. (Option A for predicates;  fixed the aggregate/
+/// projection bypass, not predicates.)
 #[tokio::test]
 async fn mask_matches_real_value_in_predicate_but_masks_projection() {
     let ctx = ctx();
@@ -295,7 +295,7 @@ async fn mask_matches_real_value_in_predicate_but_masks_projection() {
     assert_eq!(
         rows,
         vec![vec!["***".to_string()]],
-        "predicate matched the real value; projection is masked (option A)"
+        "predicate matched the real value; projection is masked",
     );
 }
 

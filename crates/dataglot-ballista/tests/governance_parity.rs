@@ -140,9 +140,10 @@ async fn setup_postgres() -> (String, ContainerAsync<Postgres>) {
 ///    `filter-pii-analyst`.
 ///
 /// Note: the row-filter predicate references the *original* `email`
-/// value (the filter is applied close to the source, before the
-/// masking projection). This is the per-MVP design (option A in
-/// spec 01) — predicates see real values, projections see masked.
+/// value — masking never rewrites predicates (`Filter`/`Join` are
+/// skipped), so an admin RLS predicate always evaluates on real data.
+/// Masking reaches output-reaching expressions (projection, aggregate,
+/// sort), which is what closed the aggregate bypass in.
 fn build_policy_rule() -> Arc<PolicyOptimizerRule> {
     let mask = ColumnMaskingEnforcer::new([ColumnMask {
         table: TableReference::bare("users"),
