@@ -93,7 +93,12 @@ pub fn rewrite_explain_federation(query: &str) -> Option<String> {
 /// Shared with [`crate::show_schemas`] — both pre-parse rewriters match
 /// leading SQL keywords case-insensitively.
 pub(crate) fn strip_keyword_ci<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
-    if s.len() < keyword.len() {
+    // `keyword.len()` is a BYTE count. `str::split_at` panics if that offset
+    // lands inside a multibyte UTF-8 char, so a query beginning with a non-ASCII
+    // char (e.g. `SELECT '🚀'`) would crash the pgwire worker. Guard
+    // the split with `is_char_boundary`: keywords are ASCII, so if the boundary
+    // is mid-char the input can't start with the keyword anyway — return None.
+    if s.len() < keyword.len() || !s.is_char_boundary(keyword.len()) {
         return None;
     }
     let (head, tail) = s.split_at(keyword.len());
@@ -111,6 +116,34 @@ pub(crate) fn starts_with_whitespace(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    ///: a query beginning with (or containing near the start) a
+    /// multibyte UTF-8 char must not panic the pre-parse keyword matcher.
+    /// `split_at(keyword.len())` used to crash on a byte offset landing inside
+    /// the char (e.g. `SELECT '🚀'`), taking down the pgwire worker.
+    #[test]
+    fn strip_keyword_ci_does_not_panic_on_multibyte_boundary() {
+        // Boundary lands inside the emoji — no panic, correct None.
+        assert_eq!(strip_keyword_ci("a🚀b", "abc"), None);
+        assert_eq!(strip_keyword_ci("🚀", "EX"), None);
+        // The exact reported shape: a whole query prefixed with an emoji.
+        for kw in ["SELECT", "EXPLAIN", "SHOW", "WITH", "SET LOCAL"] {
+            assert_eq!(
+                strip_keyword_ci("SELECT '🚀 🤖 👨‍💻 🔥' AS emojis", kw),
+                {
+                    if kw == "SELECT" {
+                        Some(" '🚀 🤖 👨‍💻 🔥' AS emojis")
+                    } else {
+                        None
+                    }
+                }
+            );
+        }
+        // ASCII keyword matching still works.
+        assert_eq!(strip_keyword_ci("EXPLAIN foo", "explain"), Some(" foo"));
+        assert_eq!(strip_keyword_ci("select 1", "SELECT"), Some(" 1"));
+        assert_eq!(strip_keyword_ci("abc", "abcd"), None);
+    }
 
     #[test]
     fn rewrites_basic_explain_federation_select() {

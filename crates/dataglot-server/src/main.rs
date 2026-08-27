@@ -171,7 +171,11 @@ async fn run() -> Result<()> {
     }
 
     tracing::info!(
-        version = dataglot_core::datafusion_version(),
+        // Dataglot's own version (matches `dataglot --version`), not the
+        // DataFusion/Ballista crate version — same source as the CLI and the
+        // dashboard ServerInfo.
+        version = env!("CARGO_PKG_VERSION"),
+        datafusion_version = dataglot_core::datafusion_version(),
         host = %config.host,
         port = config.port,
         metrics_addr = ?config.observability.metrics_addr,

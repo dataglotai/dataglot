@@ -25,7 +25,7 @@
 //! * Rule 13 — schemas are fetched on first `table_provider` call, not at
 //!   connector construction time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -46,10 +46,12 @@ use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::PhysicalExpr;
+use datafusion::sql::sqlparser::ast;
+use datafusion::sql::sqlparser::ast::VisitMut;
 use datafusion::sql::unparser::dialect::{Dialect, PostgreSqlDialect};
 use datafusion::sql::TableReference;
 use datafusion_federation::sql::{
-    RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
+    AstAnalyzer, RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
 };
 use datafusion_federation::FederatedTableProviderAdaptor;
 use futures::stream;
@@ -1251,6 +1253,319 @@ fn pg_decode_err(e: tokio_postgres::Error) -> DataFusionError {
 // other state-changing SQL on the shared client, you MUST address state
 // isolation across users — see the ADBC connector's reset-on-return +
 // discard-on-failure pattern at `crates/dataglot-federation/src/adbc.rs`.
+/// Repair the outer column qualifiers the DataFusion unparser leaves dangling
+/// when a pushed-down plan wraps its projection in a **derived table**.
+///
+/// For a federated `SELECT DISTINCT region FROM users ORDER BY 1`, the unparser
+/// emits:
+///
+/// ```sql
+/// SELECT "users"."region"
+/// FROM (SELECT "users"."region" FROM "public"."users") AS "derived_projection"
+/// GROUP BY "users"."region" ORDER BY "users"."region"
+/// ```
+///
+/// The outer scope's only relation is the derived table `derived_projection`,
+/// so the outer `"users"."region"` references have no matching FROM entry and
+/// Postgres rejects the query with *missing FROM-clause entry for table "users"*
+///
+/// **The rule.** When a `SELECT`'s FROM is a *single* derived table, that
+/// derived alias is the only relation in scope — so *every* table-qualified
+/// reference at that scope must be qualified by the derived alias. We requalify
+/// each stale qualifier (a leaked source-relation name) to the derived alias,
+/// regardless of how many distinct stale qualifiers leak (a same-source join
+/// wrapped in `DISTINCT` leaves e.g. `u.region`, `o.status` — both are
+/// rewritten).
+///
+/// **Soundness by construction.** We only ever descend through the FROM clause
+/// (derived tables and nested joins) — never into a subquery embedded in an
+/// *expression* (WHERE / projection / HAVING). A non-LATERAL derived table
+/// cannot be correlated to an enclosing scope, so at every scope we reach every
+/// non-alias qualifier is unambiguously a leaked name and is safe to requalify.
+/// Expression subqueries, by contrast, *can* be correlated, and a leaked
+/// qualifier there is textually indistinguishable from a genuine correlated
+/// reference to an enclosing relation of the same name — so we deliberately
+/// leave those unrepaired (they fail loudly on the remote, exactly as before
+/// this fix) rather than risk silently rewriting a correlated reference. Two
+/// further guards keep it sound: a scope whose derived subquery exposes
+/// duplicate output column names is left unchanged (requalifying would make the
+/// reference ambiguous), and a LATERAL derived table is never descended into.
+///
+/// For a set operation (or a parenthesized query body) the query-level ORDER BY
+/// resolves against the output columns — branch/relation aliases are not in
+/// scope — so a qualified sort key there is stripped to a bare column instead.
+fn requalify_derived_refs(mut stmt: ast::Statement) -> ast::Statement {
+    if let ast::Statement::Query(query) = &mut stmt {
+        requalify_query(query);
+    }
+    stmt
+}
+
+fn requalify_query(query: &mut ast::Query) {
+    // Split the borrow so the ORDER BY (on the `Query`) and the body are
+    // available together — the fix needs to see both to decide safely.
+    let ast::Query {
+        body,
+        order_by,
+        with,
+        ..
+    } = &mut *query;
+    // CTE definitions are their own uncorrelated scopes (a WITH query cannot
+    // reference the outer query's FROM), so descend into each and requalify it
+    // the same way — the unparser can wrap a CTE body in the derived-table shape.
+    if let Some(with) = with {
+        for cte in &mut with.cte_tables {
+            requalify_query(&mut cte.query);
+        }
+    }
+    match body.as_mut() {
+        ast::SetExpr::Select(select) => fix_select_scope(select, order_by.as_mut()),
+        ast::SetExpr::Query(inner) => {
+            requalify_query(inner);
+            // A parenthesized query body has no relation in scope at the wrapper
+            // level — its trailing ORDER BY resolves against the inner query's
+            // output columns, so strip any qualifier to a bare column.
+            if let Some(order_by) = order_by.as_mut() {
+                strip_order_by_qualifiers(order_by);
+            }
+        }
+        other => {
+            // UNION / INTERSECT / EXCEPT: fix each branch as its own scope, then
+            // handle the query-level ORDER BY. At a set operation the sort keys
+            // resolve against the *output columns* (branch relation aliases are
+            // not in scope), so a qualified sort key must be stripped to a bare
+            // column for Postgres to accept it.
+            fix_set_expr_scope(other);
+            if let Some(order_by) = order_by.as_mut() {
+                strip_order_by_qualifiers(order_by);
+            }
+        }
+    }
+}
+
+fn fix_set_expr_scope(body: &mut ast::SetExpr) {
+    match body {
+        ast::SetExpr::Select(select) => fix_select_scope(select, None),
+        ast::SetExpr::Query(inner) => requalify_query(inner),
+        ast::SetExpr::SetOperation { left, right, .. } => {
+            fix_set_expr_scope(left);
+            fix_set_expr_scope(right);
+        }
+        _ => {}
+    }
+}
+
+/// Requalify stale qualifiers at a single `SELECT` scope, then descend through
+/// its FROM clause only (see `requalify_derived_refs` for why not expressions).
+fn fix_select_scope(select: &mut ast::Select, order_by: Option<&mut ast::OrderBy>) {
+    // A single, non-LATERAL derived table ⇒ its alias is the only relation in
+    // scope, so every OTHER table qualifier at this level is a leaked name that
+    // must resolve to it — UNLESS the derived table exposes duplicate output
+    // column names, in which case requalifying would make a reference ambiguous
+    // (e.g. a DISTINCT over a same-source join projecting `u.id` and `o.id`, or a
+    // duplicated projection `u.id, u.id`). We can't recover the per-column
+    // correspondence from the unparsed SQL, so we leave such a scope unchanged
+    // (no worse than the unrepaired SQL). Colliding-name join DISTINCT is a
+    // tracked follow-up.
+    let alias = if select.from.len() == 1 && select.from[0].joins.is_empty() {
+        if let ast::TableFactor::Derived {
+            lateral: false,
+            alias: Some(a),
+            subquery,
+            ..
+        } = &select.from[0].relation
+        {
+            if derived_outputs_collide(subquery) {
+                None
+            } else {
+                Some(a.name.clone())
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(alias) = alias {
+        let mut fixer = ScopeFixer { alias, depth: 0 };
+        let _ = select.visit(&mut fixer);
+        if let Some(order_by) = order_by {
+            // ORDER BY lives on the `Query`, not the `Select`; visit it under the
+            // same scope (depth 0) so its qualifiers requalify to the derived
+            // alias too.
+            let _ = order_by.visit(&mut fixer);
+        }
+    }
+
+    // Descend through the FROM clause (derived tables, nested joins) — a
+    // non-LATERAL derived table is an uncorrelated scope, so requalifying it is
+    // sound. Expression subqueries are intentionally NOT descended into.
+    for twj in &mut select.from {
+        requalify_from_factor(&mut twj.relation);
+        for join in &mut twj.joins {
+            requalify_from_factor(&mut join.relation);
+        }
+    }
+}
+
+fn requalify_from_factor(tf: &mut ast::TableFactor) {
+    match tf {
+        ast::TableFactor::Derived {
+            lateral: false,
+            subquery,
+            ..
+        } => requalify_query(subquery),
+        ast::TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            requalify_from_factor(&mut table_with_joins.relation);
+            for join in &mut table_with_joins.joins {
+                requalify_from_factor(&mut join.relation);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether the derived subquery's projection could expose two columns with the
+/// same output name — the case where requalifying an outer reference to the
+/// derived alias would be ambiguous. Any projection item whose output name(s)
+/// can't be read off the AST — a `*`/`table.*` wildcard (which can itself expand
+/// to several duplicate-named columns) or a complex unaliased expression — is
+/// treated as a *possible* collision and makes us bail, rather than assumed
+/// collision-free.
+fn derived_outputs_collide(subquery: &ast::Query) -> bool {
+    // Resolve the body to the SELECT whose projection names the derived output
+    // columns — for a set operation that is the leftmost branch, for a
+    // parenthesized body the inner query. If it can't be resolved to a SELECT
+    // (e.g. a VALUES list), bail conservatively (treat as a collision) so we
+    // never requalify against output names we couldn't verify.
+    let Some(select) = leftmost_select(&subquery.body) else {
+        return true;
+    };
+    let mut seen = HashSet::new();
+    for item in &select.projection {
+        let name = match item {
+            ast::SelectItem::ExprWithAlias { alias, .. } => &alias.value,
+            ast::SelectItem::UnnamedExpr(ast::Expr::Identifier(id)) => &id.value,
+            ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(parts)) => {
+                match parts.last() {
+                    Some(p) => &p.value,
+                    None => return true,
+                }
+            }
+            // Wildcard, qualified wildcard, or a complex unaliased expression:
+            // the output name(s) can't be determined here, so bail.
+            _ => return true,
+        };
+        if !seen.insert(name.clone()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The SELECT whose projection determines a query's output column names: the
+/// query itself, the leftmost branch of a set operation, or the inner query of a
+/// parenthesized body. `None` if it can't be resolved to a SELECT.
+fn leftmost_select(body: &ast::SetExpr) -> Option<&ast::Select> {
+    match body {
+        ast::SetExpr::Select(select) => Some(select),
+        ast::SetExpr::Query(inner) => leftmost_select(&inner.body),
+        ast::SetExpr::SetOperation { left, .. } => leftmost_select(left),
+        _ => None,
+    }
+}
+
+/// Strip the table qualifier from a query-level ORDER BY whose scope has no
+/// relation in it — a set operation, or a parenthesized query body. There the
+/// ordering resolves against the (unqualified) output columns, so `ORDER BY
+/// users.region` (or `ORDER BY upper(users.region)`) must drop the qualifier.
+/// Depth-guarded so a subquery embedded in a sort key — its own scope — is not
+/// touched.
+fn strip_order_by_qualifiers(order_by: &mut ast::OrderBy) {
+    let mut stripper = OrderByStripper { depth: 0 };
+    let _ = order_by.visit(&mut stripper);
+}
+
+/// Drop the leading (table) part of a compound identifier, keeping the rest:
+/// `users.region` → `region`, `users.col.field` → `col.field`.
+fn drop_qualifier(parts: &[ast::Ident]) -> ast::Expr {
+    if parts.len() == 2 {
+        ast::Expr::Identifier(parts[1].clone())
+    } else {
+        ast::Expr::CompoundIdentifier(parts[1..].to_vec())
+    }
+}
+
+struct OrderByStripper {
+    depth: usize,
+}
+
+impl ast::VisitorMut for OrderByStripper {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &mut ast::Query) -> core::ops::ControlFlow<()> {
+        self.depth += 1;
+        core::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut ast::Query) -> core::ops::ControlFlow<()> {
+        self.depth = self.depth.saturating_sub(1);
+        core::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &mut ast::Expr) -> core::ops::ControlFlow<()> {
+        if self.depth == 0 {
+            if let ast::Expr::CompoundIdentifier(parts) = expr {
+                if parts.len() >= 2 {
+                    *expr = drop_qualifier(parts);
+                }
+            }
+        }
+        core::ops::ControlFlow::Continue(())
+    }
+}
+
+/// Mutating visitor that requalifies a scope's leaked table qualifiers to its
+/// derived alias. It rewrites only at query depth 0 (this scope's own
+/// expressions); `pre/post_visit_query` bump the depth as the walk enters/leaves
+/// a subquery so nested scopes — which have their own FROM and are handled by
+/// their own pass — are never touched here. The leading part of a compound
+/// identifier (the table qualifier) is replaced unless it is already the alias.
+struct ScopeFixer {
+    alias: ast::Ident,
+    depth: usize,
+}
+
+impl ast::VisitorMut for ScopeFixer {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &mut ast::Query) -> core::ops::ControlFlow<()> {
+        self.depth += 1;
+        core::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut ast::Query) -> core::ops::ControlFlow<()> {
+        self.depth = self.depth.saturating_sub(1);
+        core::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &mut ast::Expr) -> core::ops::ControlFlow<()> {
+        if self.depth == 0 {
+            if let ast::Expr::CompoundIdentifier(parts) = expr {
+                if parts.len() >= 2 && parts[0].value != self.alias.value {
+                    // Requalify to the derived alias, PRESERVING its quote style
+                    // (`"Users"` vs `users` fold differently).
+                    parts[0] = self.alias.clone();
+                }
+            }
+        }
+        core::ops::ControlFlow::Continue(())
+    }
+}
+
 #[async_trait]
 impl SQLExecutor for PostgresConnector {
     fn name(&self) -> &str {
@@ -1266,6 +1581,15 @@ impl SQLExecutor for PostgresConnector {
         // casts, and other postgres-flavoured syntax. This is what makes
         // pushed-down SQL actually executable on the remote.
         Arc::new(PostgreSqlDialect {})
+    }
+
+    fn ast_analyzer(&self) -> Option<AstAnalyzer> {
+        // Repair the derived-table requalification the unparser omits for
+        // pushed-down `DISTINCT` (and any GROUP BY the plan wraps in a derived
+        // projection). See `requalify_derived_refs`.
+        Some(Box::new(|stmt: ast::Statement| {
+            Ok(requalify_derived_refs(stmt))
+        }))
     }
 
     fn execute(
@@ -1397,6 +1721,316 @@ fn split_qualified(s: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn analyze(sql: &str) -> String {
+        use datafusion::sql::sqlparser::dialect::PostgreSqlDialect as PgParseDialect;
+        use datafusion::sql::sqlparser::parser::Parser;
+        let stmt = Parser::parse_sql(&PgParseDialect {}, sql)
+            .expect("parse")
+            .pop()
+            .expect("one statement");
+        requalify_derived_refs(stmt).to_string()
+    }
+
+    ///: the unparser wraps a pushed-down DISTINCT in a derived table but
+    /// leaves the outer refs qualified by the inner table, producing SQL Postgres
+    /// rejects (`missing FROM-clause entry for table "users"`). The analyzer
+    /// repairs it by REQUALIFYING each stale outer reference to the derived
+    /// alias; the derived subquery's own refs (where the real table is in scope)
+    /// are left untouched.
+    #[test]
+    fn requalify_fixes_derived_projection_distinct() {
+        let bad = r#"SELECT "users"."region" FROM (SELECT "users"."region" FROM "public"."users") AS "derived_projection" GROUP BY "users"."region" ORDER BY "users"."region" ASC NULLS LAST"#;
+        let fixed = analyze(bad);
+        // The derived alias is preserved; the outer refs are requalified to it.
+        assert!(
+            fixed.starts_with(r#"SELECT "derived_projection"."region" FROM"#)
+                && fixed.contains(r#"GROUP BY "derived_projection"."region""#)
+                && fixed.contains(r#"ORDER BY "derived_projection"."region""#),
+            "outer refs should be requalified to the derived alias: {fixed}"
+        );
+        // The derived subquery's own `users.region` is valid there and untouched.
+        assert!(
+            fixed.contains(
+                r#"(SELECT "users"."region" FROM "public"."users") AS "derived_projection""#
+            ),
+            "the derived subquery's inner refs must be left untouched: {fixed}"
+        );
+    }
+
+    /// A plain scan (no derived table) must be left completely untouched — the
+    /// qualifiers there are valid.
+    #[test]
+    fn requalify_leaves_plain_scan_untouched() {
+        let ok = r#"SELECT "users"."region" FROM "public"."users" GROUP BY "users"."region""#;
+        assert_eq!(analyze(ok), ok);
+    }
+
+    /// A join query (no single derived table) is untouched.
+    #[test]
+    fn requalify_leaves_join_untouched() {
+        let ok = r#"SELECT "u"."id" FROM "public"."users" AS "u" JOIN "public"."orders" AS "o" ON "o"."user_id" = "u"."id""#;
+        assert_eq!(analyze(ok), ok);
+    }
+
+    /// Stale qualifiers WRAPPED in a function / HAVING resolve too — every
+    /// reference at the outer scope is requalified regardless of expression shape.
+    #[test]
+    fn requalify_fixes_function_and_having_refs() {
+        let bad = r#"SELECT upper("users"."region") FROM (SELECT "users"."region" FROM "public"."users") AS "derived_projection" GROUP BY upper("users"."region") HAVING count("users"."region") > 1"#;
+        let fixed = analyze(bad);
+        assert!(
+            fixed.contains(r#"upper("derived_projection"."region")"#)
+                && fixed.contains(r#"count("derived_projection"."region")"#),
+            "wrapped refs must be requalified to the derived alias: {fixed}"
+        );
+        assert!(
+            fixed.contains(
+                r#"(SELECT "users"."region" FROM "public"."users") AS "derived_projection""#
+            ),
+            "derived subquery untouched: {fixed}"
+        );
+    }
+
+    /// A same-source join wrapped in DISTINCT leaves TWO stale qualifiers in the
+    /// outer scope (`u.region`, `o.status`). Both must requalify to the single
+    /// derived alias — the previous "rename to the sole stale qualifier" scheme
+    /// could not express this (Codex P1: multiple source qualifiers).
+    #[test]
+    fn requalify_fixes_join_distinct_multiple_qualifiers() {
+        let bad = r#"SELECT "u"."region", "o"."status" FROM (SELECT "u"."region", "o"."status" FROM "public"."users" AS "u" JOIN "public"."orders" AS "o" ON "o"."uid" = "u"."id") AS "derived_projection" GROUP BY "u"."region", "o"."status""#;
+        let fixed = analyze(bad);
+        assert!(
+            fixed.starts_with(
+                r#"SELECT "derived_projection"."region", "derived_projection"."status" FROM"#
+            ) && fixed.contains(
+                r#"GROUP BY "derived_projection"."region", "derived_projection"."status""#
+            ),
+            "both stale qualifiers must requalify to the derived alias: {fixed}"
+        );
+        // The inner join keeps its real `u`/`o` qualifiers (valid in that scope).
+        assert!(
+            fixed.contains(r#""public"."users" AS "u" JOIN "public"."orders" AS "o""#),
+            "inner join refs untouched: {fixed}"
+        );
+    }
+
+    /// When a reference is already qualified by the DERIVED alias, there is no
+    /// stale qualifier ⇒ the query is left completely untouched.
+    #[test]
+    fn requalify_preserves_derived_alias_refs() {
+        let ok = r#"SELECT "derived_projection"."region" FROM (SELECT "region" FROM "public"."users") AS "derived_projection" GROUP BY "derived_projection"."region""#;
+        assert_eq!(
+            analyze(ok),
+            ok,
+            "derived-alias refs are valid and untouched"
+        );
+    }
+
+    /// A DISTINCT branch inside a set operation gets the same derived-table
+    /// wrapper and must be repaired too (its outer refs requalified).
+    #[test]
+    fn requalify_fixes_set_operation_branch() {
+        let bad = r#"SELECT "users"."region" FROM (SELECT "users"."region" FROM "public"."users") AS "derived_projection" GROUP BY "users"."region" UNION ALL SELECT "region" FROM "public"."users""#;
+        let fixed = analyze(bad);
+        assert!(
+            fixed.contains(r#"SELECT "derived_projection"."region" FROM (SELECT "users"."region""#)
+                && fixed.contains(r#"GROUP BY "derived_projection"."region" UNION ALL"#),
+            "the DISTINCT branch's outer refs must be requalified: {fixed}"
+        );
+    }
+
+    /// A set operation's query-level ORDER BY resolves against the OUTPUT columns
+    /// (branch relation aliases are not in scope), so a qualified sort key must be
+    /// stripped to a bare column (Codex P1: query-level ORDER BY for set ops).
+    #[test]
+    fn requalify_strips_set_operation_order_by() {
+        let bad = r#"SELECT "region" FROM "public"."users" UNION ALL SELECT "region" FROM "public"."orders" ORDER BY "users"."region""#;
+        let fixed = analyze(bad);
+        assert!(
+            fixed.contains(r#"ORDER BY "region""#)
+                && !fixed.contains(r#"ORDER BY "users"."region""#),
+            "set-op ORDER BY must be stripped to a bare output column: {fixed}"
+        );
+    }
+
+    /// The `ORDER BY` output-alias-shadowing case (Codex): requalifying (not
+    /// stripping) keeps the reference qualified, so `ORDER BY derived.x` resolves
+    /// to the FROM column, never the output alias `x`.
+    #[test]
+    fn requalify_order_by_stays_qualified_no_shadow() {
+        let bad = r#"SELECT (- "users"."x") AS "x" FROM (SELECT "users"."x" FROM "public"."t") AS "derived_projection" ORDER BY "users"."x""#;
+        let fixed = analyze(bad);
+        assert!(
+            fixed.contains(r#"ORDER BY "derived_projection"."x""#),
+            "ORDER BY must stay qualified (to the derived alias), not stripped to a shadowed bare name: {fixed}"
+        );
+    }
+
+    /// The stale qualifier in the outer WHERE is requalified too (Codex).
+    #[test]
+    fn requalify_considers_outer_where() {
+        let bad = r#"SELECT "region" FROM (SELECT "users"."region" FROM "public"."users") AS "derived_projection" WHERE "users"."region" = 'EU'"#;
+        let fixed = analyze(bad);
+        assert!(
+            fixed.contains(r#"WHERE "derived_projection"."region" = 'EU'"#),
+            "outer WHERE ref must be requalified to the derived alias: {fixed}"
+        );
+    }
+
+    /// A qualifier that appears ONLY inside a nested subquery (its own scope)
+    /// must not be touched by the OUTER scope's requalification (Codex): the
+    /// outer refs use the derived alias, and the nested `o` is valid in its scope.
+    #[test]
+    fn requalify_ignores_nested_subquery_qualifiers() {
+        let ok = r#"SELECT "derived_projection"."region" FROM (SELECT "region" FROM "public"."users") AS "derived_projection" WHERE "derived_projection"."region" IN (SELECT "o"."region" FROM "public"."orders" AS "o")"#;
+        assert_eq!(
+            analyze(ok),
+            ok,
+            "a nested subquery's `o` qualifier must not be rewritten by the outer scope"
+        );
+    }
+
+    /// A broken shape embedded in an EXPRESSION subquery (here an IN-subquery) is
+    /// deliberately LEFT UNREPAIRED and unchanged: an expression subquery can be
+    /// correlated, and a leaked qualifier there is textually indistinguishable
+    /// from a genuine correlated reference — so requalifying it could silently
+    /// rewrite a correlation. We only descend through FROM (uncorrelated). Such a
+    /// pushdown fails loudly on the remote exactly as before this fix (tracked
+    /// follow-up); it is never silently mis-rewritten.
+    #[test]
+    fn requalify_leaves_expression_subquery_unrepaired() {
+        let bad = r#"SELECT "id" FROM "public"."accounts" WHERE "id" IN (SELECT "users"."region" FROM (SELECT "users"."region" FROM "public"."users") AS "derived_projection" GROUP BY "users"."region")"#;
+        assert_eq!(
+            analyze(bad),
+            bad,
+            "expression-subquery scopes must be left untouched, never guessed at"
+        );
+    }
+
+    /// A parenthesized query body with a trailing wrapper-level ORDER BY: the
+    /// inner refs requalify and the wrapper ORDER BY (which resolves against the
+    /// inner output columns) is stripped to a bare column (Codex P1).
+    #[test]
+    fn requalify_fixes_parenthesized_outer_order_by() {
+        let bad = r#"(SELECT "users"."region" FROM (SELECT "users"."region" FROM "public"."users") AS "derived_projection" GROUP BY "users"."region") ORDER BY "users"."region""#;
+        let fixed = analyze(bad);
+        assert!(
+            fixed.contains(r#"GROUP BY "derived_projection"."region""#),
+            "inner refs must be requalified: {fixed}"
+        );
+        assert!(
+            fixed.contains(r#"ORDER BY "region""#)
+                && !fixed.contains(r#"ORDER BY "users"."region""#),
+            "wrapper ORDER BY must be stripped to a bare output column: {fixed}"
+        );
+    }
+
+    /// A set-op ORDER BY key wrapped in a function must have its qualifier
+    /// stripped too, not only a bare `CompoundIdentifier` (Gemini).
+    #[test]
+    fn requalify_strips_set_operation_order_by_nested_expr() {
+        let bad = r#"SELECT "region" FROM "public"."users" UNION ALL SELECT "region" FROM "public"."orders" ORDER BY upper("users"."region")"#;
+        let fixed = analyze(bad);
+        assert!(
+            fixed.contains(r#"ORDER BY upper("region")"#)
+                && !fixed.contains(r#"upper("users"."region")"#),
+            "qualifier nested in a set-op ORDER BY expression must be stripped: {fixed}"
+        );
+    }
+
+    /// A DISTINCT over a same-source join projecting same-named columns (`u.id`,
+    /// `o.id`) would collapse both to `derived.id` if requalified — ambiguous or
+    /// silently wrong. The fix BAILS on such a scope, leaving the SQL unchanged
+    /// (no worse than unrepaired) rather than emitting a broken query (Codex P1).
+    #[test]
+    fn requalify_bails_on_ambiguous_duplicate_output_names() {
+        let bad = r#"SELECT "u"."id", "o"."id" FROM (SELECT "u"."id", "o"."id" FROM "public"."users" AS "u" JOIN "public"."orders" AS "o" ON "o"."uid" = "u"."id") AS "derived_projection""#;
+        let fixed = analyze(bad);
+        assert!(
+            fixed.starts_with(r#"SELECT "u"."id", "o"."id" FROM"#),
+            "colliding-output-name scope must be left unchanged, not collapsed: {fixed}"
+        );
+    }
+
+    /// The inverse guarantee for the correlated case: because expression
+    /// subqueries are never descended into, a genuine correlated reference to an
+    /// enclosing relation is never clobbered — the whole predicate is untouched.
+    #[test]
+    fn requalify_leaves_correlated_subquery_untouched() {
+        let bad = r#"SELECT "a"."id" FROM "public"."accounts" AS "a" WHERE EXISTS (SELECT "users"."region" FROM (SELECT "users"."region" FROM "public"."users") AS "derived_projection" WHERE "users"."region" = "a"."region")"#;
+        assert_eq!(
+            analyze(bad),
+            bad,
+            "correlated `a` (and everything in the expression subquery) is left as-is"
+        );
+    }
+
+    /// A duplicated projection over the SAME qualifier (`u.id, u.id`) also makes
+    /// the derived table expose two `id` columns ⇒ ambiguous ⇒ bail unchanged.
+    /// The guard keys on duplicate OUTPUT names, not distinct qualifiers (Codex).
+    #[test]
+    fn requalify_bails_on_same_qualifier_duplicate_output() {
+        let bad = r#"SELECT "u"."id", "u"."id" FROM (SELECT "u"."id", "u"."id" FROM "public"."users" AS "u") AS "derived_projection""#;
+        let fixed = analyze(bad);
+        assert!(
+            fixed.starts_with(r#"SELECT "u"."id", "u"."id" FROM"#),
+            "duplicate output name must bail, not collapse: {fixed}"
+        );
+    }
+
+    /// The derived subquery's body can itself be a set operation; the output
+    /// names come from its LEFTMOST branch. If that branch has duplicate names
+    /// (`u.id`, `o.id`), requalifying would be ambiguous ⇒ bail unchanged (Codex).
+    #[test]
+    fn requalify_bails_on_duplicate_outputs_in_derived_set_operation() {
+        let bad = r#"SELECT "u"."id", "o"."id" FROM (SELECT "u"."id", "o"."id" FROM "public"."users" AS "u" JOIN "public"."orders" AS "o" ON "o"."uid" = "u"."id" UNION ALL SELECT "u"."id", "o"."id" FROM "public"."users" AS "u" JOIN "public"."orders" AS "o" ON "o"."uid" = "u"."id") AS "derived_projection""#;
+        let fixed = analyze(bad);
+        assert!(
+            fixed.starts_with(r#"SELECT "u"."id", "o"."id" FROM"#),
+            "a set-op derived body with duplicate left-branch outputs must bail: {fixed}"
+        );
+    }
+
+    /// A derived body with a `*` wildcard can expand to duplicate columns we
+    /// can't see (`DISTINCT *` over a join exposing `u.id` and `o.id`) — an
+    /// undeterminable output name must make us bail, not assume no collision.
+    #[test]
+    fn requalify_bails_on_wildcard_derived_output() {
+        let bad = r#"SELECT "u"."id", "o"."id" FROM (SELECT * FROM "public"."users" AS "u" JOIN "public"."orders" AS "o" ON "o"."uid" = "u"."id") AS "derived_projection""#;
+        let fixed = analyze(bad);
+        assert!(
+            fixed.starts_with(r#"SELECT "u"."id", "o"."id" FROM"#),
+            "a wildcard derived output must bail unchanged: {fixed}"
+        );
+    }
+
+    /// The broken derived shape inside a CTE definition must be requalified too —
+    /// a WITH query is an uncorrelated scope the fix descends into (Gemini).
+    #[test]
+    fn requalify_fixes_derived_shape_inside_cte() {
+        let bad = r#"WITH "cte" AS (SELECT "users"."region" FROM (SELECT "users"."region" FROM "public"."users") AS "derived_projection" GROUP BY "users"."region") SELECT "region" FROM "cte""#;
+        let fixed = analyze(bad);
+        assert!(
+            fixed.contains(r#"SELECT "derived_projection"."region" FROM (SELECT "users"."region""#)
+                && fixed.contains(r#"GROUP BY "derived_projection"."region""#),
+            "the CTE body's broken shape must be requalified: {fixed}"
+        );
+    }
+
+    /// Nested derived tables in the FROM chain (an uncorrelated scope) ARE
+    /// descended into and requalified at each level.
+    #[test]
+    fn requalify_descends_nested_from_derived() {
+        let bad = r#"SELECT "users"."region" FROM (SELECT "users"."region" FROM (SELECT "users"."region" FROM "public"."users") AS "d1") AS "d2""#;
+        let fixed = analyze(bad);
+        assert!(
+            fixed.starts_with(
+                r#"SELECT "d2"."region" FROM (SELECT "d1"."region" FROM (SELECT "users"."region""#
+            ),
+            "each FROM-nested derived scope requalifies to its own alias: {fixed}"
+        );
+    }
 
     #[test]
     fn nanos_or_range_err_ok_in_range_errors_out_of_range() {
