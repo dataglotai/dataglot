@@ -55,7 +55,8 @@ use datafusion::sql::sqlparser::ast::{self, Fetch};
 use datafusion::sql::unparser::dialect::{CustomDialectBuilder, Dialect};
 use datafusion::sql::TableReference;
 use datafusion_federation::sql::{
-    AstAnalyzer, RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
+    AstAnalyzer, LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider,
+    SQLTableSource,
 };
 use datafusion_federation::FederatedTableProviderAdaptor;
 use futures::stream;
@@ -335,12 +336,23 @@ impl SQLExecutor for OracleConnector {
         oracle_dialect()
     }
 
+    fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
+        // Isolate governance row filters on OUTER-JOIN preserved legs so the
+        // unparser can't fold them into `ON` (RLS bypass). Shared across all SQL
+        // connectors — see `crate::rls_isolation` (/291).
+        Some(Box::new(|plan: datafusion::logical_expr::LogicalPlan| {
+            crate::rls_isolation::isolate_outer_join_filters(plan)
+        }))
+    }
+
     fn ast_analyzer(&self) -> Option<AstAnalyzer> {
         // Apply the Oracle-dialect rewrites the `CustomDialect` can't
         // express: `LIMIT`→`FETCH FIRST n ROWS ONLY` and stripping `AS`
         // from table aliases (ORA-03048). See module docs.
         Some(Box::new(|stmt: ast::Statement| {
-            Ok(rewrite_statement_for_oracle(stmt))
+            Ok(rewrite_statement_for_oracle(
+                crate::derived_requalify::requalify_derived_refs(stmt),
+            ))
         }))
     }
 

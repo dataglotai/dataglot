@@ -70,7 +70,8 @@ use datafusion::sql::unparser::dialect::{
 };
 use datafusion::sql::TableReference;
 use datafusion_federation::sql::{
-    RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
+    AstAnalyzer, LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider,
+    SQLTableSource,
 };
 use datafusion_federation::FederatedTableProviderAdaptor;
 use dataglot_core::{DataglotError, Result as DataglotResult};
@@ -1232,6 +1233,25 @@ impl SQLExecutor for AdbcConnector {
 
     fn dialect(&self) -> Arc<dyn Dialect> {
         self.config.dialect.unparser_dialect()
+    }
+
+    fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
+        // Isolate governance row filters on OUTER-JOIN preserved legs so the
+        // unparser can't fold them into `ON` (RLS bypass). See
+        // `crate::rls_isolation` (/291).
+        Some(Box::new(|plan: datafusion::logical_expr::LogicalPlan| {
+            crate::rls_isolation::isolate_outer_join_filters(plan)
+        }))
+    }
+
+    fn ast_analyzer(&self) -> Option<AstAnalyzer> {
+        // Requalify the derived-table references the unparser leaves dangling on
+        // pushed-down DISTINCT/GROUP BY (/291).
+        Some(Box::new(
+            |stmt: datafusion::sql::sqlparser::ast::Statement| {
+                Ok(crate::derived_requalify::requalify_derived_refs(stmt))
+            },
+        ))
     }
 
     fn execute(

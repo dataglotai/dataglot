@@ -2777,7 +2777,7 @@ License: http://www.apache.org/licenses/LICENSE-2.0
 - [`iceberg` 0.10.0](https://github.com/apache/iceberg-rust)
 - [`crc-fast` 1.10.0](https://github.com/awesomized/crc-fast-rust)
 - [`opendal` 0.57.0](https://github.com/apache/opendal)
-- [`redb` 4.1.0](https://github.com/cberner/redb)
+- [`redb` 4.2.0](https://github.com/cberner/redb)
 - [`reqsign-aws-v4` 3.0.2](https://github.com/apache/opendal-reqsign)
 - [`reqsign-core` 3.1.0](https://github.com/apache/opendal-reqsign)
 - [`reqsign-file-read-tokio` 3.0.2](https://github.com/apache/opendal-reqsign)
@@ -7374,7 +7374,7 @@ limitations under the License.
 - [`unicode-segmentation` 1.13.3](https://github.com/unicode-rs/unicode-segmentation)
 - [`unicode-width` 0.2.2](https://github.com/unicode-rs/unicode-width)
 - [`url` 2.5.8](https://github.com/servo/rust-url)
-- [`uuid` 1.24.0](https://github.com/uuid-rs/uuid)
+- [`uuid` 1.25.0](https://github.com/uuid-rs/uuid)
 - [`x509-parser` 0.18.1](https://github.com/rusticata/x509-parser.git)
 - [`xattr` 1.6.1](https://github.com/Stebalien/xattr)
 

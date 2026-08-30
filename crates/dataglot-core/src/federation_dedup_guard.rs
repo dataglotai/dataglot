@@ -110,6 +110,9 @@ impl OptimizerRule for FederatedDedupUnparseGuard {
 pub fn federated_optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     let mut rules = datafusion_federation::default_optimizer_rules();
     rules.push(Arc::new(FederatedDedupUnparseGuard));
+    rules.push(Arc::new(
+        crate::federation_mark_join_guard::FederatedMarkJoinGuard,
+    ));
     rules
 }
 

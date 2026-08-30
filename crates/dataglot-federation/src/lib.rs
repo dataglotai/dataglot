@@ -67,6 +67,27 @@ pub mod pushdown_trace;
 pub mod registry;
 #[cfg(feature = "rest")]
 pub mod rest;
+// Shared unparser fix-ups used by every SQL connector's ast_analyzer /
+// logical_optimizer: derived-table requalification (/291) and
+// governance-filter isolation (/291).
+#[cfg(any(
+    feature = "adbc",
+    feature = "postgres",
+    feature = "mysql",
+    feature = "oracle",
+    feature = "oracle-pure",
+    feature = "snowflake"
+))]
+pub(crate) mod derived_requalify;
+#[cfg(any(
+    feature = "adbc",
+    feature = "postgres",
+    feature = "mysql",
+    feature = "oracle",
+    feature = "oracle-pure",
+    feature = "snowflake"
+))]
+pub(crate) mod rls_isolation;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
 

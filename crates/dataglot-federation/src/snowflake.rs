@@ -80,7 +80,8 @@ use datafusion::sql::sqlparser::ast::{self};
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::TableReference;
 use datafusion_federation::sql::{
-    AstAnalyzer, RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
+    AstAnalyzer, LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider,
+    SQLTableSource,
 };
 use datafusion_federation::FederatedTableProviderAdaptor;
 use futures::stream;
@@ -638,13 +639,24 @@ impl SQLExecutor for SnowflakeConnector {
         Arc::new(SnowflakeDialect)
     }
 
+    fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
+        // Isolate governance row filters on OUTER-JOIN preserved legs so the
+        // unparser can't fold them into `ON` (RLS bypass). Shared across all SQL
+        // connectors — see `crate::rls_isolation` (/291).
+        Some(Box::new(|plan: datafusion::logical_expr::LogicalPlan| {
+            crate::rls_isolation::isolate_outer_join_filters(plan)
+        }))
+    }
+
     fn ast_analyzer(&self) -> Option<AstAnalyzer> {
         // Correct the malformed `ORDER BY` the DataFusion/federation
         // unparse pipeline emits when an aggregate's output alias
         // collides with the (bare) local table name. See
         // `rewrite_statement_for_snowflake` for the full mechanism.
         Some(Box::new(|stmt: ast::Statement| {
-            Ok(rewrite_statement_for_snowflake(stmt))
+            Ok(rewrite_statement_for_snowflake(
+                crate::derived_requalify::requalify_derived_refs(stmt),
+            ))
         }))
     }
 

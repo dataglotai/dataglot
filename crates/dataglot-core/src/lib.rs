@@ -23,6 +23,7 @@ pub mod catalog;
 pub mod credentials;
 pub mod error;
 pub mod federation_dedup_guard;
+pub mod federation_mark_join_guard;
 pub mod federation_pushdown;
 pub mod functions;
 pub mod governance;

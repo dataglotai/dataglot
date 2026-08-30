@@ -541,6 +541,80 @@ async fn distinct_subquery_join_currently_errors_at_source() {
     );
 }
 
+/// **Guard contract.** A subquery predicate inside an `OR`
+/// decorrelates to a MARK join; DataFusion 54.1's unparser DROPS it,
+/// emitting SQL that references a dangling correlated table. Both fixture
+/// tables live in the one DuckDB source, so federation collapses the mark
+/// join into a single pushed statement — where `FederatedMarkJoinGuard`
+/// (wired into `federated_optimizer_rules`, so active in `contract_context`)
+/// must FAIL planning rather than let the broken SQL reach the source.
+/// The in-crate rule tests pin the traversal; this pins the whole
+/// federation stack end-to-end.
+#[tokio::test]
+async fn or_in_subquery_mark_join_is_rejected_by_guard() {
+    let Some(driver) = driver_path() else { return };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_file = dir.path().join("contract.duckdb");
+    let db_file = db_file.to_str().expect("utf8 temp path");
+    seed_join_fixture(&driver, db_file);
+    let ctx = contract_context(&driver, db_file).await;
+
+    // `segment = 'pro' OR id IN (…)` cannot be a plain semi join, so it
+    // decorrelates to a mark join.
+    let sql = "SELECT name FROM customers \
+               WHERE segment = 'pro' \
+                  OR id IN (SELECT customer_id FROM orders WHERE amount >= 50)";
+
+    // Match on both call sites: the guard runs in the optimizer, which today
+    // fires at `collect`, but a future DataFusion could optimize during `sql`.
+    let err = match ctx.sql(sql).await {
+        Err(e) => e,
+        Ok(df) => df.collect().await.expect_err(
+            "a federated OR-ed IN subquery is a mark join the unparser drops; \
+             FederatedMarkJoinGuard must reject it rather than ship SQL with a \
+             dangling correlated reference",
+        ),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains(dataglot_core::federation_mark_join_guard::MARK_JOIN_UNPARSE_GUARD_ERROR),
+        "expected the mark-join guard rejection, got: {msg}"
+    );
+
+    // The rewrite the error recommends — two DISJOINT branches — must run on
+    // the SAME guarded context (no mark join) and return the correct THREE
+    // names: bob/carol (pro) and alice (id 1 has a >= 50 order); dave is
+    // neither pro nor has such an order. Proves the hint is executable and
+    // bag-equivalent (no dupe for carol, who satisfies both branches' source
+    // predicate but lands only in branch 1).
+    let rewritten = "SELECT name FROM customers WHERE segment = 'pro' \
+                     UNION ALL \
+                     SELECT name FROM customers \
+                       WHERE (segment = 'pro') IS NOT TRUE \
+                         AND id IN (SELECT customer_id FROM orders WHERE amount >= 50) \
+                     ORDER BY name";
+    let batches = ctx
+        .sql(rewritten)
+        .await
+        .expect("rewrite plans")
+        .collect()
+        .await
+        .expect("rewrite executes");
+    let rendered = pretty_format_batches(&batches).unwrap().to_string();
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(
+        rows, 3,
+        "disjoint rewrite returns exactly the 3 matches:\n{rendered}"
+    );
+    for name in ["alice", "bob", "carol"] {
+        assert!(rendered.contains(name), "{name} must appear:\n{rendered}");
+    }
+    assert!(
+        !rendered.contains("dave"),
+        "dave must not appear:\n{rendered}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Deep-coverage shapes ( second pass — "every level" sweep).
 // Each is written optimistically as a full-pushdown assertion first;
