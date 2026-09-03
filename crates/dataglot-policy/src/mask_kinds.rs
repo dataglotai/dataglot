@@ -89,7 +89,18 @@ enum Reveal {
 fn partial_mask(column: &str, n: usize, reveal: Reveal) -> Expr {
     let keep = i64::try_from(n).unwrap_or(i64::MAX);
     let s = as_text(column);
-    let full_len = character_length(s.clone());
+    // `character_length` returns Int32 for the Utf8 input `as_text`
+    // guarantees, while `keep` is an Int64 literal. Mask expressions are
+    // injected by an OptimizerRule, which runs AFTER the TypeCoercion
+    // analyzer — nothing coerces a mixed-type operation for us, and the
+    // uncoerced `Int32 > Int64` panics at execution when the masked
+    // table sits inside a federated join (dataglotai/dataglot#2). Cast
+    // the length up front so every use below (`>`, `-`, the `repeat`
+    // count) is Int64-vs-Int64 by construction.
+    let full_len = Expr::Cast(Cast::new(
+        Box::new(character_length(s.clone())),
+        DataType::Int64,
+    ));
     let longer = full_len.clone().gt(lit(keep));
     let masked_len = when(longer.clone(), full_len.clone() - lit(keep))
         .otherwise(full_len)
@@ -206,6 +217,40 @@ mod tests {
         let m = MaskKind::PartialShowLast(4);
         // "1234567" -> mask first 3 with X, show last 4
         assert_eq!(mask_one(&m, "1234567").await.as_deref(), Some("XXX4567"));
+    }
+
+    /// Regression for dataglotai/dataglot#2: mask expressions are injected
+    /// by an `OptimizerRule`, which runs AFTER the `TypeCoercion` analyzer, so
+    /// a mixed-type operation inside a mask is never coerced and panics at
+    /// execution (`Invalid comparison operation: Int32 > Int64`) when the
+    /// masked table sits inside a federated join. Pin that every binary
+    /// operation in the partial masks is type-identical by construction.
+    #[test]
+    fn partial_masks_are_type_correct_without_coercion() {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion::common::DFSchema;
+        use datafusion::logical_expr::{BinaryExpr, ExprSchemable};
+
+        let schema = Schema::new(vec![Field::new("email", DataType::Utf8, true)]);
+        let df_schema = DFSchema::try_from(schema).unwrap();
+        for kind in [MaskKind::PartialShowLast(4), MaskKind::PartialShowFirst(2)] {
+            let expr = kind.to_expr("email");
+            expr.apply(|e| {
+                if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = e {
+                    let lt = left.get_type(&df_schema).unwrap();
+                    let rt = right.get_type(&df_schema).unwrap();
+                    assert_eq!(
+                        lt, rt,
+                        "uncoerced `{op}` ({lt} vs {rt}) in {kind:?} — mask exprs \
+                         run after the TypeCoercion analyzer and must be \
+                         type-correct by construction"
+                    );
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+        }
     }
 
     #[tokio::test]
