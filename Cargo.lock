@@ -2641,7 +2641,7 @@ dependencies = [
 
 [[package]]
 name = "dataglot-ballista"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "arrow-flight",
  "assert_cmd",
@@ -2686,7 +2686,7 @@ dependencies = [
 
 [[package]]
 name = "dataglot-catalog"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -2709,7 +2709,7 @@ dependencies = [
 
 [[package]]
 name = "dataglot-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2728,7 +2728,7 @@ dependencies = [
 
 [[package]]
 name = "dataglot-federation"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -2772,7 +2772,7 @@ dependencies = [
 
 [[package]]
 name = "dataglot-pgwire"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2797,7 +2797,7 @@ dependencies = [
 
 [[package]]
 name = "dataglot-policy"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "arrow",
  "datafusion",
@@ -2809,7 +2809,7 @@ dependencies = [
 
 [[package]]
 name = "dataglot-server"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -2863,7 +2863,7 @@ dependencies = [
 
 [[package]]
 name = "dataglot-test-support"
-version = "0.5.0"
+version = "0.5.1"
 
 [[package]]
 name = "deadpool"
