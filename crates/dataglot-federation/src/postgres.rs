@@ -32,8 +32,8 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder, Float64Builder,
-    Int16Builder, Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
-    TimestampNanosecondBuilder, UInt64Builder,
+    Int16Builder, Int32Builder, Int64Builder, LargeStringBuilder, StringBuilder, StringViewBuilder,
+    TimestampMicrosecondBuilder, TimestampNanosecondBuilder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -901,6 +901,14 @@ fn decode_column(rows: &[Row], col_idx: usize, data_type: &DataType) -> DfResult
         }
         DataType::Boolean => decode_bool(rows, col_idx),
         DataType::Utf8 => decode_utf8(rows, col_idx),
+        // Utf8View / LargeUtf8 never come from a source *column* (text types
+        // map to Utf8, see `pg_udt_to_arrow`) — they arise from a pushed-down
+        // expression whose DataFusion return type is a view/large string,
+        // e.g. `substr`/`left`/`right`/`concat`/`repeat` (and therefore the
+        // show_last/show_first column masks built from them). Postgres
+        // returns plain text either way; only the Arrow container differs
+        DataType::Utf8View => decode_utf8_view(rows, col_idx),
+        DataType::LargeUtf8 => decode_large_utf8(rows, col_idx),
         DataType::Date32 => decode_date32(rows, col_idx),
         DataType::Timestamp(TimeUnit::Microsecond, None) => decode_timestamp_us(rows, col_idx),
         // Nanosecond timestamps never come from a source *column* (those map to
@@ -1116,6 +1124,30 @@ fn decode_utf8(rows: &[Row], col_idx: usize) -> DfResult<ArrayRef> {
     // Rust side. A single builder with a generous byte estimate avoids
     // repeated reallocation.
     let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+    for row in rows {
+        let v: Option<&str> = row.try_get(col_idx).map_err(pg_decode_err)?;
+        match v {
+            Some(x) => b.append_value(x),
+            None => b.append_null(),
+        }
+    }
+    Ok(Arc::new(b.finish()))
+}
+
+fn decode_utf8_view(rows: &[Row], col_idx: usize) -> DfResult<ArrayRef> {
+    let mut b = StringViewBuilder::with_capacity(rows.len());
+    for row in rows {
+        let v: Option<&str> = row.try_get(col_idx).map_err(pg_decode_err)?;
+        match v {
+            Some(x) => b.append_value(x),
+            None => b.append_null(),
+        }
+    }
+    Ok(Arc::new(b.finish()))
+}
+
+fn decode_large_utf8(rows: &[Row], col_idx: usize) -> DfResult<ArrayRef> {
+    let mut b = LargeStringBuilder::with_capacity(rows.len(), rows.len() * 16);
     for row in rows {
         let v: Option<&str> = row.try_get(col_idx).map_err(pg_decode_err)?;
         match v {

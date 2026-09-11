@@ -37,8 +37,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use arrow::array::{
-    ArrayRef, BooleanBuilder, Decimal128Builder, Float64Builder, Int64Builder, StringBuilder,
-    TimestampMicrosecondBuilder,
+    ArrayRef, BooleanBuilder, Decimal128Builder, Float64Builder, Int64Builder, LargeStringBuilder,
+    StringBuilder, StringViewBuilder, TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -894,6 +894,37 @@ fn pure_decode_column(rows: &[oracle_rs::Row], idx: usize, dt: &DataType) -> DfR
             }
             Ok(Arc::new(b.finish()))
         }
+        // Utf8View / LargeUtf8 never come from a source *column* — they arise
+        // from a pushed-down expression whose DataFusion return type is a
+        // view/large string (substr, left, right, concat, repeat, and the
+        // show_last/show_first column masks built from them). Same text,
+        // different Arrow container.
+        DataType::Utf8View => {
+            let mut b = StringViewBuilder::with_capacity(rows.len());
+            for row in rows {
+                match row.get(idx) {
+                    None | Some(Value::Null) => b.append_null(),
+                    Some(Value::String(s)) => b.append_value(s),
+                    Some(other) => {
+                        return Err(decode_err(idx, &format!("expected string, got {other:?}")))
+                    }
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::LargeUtf8 => {
+            let mut b = LargeStringBuilder::with_capacity(rows.len(), rows.len() * 16);
+            for row in rows {
+                match row.get(idx) {
+                    None | Some(Value::Null) => b.append_null(),
+                    Some(Value::String(s)) => b.append_value(s),
+                    Some(other) => {
+                        return Err(decode_err(idx, &format!("expected string, got {other:?}")))
+                    }
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
         DataType::Boolean => {
             let mut b = BooleanBuilder::with_capacity(rows.len());
             for row in rows {
@@ -1232,6 +1263,24 @@ fn decode_column(rows: &[oracle::Row], idx: usize, dt: &DataType) -> DfResult<Ar
         }
         DataType::Utf8 => {
             let mut b = StringBuilder::new();
+            for row in rows {
+                let v: Option<String> = row.get(idx).map_err(|e| col_err(idx, &e))?;
+                b.append_option(v);
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // Pushed-down string expressions may type their result Utf8View /
+        // LargeUtf8 (see the pure backend above) —.
+        DataType::Utf8View => {
+            let mut b = StringViewBuilder::with_capacity(rows.len());
+            for row in rows {
+                let v: Option<String> = row.get(idx).map_err(|e| col_err(idx, &e))?;
+                b.append_option(v);
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::LargeUtf8 => {
+            let mut b = LargeStringBuilder::with_capacity(rows.len(), rows.len() * 16);
             for row in rows {
                 let v: Option<String> = row.get(idx).map_err(|e| col_err(idx, &e))?;
                 b.append_option(v);

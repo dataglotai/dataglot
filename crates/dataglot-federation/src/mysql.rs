@@ -69,7 +69,8 @@ use std::sync::Arc;
 use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
     Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, LargeBinaryBuilder,
-    StringBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder, UInt64Builder,
+    LargeStringBuilder, StringBuilder, StringViewBuilder, Time64MicrosecondBuilder,
+    TimestampMicrosecondBuilder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -745,6 +746,14 @@ fn decode_column(
         DataType::Float32 => decode_float32(&col, col_idx),
         DataType::Float64 => decode_float64(&col, col_idx),
         DataType::Utf8 => decode_utf8(&col, col_idx),
+        // Utf8View / LargeUtf8 never come from a source *column* (text types
+        // map to Utf8 above) — they arise from a pushed-down expression whose
+        // DataFusion return type is a view/large string (substr, left, right,
+        // concat, repeat — and the show_last/show_first column masks built
+        // from them). MySQL returns the same bytes; only the Arrow container
+        // differs.
+        DataType::Utf8View => decode_utf8_view(&col, col_idx),
+        DataType::LargeUtf8 => decode_large_utf8(&col, col_idx),
         DataType::Date32 => decode_date32(&col, col_idx),
         DataType::Timestamp(TimeUnit::Microsecond, None) => decode_timestamp_us(&col, col_idx),
         DataType::Time64(TimeUnit::Microsecond) => decode_time64_us(&col, col_idx),
@@ -957,6 +966,38 @@ fn decode_utf8(col: &[Option<&Value>], col_idx: usize) -> DfResult<ArrayRef> {
                 b.append_value(s);
             }
             Some(other) => return Err(unexpected_value(col_idx, "Utf8", other)),
+        }
+    }
+    Ok(Arc::new(b.finish()))
+}
+
+/// [`decode_utf8`] for an Arrow `Utf8View` target.
+fn decode_utf8_view(col: &[Option<&Value>], col_idx: usize) -> DfResult<ArrayRef> {
+    let mut b = StringViewBuilder::with_capacity(col.len());
+    for v in col.iter().copied() {
+        match v {
+            None => b.append_null(),
+            Some(Value::Bytes(bytes)) => {
+                let s = std::str::from_utf8(bytes).map_err(decode_err)?;
+                b.append_value(s);
+            }
+            Some(other) => return Err(unexpected_value(col_idx, "Utf8View", other)),
+        }
+    }
+    Ok(Arc::new(b.finish()))
+}
+
+/// [`decode_utf8`] for an Arrow `LargeUtf8` target.
+fn decode_large_utf8(col: &[Option<&Value>], col_idx: usize) -> DfResult<ArrayRef> {
+    let mut b = LargeStringBuilder::with_capacity(col.len(), col.len() * 16);
+    for v in col.iter().copied() {
+        match v {
+            None => b.append_null(),
+            Some(Value::Bytes(bytes)) => {
+                let s = std::str::from_utf8(bytes).map_err(decode_err)?;
+                b.append_value(s);
+            }
+            Some(other) => return Err(unexpected_value(col_idx, "LargeUtf8", other)),
         }
     }
     Ok(Arc::new(b.finish()))
@@ -2038,6 +2079,33 @@ mod tests {
         let a64 = decode_float64(&[Some(&d), Some(&t)], 0).unwrap();
         let a64 = a64.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!((a64.value(0), a64.value(1)), (2.5, 3.5));
+    }
+
+    ///: a pushed-down expression (`substr`/`left`/`right`/`concat`/
+    /// `repeat`, hence the `show_last`/`show_first` masks) can type its
+    /// result `Utf8View` or `LargeUtf8` even though every MySQL text column
+    /// maps to `Utf8`. Both must decode from the same `Value::Bytes` —
+    /// previously the `decode_column` catch-all failed the whole query with
+    /// "not yet supported".
+    #[test]
+    fn decode_utf8_view_and_large_utf8_paths() {
+        use arrow::array::{LargeStringArray, StringViewArray};
+        let s = Value::Bytes(b"hi".to_vec());
+        let raw = Value::Bytes(vec![0xff, 0x00, 0x01]);
+
+        let arr = decode_utf8_view(&[Some(&s), None], 0).unwrap();
+        let a = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
+        assert_eq!(a.value(0), "hi");
+        assert!(a.is_null(1));
+        assert!(decode_utf8_view(&[Some(&raw)], 0).is_err());
+        assert!(decode_utf8_view(&[Some(&Value::Int(1))], 0).is_err());
+
+        let arr = decode_large_utf8(&[Some(&s), None], 0).unwrap();
+        let a = arr.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(a.value(0), "hi");
+        assert!(a.is_null(1));
+        assert!(decode_large_utf8(&[Some(&raw)], 0).is_err());
+        assert!(decode_large_utf8(&[Some(&Value::Int(1))], 0).is_err());
     }
 
     #[test]
