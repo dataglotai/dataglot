@@ -48,7 +48,8 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::sql::sqlparser::ast;
-use datafusion::sql::unparser::dialect::{Dialect, PostgreSqlDialect};
+use datafusion::sql::unparser::dialect::{Dialect, IntervalStyle, PostgreSqlDialect};
+use datafusion::sql::unparser::Unparser;
 use datafusion::sql::TableReference;
 use datafusion_federation::sql::{
     AstAnalyzer, LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider,
@@ -1302,7 +1303,7 @@ impl SQLExecutor for PostgresConnector {
         // PostgreSqlDialect emits double-quoted identifiers, `::type`
         // casts, and other postgres-flavoured syntax. This is what makes
         // pushed-down SQL actually executable on the remote.
-        Arc::new(PostgreSqlDialect {})
+        Arc::new(DataglotPostgresDialect::default())
     }
 
     fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
@@ -1449,6 +1450,156 @@ fn split_qualified(s: &str) -> Option<(String, String)> {
         return None;
     }
     Some((schema.to_string(), table.to_string()))
+}
+
+/// PostgreSQL unparser dialect for pushed-down SQL: DataFusion's own
+/// [`PostgreSqlDialect`] plus the overrides Dataglot needs.
+///
+/// **Integer function arguments.** DataFusion's string functions
+/// take their count arguments as `Int64` (`repeat`, `left`, `right`,
+/// `substr`, `lpad`, `rpad`), and a plan-time mask expression MUST carry
+/// `Int64` there: it is injected after type coercion and may execute
+/// locally. PostgreSQL declares those functions with `integer` parameters
+/// and does not implicitly cast `bigint` to `integer` for function
+/// resolution, so a computed count unparsed as bigint fails remotely —
+/// `function repeat(unknown, bigint) does not exist` — which broke every
+/// `show_last`/`show_first` column mask over a federated Postgres source.
+/// This dialect casts every non-literal argument in a count position to
+/// `INTEGER`; integer literals are already `integer` on the PostgreSQL side.
+pub struct DataglotPostgresDialect {
+    inner: PostgreSqlDialect,
+}
+
+impl Default for DataglotPostgresDialect {
+    fn default() -> Self {
+        Self {
+            inner: PostgreSqlDialect {},
+        }
+    }
+}
+
+impl std::fmt::Debug for DataglotPostgresDialect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DataglotPostgresDialect")
+    }
+}
+
+impl Dialect for DataglotPostgresDialect {
+    fn use_array_keyword_for_array_literals(&self) -> bool {
+        self.inner.use_array_keyword_for_array_literals()
+    }
+
+    fn supports_qualify(&self) -> bool {
+        self.inner.supports_qualify()
+    }
+
+    fn requires_derived_table_alias(&self) -> bool {
+        self.inner.requires_derived_table_alias()
+    }
+
+    fn supports_empty_select_list(&self) -> bool {
+        self.inner.supports_empty_select_list()
+    }
+
+    fn identifier_quote_style(&self, ident: &str) -> Option<char> {
+        self.inner.identifier_quote_style(ident)
+    }
+
+    fn interval_style(&self) -> IntervalStyle {
+        self.inner.interval_style()
+    }
+
+    fn float64_ast_dtype(&self) -> ast::DataType {
+        self.inner.float64_ast_dtype()
+    }
+
+    fn int8_cast_dtype(&self) -> ast::DataType {
+        self.inner.int8_cast_dtype()
+    }
+
+    fn scalar_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[datafusion::logical_expr::Expr],
+    ) -> DfResult<Option<ast::Expr>> {
+        let count_positions: &[usize] = match func_name {
+            "chr" => &[0],
+            "repeat" | "left" | "right" | "lpad" | "rpad" => &[1],
+            "substr" | "substring" => &[1, 2],
+            "split_part" => &[2],
+            "overlay" => &[2, 3],
+            _ => {
+                return self
+                    .inner
+                    .scalar_function_to_sql_overrides(unparser, func_name, args)
+            }
+        };
+        // `Unparser::function_args_to_sql` is private upstream; unparse each
+        // argument and wrap it ourselves.
+        let mut sql_exprs = args
+            .iter()
+            .map(|a| unparser.expr_to_sql(a))
+            .collect::<DfResult<Vec<ast::Expr>>>()?;
+        let mut changed = false;
+        for &i in count_positions {
+            let Some(slot) = sql_exprs.get_mut(i) else {
+                continue;
+            };
+            if matches!(
+                slot,
+                ast::Expr::Value(_)
+                    | ast::Expr::Cast {
+                        data_type: ast::DataType::Integer(_) | ast::DataType::Int(_),
+                        ..
+                    }
+            ) {
+                continue;
+            }
+            let current = std::mem::replace(slot, ast::Expr::Value(ast::Value::Null.into()));
+            *slot = cast_to_integer(current);
+            changed = true;
+        }
+        let sql_args: Vec<ast::FunctionArg> = sql_exprs
+            .into_iter()
+            .map(|e| ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)))
+            .collect();
+        if !changed {
+            // Nothing to cast: keep whatever the upstream dialect does here.
+            return self
+                .inner
+                .scalar_function_to_sql_overrides(unparser, func_name, args);
+        }
+        Ok(Some(ast::Expr::Function(ast::Function {
+            name: ast::ObjectName::from(vec![ast::Ident::new(func_name)]),
+            args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                duplicate_treatment: None,
+                args: sql_args,
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+            parameters: ast::FunctionArguments::None,
+            uses_odbc_syntax: false,
+        })))
+    }
+}
+
+/// `CAST(e AS INTEGER)` — folding into an existing cast instead of nesting.
+fn cast_to_integer(e: ast::Expr) -> ast::Expr {
+    // Always NEST, never fold an existing cast: `CAST(CAST(x AS NUMERIC) AS
+    // INTEGER)` keeps the inner cast's parsing semantics (a decimal string
+    // cast straight to INTEGER is an error on Postgres). An argument that
+    // is already an INTEGER cast never reaches here (skipped by the caller).
+    ast::Expr::Cast {
+        kind: ast::CastKind::Cast,
+        expr: Box::new(e),
+        data_type: ast::DataType::Integer(None),
+        array: false,
+        format: None,
+    }
 }
 
 #[cfg(test)]
@@ -2271,5 +2422,85 @@ mod tests {
         );
         // Decimal::MAX (~7.9e28) is far beyond i64::MAX -> fail-loud.
         assert!(numeric_to_i64(Decimal::MAX, 0).is_err());
+    }
+
+    ///: a computed count argument reaches PostgreSQL as bigint
+    /// (DataFusion's string functions take Int64 counts, and a mask must keep
+    /// them Int64 to execute locally), but PostgreSQL only declares
+    /// `repeat(text, integer)` & co. The dialect casts computed counts to
+    /// INTEGER, leaves integer literals alone, and delegates everything else
+    /// to DataFusion's `PostgreSqlDialect`.
+    #[test]
+    fn dialect_casts_computed_string_counts_to_integer() {
+        use datafusion::functions::expr_fn::{
+            character_length, chr, overlay, repeat, right, split_part, upper,
+        };
+        use datafusion::logical_expr::{cast, col, lit};
+
+        let dialect = DataglotPostgresDialect::default();
+        let unparser = Unparser::new(&dialect);
+
+        // The show_last mask's count: CAST(character_length(x) AS BIGINT) - 4.
+        let count = cast(character_length(col("email")), DataType::Int64) - lit(4_i64);
+        let sql = unparser
+            .expr_to_sql(&repeat(lit("X"), count))
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            sql,
+            r#"repeat('X', CAST((CAST(character_length("email") AS BIGINT) - 4) AS INTEGER))"#
+        );
+
+        // A literal count is already `integer` on the Postgres side.
+        let sql = unparser
+            .expr_to_sql(&right(col("email"), lit(4_i64)))
+            .unwrap()
+            .to_string();
+        assert_eq!(sql, r#"right("email", 4)"#);
+
+        // Unrelated functions and identifier quoting are untouched.
+        let sql = unparser
+            .expr_to_sql(&upper(col("email")))
+            .unwrap()
+            .to_string();
+        assert_eq!(sql, r#"upper("email")"#);
+
+        // split_part's field index (position 2) is `integer` on Postgres too.
+        let idx = cast(character_length(col("email")), DataType::Int64);
+        let sql = unparser
+            .expr_to_sql(&split_part(col("email"), lit("@"), idx))
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            sql,
+            r#"split_part("email", '@', CAST(CAST(character_length("email") AS BIGINT) AS INTEGER))"#
+        );
+
+        // overlay(string PLACING replacement FROM start [FOR len]) — positions
+        // 2 and 3 are integer on Postgres too. A literal 2 is left alone; the
+        // computed length is cast (nested, never folded).
+        let len = cast(character_length(col("email")), DataType::Int64);
+        let sql = unparser
+            .expr_to_sql(&overlay(vec![col("email"), lit("xx"), lit(2_i64), len]))
+            .unwrap()
+            .to_string();
+        assert!(
+            sql.contains(r#"CAST(CAST(character_length("email") AS BIGINT) AS INTEGER)"#)
+                && sql.contains(", 2,"),
+            "{sql}"
+        );
+
+        // chr(bigint) does not exist on Postgres either (argument 0).
+        let code = cast(col("n"), DataType::Int64) + lit(64_i64);
+        let sql = unparser.expr_to_sql(&chr(code)).unwrap().to_string();
+        assert_eq!(sql, r#"chr(CAST((CAST("n" AS BIGINT) + 64) AS INTEGER))"#);
+
+        // An argument already cast to INTEGER is not wrapped again.
+        let already = cast(col("n"), DataType::Int32);
+        let sql = unparser
+            .expr_to_sql(&repeat(lit("X"), already))
+            .unwrap()
+            .to_string();
+        assert_eq!(sql, r#"repeat('X', CAST("n" AS INTEGER))"#);
     }
 }
