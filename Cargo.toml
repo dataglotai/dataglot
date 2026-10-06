@@ -294,6 +294,18 @@ all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 cast_possible_truncation = "allow"
 module_name_repetitions = "allow"
+# Stabilised in Rust 1.99 and fires across the workspace, all of them test
+# assertions of the form `assert!(x.is_empty())`.
+#
+# The lint's point is diagnostics: `assert_eq!` prints the value on failure
+# where `assert!` prints only "assertion failed". That is a real benefit, but
+# the rewrite it suggests is not — `assert_eq!(r.rows, [] as [Vec<String>; 0])`
+# names the element type at every site and reads worse than what it replaces.
+#
+# Allowed rather than rewritten. Where the contents genuinely matter on
+# failure, prefer `assert!(x.is_empty(), "expected empty, got {x:?}")`: same
+# diagnostic, without the turbofished empty-array literal.
+assert_is_empty = "allow"
 
 # Tier 1 — async-safety + ship-readiness lints. These encode three of the
 # workspace's hard-rule commitments as enforceable lints:
