@@ -116,9 +116,22 @@ cargo test -p dataglot-server --lib --features flight_sql
 cargo test -p dataglot-server --lib --features ballista,adbc
 ```
 
-Check `[features]` in the crate's `Cargo.toml` for the name — a feature that
-does not exist fails with `does not contain this feature`, not with a test
-failure, so it is easy to read as "nothing to run here".
+**`--features all` and `--all-features` are not the same thing**, and the
+difference decides whether a suite runs. `all` is a feature the crate
+declares, listing a subset — `postgres`, `mysql`, `iceberg`, `odata`, `rest`
+— so anything left out of that list is skipped. Cargo's `--all-features`
+enables every *declared* feature, so it does include the ones `all` omits.
+
+A feature omitted from `all` therefore has to be named explicitly, or the
+shortcut quietly leaves its suite unrun. Compare the crate's `[features]`
+table against the `all` list to find them.
+
+`[features]` in the crate's `Cargo.toml` is the authority on what exists, and
+the feature matrix in `.github/workflows/integration.yml` on what CI covers.
+If a name is not in yours, check the spelling there first — the other likely
+cause is that the feature postdates your checkout. Either way the failure is
+`does not contain this feature`, not a test failure, which is easy to read as
+"nothing to run here".
 
 Watch for pairs whose names differ only in punctuation and which mean
 opposite things. `flight_sql` on the server *serves* Flight SQL to clients;
