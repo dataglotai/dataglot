@@ -1882,6 +1882,52 @@ impl DataglotServer {
         }
     }
 
+    /// Resolve the policy [`Identity`](dataglot_policy::Identity) an embedded
+    /// (in-process) session runs under — `dataglot query` / `dataglot shell`.
+    ///
+    /// Mirrors what the pg-wire `StartupObserver` publishes for a trust-mode
+    /// connection with the same username: the config identity with its roles
+    /// folded in ([`resolve_identity_with_roles`]), then the F4 org
+    /// resolution — an org-less identity takes the boot org, so runtime
+    /// `CREATE MASK` / `CREATE ROW FILTER` rules (persisted under that org)
+    /// match it. Store roles / superuser and directory groups are *not*
+    /// applied: pg-wire resolves those during an authentication handshake the
+    /// embedded path never performs, so they fail closed, exactly as for a
+    /// trust session that carries no auth principal.
+    ///
+    /// The caller must run planning and execution inside
+    /// [`dataglot_policy::with_session_identity`] with the returned identity —
+    /// without that scope the policy rule falls back to an anonymous,
+    /// org-less identity and org-scoped rules never fire.
+    ///
+    /// # Errors
+    /// When a control plane is configured and the identity belongs to an org
+    /// other than the boot org. The embedded session carries the boot org's
+    /// catalogs (pg-wire re-registers them per org after startup); running a
+    /// foreign-org identity against them would pair one org's data with
+    /// another org's policies, so this refuses instead.
+    pub(crate) fn embedded_session_identity(
+        &self,
+        user: &str,
+    ) -> Result<dataglot_policy::Identity> {
+        let identity =
+            resolve_identity_with_roles(user, &self.config.identities, &self.config.roles);
+        let resolved_org = resolved_session_org(identity.org.as_deref(), None, &self.boot_org);
+        if self.live_catalogs.is_some() && resolved_org != self.boot_org {
+            anyhow::bail!(
+                "user {user:?} belongs to org {resolved_org:?}, but an embedded session only \
+                 serves the boot org {:?}; connect to a running server (e.g. with psql) to \
+                 query as this user",
+                self.boot_org
+            );
+        }
+        Ok(if identity.org.is_none() {
+            identity.with_org(resolved_org)
+        } else {
+            identity
+        })
+    }
+
     /// Authenticate a Flight SQL request from its `authorization` metadata and
     /// resolve the identity its query runs under — the SAME identity→policy seam
     /// pg-wire uses (`resolve_identity_with_roles`; the caller wraps execution in

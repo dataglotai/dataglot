@@ -180,7 +180,9 @@ pub struct ShellArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 
-    /// Identity to run as — sets what `current_user` / `session_user` return.
+    /// Identity to run as. Governance (masks, row filters, grants, column
+    /// whitelists) applies as for a trust-mode pg-wire connection with this
+    /// username; also sets what `current_user` / `session_user` return.
     #[arg(long, default_value = "dataglot")]
     pub user: String,
 }
@@ -220,10 +222,9 @@ pub struct QueryArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 
-    /// Identity to run as — sets what `current_user` / `session_user` return.
-    /// Governance (masking / row filters) is static today, so this is currently
-    /// only reflected by those functions; it becomes policy-relevant when
-    /// identity-aware rules land.
+    /// Identity to run as. Governance (masks, row filters, grants, column
+    /// whitelists) applies as for a trust-mode pg-wire connection with this
+    /// username; also sets what `current_user` / `session_user` return.
     #[arg(long, default_value = "dataglot")]
     pub user: String,
 }
