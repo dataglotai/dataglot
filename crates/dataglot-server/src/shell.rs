@@ -1,10 +1,10 @@
 //! `dataglot shell` — an interactive SQL REPL over the embedded engine.
 //!
 //! Builds the same in-process session as `dataglot query` (federation +
-//! plan-time governance, no pg-wire listener) once, then reads one statement
-//! per line from stdin and prints results until EOF or `\q`. Results go to
-//! stdout; the banner, prompt, and errors go to stderr, so a piped session's
-//! stdout stays result-only.
+//! plan-time governance under `--user`'s identity, no pg-wire listener) once,
+//! then reads one statement per line from stdin and prints results until EOF
+//! or `\q`. Results go to stdout; the banner, prompt, and errors go to
+//! stderr, so a piped session's stdout stays result-only.
 //!
 //! Dependency-free by design (no readline crate): line editing and history are
 //! a shell / `rlwrap` concern, and pulling in `rustyline` would add a
@@ -26,7 +26,7 @@ use crate::cli::{Args, ShellArgs};
 // does — so the drop-tightening lint doesn't apply here.
 #[allow(clippy::significant_drop_tightening)]
 pub async fn run(args: &Args, s: &ShellArgs) -> Result<()> {
-    let (_server, ctx) = crate::query::build_session(args, &s.user).await?;
+    let session = crate::query::build_session(args, &s.user).await?;
 
     let mut stderr = std::io::stderr();
     let _ = writeln!(
@@ -53,7 +53,7 @@ pub async fn run(args: &Args, s: &ShellArgs) -> Result<()> {
             break;
         }
         // Keep the REPL alive on a query error — print it and prompt again.
-        if let Err(e) = crate::query::execute_and_print(&ctx, sql, s.format).await {
+        if let Err(e) = session.execute_and_print(sql, s.format).await {
             let _ = writeln!(stderr, "error: {e:#}");
         }
     }
