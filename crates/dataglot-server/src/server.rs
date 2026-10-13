@@ -1885,15 +1885,14 @@ impl DataglotServer {
     /// Resolve the policy [`Identity`](dataglot_policy::Identity) an embedded
     /// (in-process) session runs under — `dataglot query` / `dataglot shell`.
     ///
-    /// Mirrors what the pg-wire `StartupObserver` publishes for a trust-mode
-    /// connection with the same username: the config identity with its roles
-    /// folded in ([`resolve_identity_with_roles`]), then the F4 org
-    /// resolution — an org-less identity takes the boot org, so runtime
-    /// `CREATE MASK` / `CREATE ROW FILTER` rules (persisted under that org)
-    /// match it. Store roles / superuser and directory groups are *not*
-    /// applied: pg-wire resolves those during an authentication handshake the
-    /// embedded path never performs, so they fail closed, exactly as for a
-    /// trust session that carries no auth principal.
+    /// Follows the pg-wire `StartupObserver`: the config identity with its
+    /// roles folded in ([`resolve_identity_with_roles`]), then the org — the
+    /// config identity's own, else the org that owns the username in the meta
+    /// store (the lookup the md5 login does), else the boot org (F4), so
+    /// runtime `CREATE MASK` / `CREATE ROW FILTER` rules persisted under that
+    /// org match it. Store roles / superuser and directory groups are *not*
+    /// applied: pg-wire only learns those from an authentication handshake the
+    /// embedded path never performs, so they fail closed.
     ///
     /// The caller must run planning and execution inside
     /// [`dataglot_policy::with_session_identity`] with the returned identity —
@@ -1901,18 +1900,29 @@ impl DataglotServer {
     /// org-less identity and org-scoped rules never fire.
     ///
     /// # Errors
-    /// When a control plane is configured and the identity belongs to an org
-    /// other than the boot org. The embedded session carries the boot org's
+    /// When a control plane is configured and the user belongs to an org other
+    /// than the boot org, or the meta store lookup fails. The embedded session carries the boot org's
     /// catalogs (pg-wire re-registers them per org after startup); running a
     /// foreign-org identity against them would pair one org's data with
     /// another org's policies, so this refuses instead.
-    pub(crate) fn embedded_session_identity(
+    pub(crate) async fn embedded_session_identity(
         &self,
         user: &str,
     ) -> Result<dataglot_policy::Identity> {
         let identity =
             resolve_identity_with_roles(user, &self.config.identities, &self.config.roles);
-        let resolved_org = resolved_session_org(identity.org.as_deref(), None, &self.boot_org);
+        // Users created with `CREATE USER` aren't in the config file, so their
+        // org has to come from the meta store. A config identity's own org
+        // still wins, as on pg-wire.
+        let store_org = match &self.control_plane_store {
+            Some(store) if identity.org.is_none() && !user.is_empty() => store
+                .find_user(user)
+                .await
+                .context("looking up the user in the meta store")?
+                .map(|(org, _, _)| org),
+            _ => None,
+        };
+        let resolved_org = resolved_session_org(identity.org.as_deref(), store_org, &self.boot_org);
         if self.live_catalogs.is_some() && resolved_org != self.boot_org {
             anyhow::bail!(
                 "user {user:?} belongs to org {resolved_org:?}, but an embedded session only \

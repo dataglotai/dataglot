@@ -181,8 +181,8 @@ pub struct ShellArgs {
     pub format: OutputFormat,
 
     /// Identity to run as. Governance (masks, row filters, grants, column
-    /// whitelists) applies as for a trust-mode pg-wire connection with this
-    /// username; also sets what `current_user` / `session_user` return.
+    /// whitelists) applies as for a pg-wire connection with this username;
+    /// also sets what `current_user` / `session_user` return.
     #[arg(long, default_value = "dataglot")]
     pub user: String,
 }
@@ -223,8 +223,8 @@ pub struct QueryArgs {
     pub format: OutputFormat,
 
     /// Identity to run as. Governance (masks, row filters, grants, column
-    /// whitelists) applies as for a trust-mode pg-wire connection with this
-    /// username; also sets what `current_user` / `session_user` return.
+    /// whitelists) applies as for a pg-wire connection with this username;
+    /// also sets what `current_user` / `session_user` return.
     #[arg(long, default_value = "dataglot")]
     pub user: String,
 }

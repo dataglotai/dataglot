@@ -8,8 +8,8 @@
 //! query without `psql` or a running server.
 //!
 //! Governance note: the embedded session applies the same plan-time policy
-//! rules as the server, under the identity a trust-mode pg-wire connection
-//! with the same username would get (`DataglotServer::embedded_session_identity`).
+//! rules as the server, under the identity a pg-wire connection with the same
+//! username gets (`DataglotServer::embedded_session_identity`).
 //! `--user` therefore selects whose masks, row filters, grants and column
 //! whitelists apply — including org-scoped rules created at runtime with
 //! `CREATE MASK` / `CREATE ROW FILTER` — as well as what `current_user` /
@@ -98,8 +98,8 @@ impl EmbeddedSession {
 /// builds (federation + plan-time governance + `pg_catalog` overlay), minus
 /// the pg-wire listener, running under `user`'s policy identity.
 ///
-/// `user` resolves to the identity a trust-mode pg-wire connection with that
-/// username would get ([`DataglotServer::embedded_session_identity`]), and
+/// `user` resolves to the identity a pg-wire connection with that username
+/// gets ([`DataglotServer::embedded_session_identity`]), and
 /// also sets what `current_user` / `session_user` return (the pg-wire path
 /// registers those per connection via the `StartupObserver`; the embedded
 /// path does it here).
@@ -121,7 +121,7 @@ pub(crate) async fn build_session(args: &Args, user: &str) -> Result<EmbeddedSes
     let server = DataglotServer::new(config)
         .await
         .context("initializing the engine (catalogs / federation)")?;
-    let identity = server.embedded_session_identity(user)?;
+    let identity = server.embedded_session_identity(user).await?;
     let ctx = server.create_session();
     // Make both `session_user` and `current_user` reflect `--user`. Over pgwire
     // datafusion-pg-catalog rewrites `current_user` → `session_user`; that
@@ -436,6 +436,104 @@ mod tests {
         assert!(
             msg.contains("boot org"),
             "error must explain why; got: {msg}"
+        );
+    }
+
+    /// A runtime `CREATE USER` in another org has no config entry, so its org
+    /// has to come from the meta store. Without that lookup it silently fell
+    /// back to the boot org (found in review).
+    #[tokio::test]
+    async fn store_user_in_foreign_org_is_refused_with_control_plane() {
+        use std::sync::Arc;
+
+        use dataglot_catalog::{MetaStore, RedbMetaStore};
+        use dataglot_pgwire::policy_ddl::{PolicyDdl, PolicyMask};
+        use dataglot_pgwire::user_admin::UserAdmin;
+        use dataglot_pgwire::user_ddl::UserDdl;
+
+        let (dir, args) = fixture_with_policy(
+            PolicyDdl::CreateMask {
+                name: "email_mask".to_string(),
+                table: "files.public.users".to_string(),
+                column: "email".to_string(),
+                mask: PolicyMask::Literal("***@example.com".to_string()),
+                if_not_exists: false,
+            },
+            "",
+        )
+        .await;
+        {
+            let store: Arc<dyn MetaStore> = Arc::new(
+                RedbMetaStore::open(&dir.path().join("meta.redb"), "default")
+                    .await
+                    .unwrap(),
+            );
+            crate::user_admin::StoreUserAdmin::new(store, None)
+                .apply(
+                    "acme",
+                    UserDdl::CreateUser {
+                        name: "analyst".to_string(),
+                        password: None,
+                        superuser: false,
+                        if_not_exists: false,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        match build_session(&args, "analyst").await {
+            Err(e) => assert!(format!("{e:#}").contains("boot org")),
+            Ok(s) => panic!("not refused; resolved to org {:?}", s.identity.org),
+        }
+    }
+
+    /// The other side of the lookup: a runtime user in the boot org runs, gets
+    /// that org, and sees the org's runtime mask.
+    #[tokio::test]
+    async fn store_user_in_boot_org_runs_under_that_org() {
+        use std::sync::Arc;
+
+        use dataglot_catalog::{MetaStore, RedbMetaStore};
+        use dataglot_pgwire::policy_ddl::{PolicyDdl, PolicyMask};
+        use dataglot_pgwire::user_admin::UserAdmin;
+        use dataglot_pgwire::user_ddl::UserDdl;
+
+        let (dir, args) = fixture_with_policy(
+            PolicyDdl::CreateMask {
+                name: "email_mask".to_string(),
+                table: "files.public.users".to_string(),
+                column: "email".to_string(),
+                mask: PolicyMask::Literal("***@example.com".to_string()),
+                if_not_exists: false,
+            },
+            "",
+        )
+        .await;
+        {
+            let store: Arc<dyn MetaStore> = Arc::new(
+                RedbMetaStore::open(&dir.path().join("meta.redb"), "default")
+                    .await
+                    .unwrap(),
+            );
+            crate::user_admin::StoreUserAdmin::new(store, None)
+                .apply(
+                    "default",
+                    UserDdl::CreateUser {
+                        name: "dana".to_string(),
+                        password: None,
+                        superuser: false,
+                        if_not_exists: false,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let session = build_session(&args, "dana").await.expect("build session");
+        assert_eq!(session.identity.org.as_deref(), Some("default"));
+        let out = users_table(&session).await;
+        assert!(
+            out.contains("***@example.com"),
+            "mask must apply; got:\n{out}"
         );
     }
 }
