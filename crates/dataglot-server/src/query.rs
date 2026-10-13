@@ -483,7 +483,7 @@ mod tests {
         }
         match build_session(&args, "analyst").await {
             Err(e) => assert!(format!("{e:#}").contains("boot org")),
-            Ok(s) => panic!("not refused; resolved to org {:?}", s.identity.org),
+            Ok(_s) => panic!("not refused; resolved to unexpected org"),
         }
     }
 
