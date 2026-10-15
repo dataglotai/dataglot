@@ -15,6 +15,7 @@
 //! `CREATE MASK` / `CREATE ROW FILTER` — as well as what `current_user` /
 //! `session_user` return.
 
+use std::borrow::Cow;
 use std::io::{Read, Write};
 
 use anyhow::{Context, Result};
@@ -58,22 +59,48 @@ pub(crate) struct EmbeddedSession {
 }
 
 impl EmbeddedSession {
-    /// Plan and execute one statement under this session's identity.
-    ///
-    /// Both steps run inside [`dataglot_policy::with_session_identity`]:
-    /// `DataFrame::collect` is where DataFusion runs the optimizer (and with
-    /// it the policy rule), so scoping only `ctx.sql()` would not be enough.
-    /// Without the scope the policy rule sees an anonymous, org-less identity
-    /// and org-scoped runtime masks / row filters silently never fire.
+    /// Run one statement and return its batches (empty for a no-op). Only the
+    /// tests need the batches back; the CLI uses [`Self::execute_and_print`].
+    #[cfg(test)]
+    pub(crate) async fn execute(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        Ok(self.run(sql).await?.unwrap_or_default())
+    }
+
+    /// Run one statement and print the result. A no-op statement prints
+    /// nothing.
     ///
     /// # Errors
-    /// If the query fails to plan or execute.
-    pub(crate) async fn execute(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+    /// If the statement is one the embedded session can't run, fails to plan
+    /// or execute, or the result can't be formatted.
+    pub(crate) async fn execute_and_print(&self, sql: &str, format: OutputFormat) -> Result<()> {
+        match self.run(sql).await? {
+            Some(batches) => print_batches(&batches, format),
+            None => Ok(()),
+        }
+    }
+
+    /// Plan and execute one statement under this session's identity; `None`
+    /// for a statement that was accepted but had nothing to run.
+    ///
+    /// Statements the pg-wire handler deals with before DataFusion sees them
+    /// are handled the same way here first (see [`prepare`]).
+    ///
+    /// Planning and collecting both run inside
+    /// [`dataglot_policy::with_session_identity`]: `DataFrame::collect` is
+    /// where DataFusion runs the optimizer (and with it the policy rule), so
+    /// scoping only `ctx.sql()` would not be enough. Without the scope the
+    /// policy rule sees an anonymous, org-less identity and org-scoped runtime
+    /// masks / row filters silently never fire.
+    async fn run(&self, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
+        let sql = match prepare(sql)? {
+            Prepared::Skip => return Ok(None),
+            Prepared::Run(sql) => sql,
+        };
         Box::pin(dataglot_policy::with_session_identity(
             self.identity.clone(),
             async {
                 self.ctx
-                    .sql(sql)
+                    .sql(&sql)
                     .await
                     .context("planning the query")?
                     .collect()
@@ -82,15 +109,75 @@ impl EmbeddedSession {
             },
         ))
         .await
+        .map(Some)
     }
+}
 
-    /// [`Self::execute`] one statement and print the result.
-    ///
-    /// # Errors
-    /// If the query fails to plan or execute, or the result can't be formatted.
-    pub(crate) async fn execute_and_print(&self, sql: &str, format: OutputFormat) -> Result<()> {
-        let batches = self.execute(sql).await?;
-        print_batches(&batches, format)
+enum Prepared<'a> {
+    /// Accepted, nothing to run (pooler / session-control no-ops).
+    Skip,
+    /// Run this SQL, possibly rewritten.
+    Run(Cow<'a, str>),
+}
+
+/// Apply what the pg-wire handler (`dataglot_pgwire::handler::do_query`) does
+/// before handing a statement to DataFusion, so the CLI doesn't fail on
+/// statements psql accepts:
+///
+/// - control-plane DDL and `COPY … TO STDOUT` are refused with a message
+///   saying where to run them instead
+/// - pooler no-ops (`DISCARD`, `RESET`, `SAVEPOINT`, …) are accepted
+/// - `EXPLAIN FEDERATION`, `SHOW SCHEMAS`, `SHOW <variable>` and `TABLE x`
+///   get the same SQL rewrite as on pg-wire
+fn prepare(sql: &str) -> Result<Prepared<'_>> {
+    use dataglot_pgwire::{copy, explain, pg_compat, show_schemas, show_variable};
+
+    if let Some(kind) = control_plane_kind(sql) {
+        anyhow::bail!(
+            "{kind} statements change the server's control plane and aren't available in \
+             `dataglot query` / `dataglot shell`; run this over psql against a running server"
+        );
+    }
+    if copy::detect_copy_to_stdout(sql).is_some() {
+        anyhow::bail!(
+            "`COPY ... TO STDOUT` isn't supported here; run the query itself and use \
+             `--format csv` for CSV output"
+        );
+    }
+    if pg_compat::noop_command_tag(sql).is_some() {
+        return Ok(Prepared::Skip);
+    }
+    // Same chain as the handler's `apply_preparse_rewrites`, minus the identity
+    // register rewrite (private to pgwire; `current_user` / `session_user` are
+    // registered as UDFs in `build_session` instead).
+    let rewritten = explain::rewrite_explain_federation(sql)
+        .or_else(|| show_schemas::rewrite_show_schemas(sql))
+        .or_else(|| show_variable::rewrite_show_variable(sql))
+        .or_else(|| pg_compat::rewrite_table(sql));
+    Ok(Prepared::Run(
+        rewritten.map_or(Cow::Borrowed(sql), Cow::Owned),
+    ))
+}
+
+/// Which family of control-plane DDL `sql` is, using pgwire's own parsers so
+/// the CLI recognises exactly what the server intercepts.
+fn control_plane_kind(sql: &str) -> Option<&'static str> {
+    use dataglot_pgwire::{catalog_ddl, grant_ddl, policy_ddl, secret_ddl, user_ddl, view_ddl};
+
+    if catalog_ddl::parse_catalog_ddl(sql).is_some() {
+        Some("Catalog")
+    } else if secret_ddl::parse_secret_ddl(sql).is_some() {
+        Some("Secret")
+    } else if user_ddl::parse_user_ddl(sql).is_some() {
+        Some("User / role")
+    } else if policy_ddl::parse_policy_ddl(sql).is_some() {
+        Some("Mask / row filter")
+    } else if grant_ddl::parse_grant_ddl(sql).is_some() {
+        Some("GRANT / REVOKE")
+    } else if view_ddl::parse_view_ddl(sql).is_some() {
+        Some("View")
+    } else {
+        None
     }
 }
 
@@ -535,5 +622,90 @@ mod tests {
             out.contains("***@example.com"),
             "mask must apply; got:\n{out}"
         );
+    }
+
+    async fn default_session() -> EmbeddedSession {
+        let args = Args::try_parse_from(["dataglot"]).expect("parse default args");
+        build_session(&args, "dataglot")
+            .await
+            .expect("build session")
+    }
+
+    fn render(batches: &[RecordBatch]) -> String {
+        datafusion::arrow::util::pretty::pretty_format_batches(batches)
+            .expect("format")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn control_plane_statements_are_refused_clearly() {
+        let session = default_session().await;
+        for sql in [
+            "CREATE CATALOG c WITH (kind = 'postgres', dsn = 'host=x')",
+            "DROP SECRET s",
+            "CREATE USER u",
+            "CREATE MASK m ON t (c) AS 'x'",
+            "CREATE ROW FILTER f ON t USING (id = 1)",
+            "GRANT SELECT ON c.s.t TO u",
+            "CREATE VIEW v AS SELECT 1",
+        ] {
+            let Err(e) = session.execute(sql).await else {
+                panic!("{sql:?} should be refused");
+            };
+            let msg = format!("{e:#}");
+            assert!(
+                msg.contains("control plane") && msg.contains("psql"),
+                "{sql:?}: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_to_stdout_points_at_format_csv() {
+        let session = default_session().await;
+        let Err(e) = session.execute("COPY (SELECT 1) TO STDOUT").await else {
+            panic!("COPY should be refused");
+        };
+        assert!(format!("{e:#}").contains("--format csv"), "{e:#}");
+    }
+
+    #[tokio::test]
+    async fn explain_federation_returns_a_plan() {
+        let session = default_session().await;
+        let out = render(
+            &session
+                .execute("EXPLAIN FEDERATION SELECT 1")
+                .await
+                .expect("explain"),
+        );
+        assert!(out.contains("plan_type"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn pgwire_rewrites_apply() {
+        let session = default_session().await;
+        for sql in [
+            "SHOW SCHEMAS",
+            "SHOW server_version",
+            "TABLE information_schema.tables",
+        ] {
+            let batches = session
+                .execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql:?}: {e:#}"));
+            assert!(!render(&batches).trim().is_empty(), "{sql:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pooler_noops_are_accepted_quietly() {
+        let session = default_session().await;
+        for sql in ["DISCARD ALL", "RESET ALL"] {
+            let batches = session
+                .execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql:?}: {e:#}"));
+            assert!(batches.is_empty(), "{sql:?}");
+        }
     }
 }
