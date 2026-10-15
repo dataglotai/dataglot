@@ -211,6 +211,8 @@ thiserror.workspace = true
 # metric set with no need for the `metrics` facade across crates yet, and
 # `prometheus` ships its own text encoder so we avoid a second runtime.
 prometheus = "0.14"
+# Client mode for `dataglot query`
+tokio-postgres.workspace = true
 # HTTP client for the OpenLineage HTTP emitter
 # (`dataglot-server::lineage::OpenLineageHttpEmitter`). Pulled
 # in as a runtime dep here rather than core because core
@@ -253,10 +255,6 @@ tempfile.workspace = true
 # orchestration against a real WarehouseConnector. Dev-only — the production
 # server reaches iceberg solely through dataglot-federation (rule 7).
 iceberg.workspace = true
-# tokio-postgres lets the e2e test in `tests/pgwire_metrics_e2e.rs`
-# drive a real `DataglotServer` over the wire and assert that
-# /metrics reflects the queries.
-tokio-postgres.workspace = true
 # tower brings ServiceExt::oneshot for in-process router tests.
 tower = { workspace = true }
 # Mock HTTP server for `dataglot-server::lineage::tests` —
