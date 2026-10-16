@@ -14,7 +14,7 @@
 //! whitelists apply — including org-scoped rules created at runtime with
 //! `CREATE MASK` / `CREATE ROW FILTER` — as well as what `current_user` /
 //! `session_user` return.
-//! +//!
+//!
 //! With `--server` none of the above happens locally: the statement goes to a
 //! running server (see [`crate::client`]).
 

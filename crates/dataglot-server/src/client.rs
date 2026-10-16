@@ -363,7 +363,7 @@ fn target(config: &Config) -> String {
     }
 }
 
-// The useful part of a tokio-postgres error. Its own `Display` starts with
+/// The useful part of a tokio-postgres error. Its own `Display` starts with
 /// a generic kind ("db error", "error connecting to server") and, for server
 /// errors, leaves out DETAIL and HINT.
 fn describe(e: &tokio_postgres::Error) -> String {
