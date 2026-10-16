@@ -159,6 +159,20 @@ In this mode `--config` and `--user` don't apply. Values arrive as text, so
 `--format json` prints them as strings. Exit codes: 0 ok, 1 statement failed,
 2 no connection (couldn't connect, or lost it mid-session).
 
+Connection settings follow psql. `sslmode` defaults to `prefer`: encrypted
+when the server offers TLS, without checking its certificate, same as
+`require`. `verify-ca` / `verify-full` check the certificate against the OS
+trust store, or against `sslrootcert=<file>` (`require` with a root file
+checks it too). Unlike libpq, `verify-ca` also checks the host name.
+`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE` and
+`PGSSLROOTCERT` fill in anything the URL leaves out; they never switch client
+mode on by themselves. Prefer `PGPASSWORD` over a password in the URL, which
+ends up in shell history and the process list.
+
+```bash
+PGPASSWORD=... dataglot query --server "postgres://alice@db.example.com/files?sslmode=verify-full" "SELECT 1"
+```
+
 ## Dashboard
 
 - **Operational dashboard (served by the engine):** <http://127.0.0.1:9090/ui>
