@@ -152,8 +152,8 @@ async fn verifying_modes_reject_an_untrusted_certificate() {
         format!("{url}?sslmode=require&sslrootcert={cert}"),
     ] {
         let (code, _, err) = query(&server).await;
-        assert_eq!(code, ExitCode::from(2), "{server}: {err}");
-        assert!(err.contains("certificate"), "{server}: {err}");
+        assert_eq!(code, ExitCode::from(2), "expected connection failure");
+        assert!(err.contains("certificate"), "expected certificate-related error");
     }
 }
 
