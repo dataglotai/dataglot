@@ -187,8 +187,12 @@ pub struct ShellArgs {
     /// Identity to run as. Governance (masks, row filters, grants, column
     /// whitelists) applies as for a pg-wire connection with this username;
     /// also sets what `current_user` / `session_user` return. With
-    /// `--server`, put the user in the URL instead.
-    #[arg(long, default_value = "dataglot", conflicts_with = "server")]
+    /// `--server` or `--profile`, the user comes from the URL instead.
+    #[arg(
+        long,
+        default_value = "dataglot",
+        conflicts_with_all = ["server", "profile"]
+    )]
     pub user: String,
 
     /// Send statements to a running Dataglot server instead of starting an
@@ -200,6 +204,19 @@ pub struct ShellArgs {
     /// config applies.
     #[arg(long, value_name = "URL", env = "DATAGLOT_SERVER")]
     pub server: Option<String>,
+
+    /// Connect to the server described by this profile instead of passing
+    /// `--server`. Profiles live in `DATAGLOT_CLI_CONFIG`, or by default
+    /// `~/.config/dataglot/cli.toml` (`%APPDATA%\dataglot\cli.toml` on
+    /// Windows), as `[profiles.<name>]` tables with a `url` and an optional
+    /// `password_env`.
+    #[arg(
+        long,
+        value_name = "NAME",
+        env = "DATAGLOT_PROFILE",
+        conflicts_with = "server"
+    )]
+    pub profile: Option<String>,
 }
 
 /// Arguments for `dataglot completions`.
@@ -240,8 +257,12 @@ pub struct QueryArgs {
     /// Identity to run as. Governance (masks, row filters, grants, column
     /// whitelists) applies as for a pg-wire connection with this username;
     /// also sets what `current_user` / `session_user` return. With
-    /// `--server`, put the user in the URL instead.
-    #[arg(long, default_value = "dataglot", conflicts_with = "server")]
+    /// `--server` or `--profile`, the user comes from the URL instead.
+    #[arg(
+        long,
+        default_value = "dataglot",
+        conflicts_with_all = ["server", "profile"]
+    )]
     pub user: String,
 
     /// Send statements to a running Dataglot server instead of starting an
@@ -253,6 +274,19 @@ pub struct QueryArgs {
     /// config applies.
     #[arg(long, value_name = "URL", env = "DATAGLOT_SERVER")]
     pub server: Option<String>,
+
+    /// Connect to the server described by this profile instead of passing
+    /// `--server`. Profiles live in `DATAGLOT_CLI_CONFIG`, or by default
+    /// `~/.config/dataglot/cli.toml` (`%APPDATA%\dataglot\cli.toml` on
+    /// Windows), as `[profiles.<name>]` tables with a `url` and an optional
+    /// `password_env`.
+    #[arg(
+        long,
+        value_name = "NAME",
+        env = "DATAGLOT_PROFILE",
+        conflicts_with = "server"
+    )]
+    pub profile: Option<String>,
 }
 
 /// Result-set rendering for `dataglot query`.
@@ -478,6 +512,35 @@ mod tests {
         match Args::parse_from(["dataglot", "shell", "--server", url]).command {
             Some(Command::Shell(s)) => assert_eq!(s.server.as_deref(), Some(url)),
             other => panic!("expected Shell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_flag_parses_and_conflicts_with_server_and_user() {
+        match Args::parse_from(["dataglot", "query", "--profile", "prod", "SELECT 1"]).command {
+            Some(Command::Query(q)) => {
+                assert_eq!(q.profile.as_deref(), Some("prod"));
+                assert!(q.server.is_none());
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+        for sub in ["query", "shell"] {
+            for clash in [["--server", "postgres://h"], ["--user", "alice"]] {
+                let err = Args::try_parse_from([
+                    "dataglot",
+                    sub,
+                    "--profile",
+                    "prod",
+                    clash[0],
+                    clash[1],
+                ])
+                .expect_err("must conflict");
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "{sub} {clash:?}"
+                );
+            }
         }
     }
 
