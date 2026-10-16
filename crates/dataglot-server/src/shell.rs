@@ -7,7 +7,7 @@
 //! go to stdout; the banner, prompt, and errors go to stderr, so a piped
 //! session's stdout stays result-only.
 //!
-//! With `--server` the same loop sends each statement to a running server
+//! With `--server` or `--profile` the same loop sends each statement to a running server
 //! instead (see [`crate::client`]). If that connection drops, the shell exits
 //! with code 2 rather than failing every statement after it.
 //!
@@ -24,7 +24,7 @@ use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::tokenizer::{Location, Token, Tokenizer, TokenizerError};
 
 use crate::cli::{Args, ShellArgs};
-use crate::client::{ClientError, RemoteSession};
+use crate::client::{ClientError, Endpoint, RemoteSession};
 
 const PROMPT: &str = "dataglot> ";
 // Same markers as psql, so it's obvious when a quote or comment is still open.
@@ -42,8 +42,15 @@ const IN_COMMENT_PROMPT: &str = "dataglot*> ";
 pub async fn run(args: &Args, s: &ShellArgs) -> Result<ExitCode> {
     let stdin = std::io::stdin();
     let mut stderr = std::io::stderr();
-    if let Some(server) = &s.server {
-        let remote = match RemoteSession::connect(server).await {
+    let endpoint = match Endpoint::from_args(s.server.as_deref(), s.profile.as_deref()) {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            let _ = writeln!(stderr, "error: {e}");
+            return Ok(e.exit_code());
+        }
+    };
+    if let Some(endpoint) = endpoint {
+        let remote = match RemoteSession::connect_to(&endpoint).await {
             Ok(remote) => remote,
             Err(e) => {
                 let _ = writeln!(stderr, "error: {e}");

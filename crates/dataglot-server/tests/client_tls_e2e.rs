@@ -1,7 +1,8 @@
 //! Client mode TLS and password handling against a real `DataglotServer`.
 //!
 //! One server requires TLS on pg-wire, so a plaintext client can't get in.
-//! Another uses `scram-sha-256` auth for the password cases.
+//! Another uses `scram-sha-256` auth for the password cases, including a
+//! connection profile that reads its password from `password_env`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -9,7 +10,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use dataglot_server::cli::OutputFormat;
-use dataglot_server::client::{self, RemoteSession};
+use dataglot_server::client::{self, Endpoint, RemoteSession};
 use dataglot_server::config::{
     AuthConfig, AuthMode, IdentityProfileConfig, PgwireTlsConfig, PgwireTlsMode, ServerConfig,
 };
@@ -188,7 +189,7 @@ async fn password_auth() {
         identities: HashMap::from([(
             "alice".to_string(),
             IdentityProfileConfig {
-                password_env: Some(password_env),
+                password_env: Some(password_env.clone()),
                 ..IdentityProfileConfig::default()
             },
         )]),
@@ -214,4 +215,28 @@ async fn password_auth() {
         !err.contains("wrong"),
         "the password must not be echoed: {err}"
     );
+
+    // A profile supplies the password through password_env.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profiles = dir.path().join("cli.toml");
+    std::fs::write(
+        &profiles,
+        format!(
+            "[profiles.test]\nurl = \"postgres://alice@{base}\"\npassword_env = \"{password_env}\"\n"
+        ),
+    )
+    .expect("write profiles");
+    let endpoint = Endpoint::from_profile_file(&profiles, "test").expect("profile");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = client::run_query(
+        endpoint,
+        "SELECT 1 AS n",
+        OutputFormat::Csv,
+        &mut out,
+        &mut err,
+    )
+    .await;
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(String::from_utf8(out).expect("utf-8"), "n\n1\n");
 }

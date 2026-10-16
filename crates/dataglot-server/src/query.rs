@@ -15,8 +15,8 @@
 //! `CREATE MASK` / `CREATE ROW FILTER` — as well as what `current_user` /
 //! `session_user` return.
 //!
-//! With `--server` none of the above happens locally: the statement goes to a
-//! running server (see [`crate::client`]).
+//! With `--server` or `--profile` none of the above happens locally: the
+//! statement goes to a running server (see [`crate::client`]).
 
 use std::borrow::Cow;
 use std::io::{Read, Write};
@@ -27,6 +27,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::prelude::SessionContext;
 
 use crate::cli::{Args, OutputFormat, QueryArgs};
+use crate::client::Endpoint;
 use crate::config::ServerConfig;
 use crate::server::DataglotServer;
 
@@ -229,21 +230,30 @@ pub(crate) async fn build_session(args: &Args, user: &str) -> Result<EmbeddedSes
 
 /// Run `dataglot query`: load config (honouring the global `--config`), build
 /// the federation + governance session, execute one statement, print it.
-/// With `--server`, send the SQL to that server instead.
+/// With `--server` or `--profile`, send the SQL to that server instead.
 ///
 /// # Errors
 /// If no SQL is provided, the engine fails to initialize, or the query fails.
 /// In client mode failures are reported on stderr and come back as the exit
-/// code instead (1 for a failed statement, 2 for a failed connection).
+/// code instead (1 for a failed statement, 2 for a failed connection or an
+/// unusable profile).
 pub async fn run(args: &Args, q: &QueryArgs) -> Result<ExitCode> {
+    // Before reading the SQL, so a bad profile doesn't wait on stdin first.
+    let endpoint = match Endpoint::from_args(q.server.as_deref(), q.profile.as_deref()) {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "error: {e}");
+            return Ok(e.exit_code());
+        }
+    };
     let sql = resolve_sql(q)?;
     let sql = sql.trim();
     if sql.is_empty() {
         anyhow::bail!("no SQL provided (pass a statement, --file <path>, or pipe via stdin)");
     }
-    if let Some(server) = &q.server {
+    if let Some(endpoint) = endpoint {
         return Ok(crate::client::run_query(
-            server,
+            endpoint,
             sql,
             q.format,
             &mut std::io::stdout(),
@@ -296,6 +306,7 @@ mod tests {
             format: OutputFormat::Table,
             user: "dataglot".to_string(),
             server: None,
+            profile: None,
         }
     }
 

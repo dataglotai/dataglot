@@ -15,7 +15,11 @@
 //! The connection string follows libpq: `sslmode` and `sslrootcert` work as in psql,
 //! and `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE` and `PGSSLROOTCERT`
 //! fill in whatever `--server` leaves out.
+//!
+//! Instead of `--server`, `--profile <name>` picks a named connection from a
+//! profiles file (see [`Endpoint::from_profile`]).
 
+mod profile;
 mod settings;
 
 use std::io::{BufWriter, Write};
@@ -64,6 +68,10 @@ pub enum ClientError {
     /// The result couldn't be written to stdout.
     #[error("writing output: {0}")]
     Output(String),
+    /// `--profile` couldn't be resolved: no profiles file, no such profile,
+    /// or a profile that can't be used as written.
+    #[error("{0}")]
+    Profile(String),
 }
 
 impl ClientError {
@@ -72,9 +80,10 @@ impl ClientError {
     #[must_use]
     pub fn exit_code(&self) -> ExitCode {
         match self {
-            Self::InvalidServer(_) | Self::Connect { .. } | Self::ConnectionLost { .. } => {
-                ExitCode::from(2)
-            }
+            Self::InvalidServer(_)
+            | Self::Connect { .. }
+            | Self::ConnectionLost { .. }
+            | Self::Profile(_) => ExitCode::from(2),
             Self::Statement(_) | Self::Output(_) => ExitCode::FAILURE,
         }
     }
@@ -99,6 +108,72 @@ impl From<std::io::Error> for ClientError {
     }
 }
 
+/// Where client mode connects: a `--server` value as given, or the one a
+/// profile resolved to, together with the profile's password.
+///
+/// No `Debug`, so the password can't end up in a log line by accident.
+pub struct Endpoint {
+    server: String,
+    password: Option<String>,
+}
+
+impl Endpoint {
+    /// Look up profile `name` in the profiles file: `DATAGLOT_CLI_CONFIG`
+    /// if set, otherwise `%APPDATA%\dataglot\cli.toml` on Windows and
+    /// `$XDG_CONFIG_HOME/dataglot/cli.toml` (or `~/.config/dataglot/cli.toml`)
+    /// elsewhere.
+    ///
+    /// # Errors
+    /// [`ClientError::Profile`] if the file is missing or invalid, the
+    /// profile doesn't exist, its url carries a password, or the variable
+    /// its `password_env` names isn't set.
+    pub fn from_profile(name: &str) -> Result<Self, ClientError> {
+        profile::load(name)
+    }
+
+    /// Like [`Self::from_profile`], with the profiles file at `path`.
+    ///
+    /// # Errors
+    /// As for [`Self::from_profile`].
+    pub fn from_profile_file(path: &std::path::Path, name: &str) -> Result<Self, ClientError> {
+        profile::load_from(path, name, &|key| std::env::var(key).ok())
+    }
+
+    /// The endpoint `--server` / `--profile` ask for, or `None` for
+    /// embedded mode. clap already keeps the two flags apart.
+    ///
+    /// # Errors
+    /// As for [`Self::from_profile`].
+    pub fn from_args(
+        server: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<Option<Self>, ClientError> {
+        match (server, profile) {
+            (Some(server), _) => Ok(Some(server.into())),
+            (None, Some(name)) => Self::from_profile(name).map(Some),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+impl From<&str> for Endpoint {
+    fn from(server: &str) -> Self {
+        Self {
+            server: server.to_string(),
+            password: None,
+        }
+    }
+}
+
+impl From<String> for Endpoint {
+    fn from(server: String) -> Self {
+        Self {
+            server,
+            password: None,
+        }
+    }
+}
+
 /// A connection to a running Dataglot server
 pub struct RemoteSession {
     client: tokio_postgres::Client,
@@ -117,8 +192,24 @@ impl RemoteSession {
     /// be used, [`ClientError::Connect`] if the TLS setup, the connection or
     /// the login fails.
     pub async fn connect(server: &str) -> Result<Self, ClientError> {
-        let env = |key: &str| std::env::var(key).ok();
-        let settings = settings::resolve(server, &env).map_err(ClientError::InvalidServer)?;
+        Self::connect_to(&server.into()).await
+    }
+
+    /// Connect to `endpoint`. A profile's password takes precedence over
+    /// `PGPASSWORD`.
+    ///
+    /// # Errors
+    /// As for [`Self::connect`].
+    pub async fn connect_to(endpoint: &Endpoint) -> Result<Self, ClientError> {
+        let password = endpoint.password.clone();
+        // The profile's password stands in for `PGPASSWORD`, so it wins
+        // over the environment variable.
+        let env = move |key: &str| match (key, &password) {
+            ("PGPASSWORD", Some(password)) => Some(password.clone()),
+            _ => std::env::var(key).ok(),
+        };
+        let settings =
+            settings::resolve(&endpoint.server, &env).map_err(ClientError::InvalidServer)?;
         let target = target(&settings.config);
         let opened = match settings.tls() {
             None => open(&settings.config, NoTls).await,
@@ -247,13 +338,13 @@ where
 /// Returns the exit code rather than an error so a failed statement exits 1
 /// and a failed connection exits 2.
 pub async fn run_query<O: Write, E: Write>(
-    server: &str,
+    endpoint: impl Into<Endpoint>,
     sql: &str,
     format: OutputFormat,
     out: &mut O,
     err: &mut E,
 ) -> ExitCode {
-    let result = match RemoteSession::connect(server).await {
+    let result = match RemoteSession::connect_to(&endpoint.into()).await {
         Ok(session) => session.execute(sql, format, out).await,
         Err(e) => Err(e),
     };
@@ -436,6 +527,7 @@ mod tests {
                 target: String::new(),
                 message: String::new(),
             },
+            ClientError::Profile(String::new()),
         ];
         for e in no_connection {
             assert_eq!(e.exit_code(), ExitCode::from(2), "{e:?}");
@@ -448,6 +540,16 @@ mod tests {
             ClientError::Output(String::new()).exit_code(),
             ExitCode::FAILURE
         );
+    }
+
+    #[test]
+    fn from_args_picks_server_profile_or_embedded() {
+        let endpoint = Endpoint::from_args(Some("postgres://h"), None)
+            .expect("server")
+            .expect("client mode");
+        assert_eq!(endpoint.server, "postgres://h");
+        assert!(endpoint.password.is_none());
+        assert!(Endpoint::from_args(None, None).expect("embedded").is_none());
     }
 
     #[test]
@@ -474,7 +576,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run_query(
-            &format!("postgres://127.0.0.1:{port}"),
+            format!("postgres://127.0.0.1:{port}"),
             "SELECT 1",
             OutputFormat::Table,
             &mut out,
