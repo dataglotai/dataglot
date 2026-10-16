@@ -11,6 +11,12 @@
 //! simple protocol returns every value as text without type information, so
 //! result columns are strings here. Tables and CSV look the same as in
 //! embedded mode; JSON values come out quoted.
+//!
+//! The connection string follows libpq: `sslmode` and `sslrootcert` work as in psql,
+//! and `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE` and `PGSSLROOTCERT`
+//! fill in whatever `--server` leaves out.
+
+mod settings;
 
 use std::io::{BufWriter, Write};
 use std::process::ExitCode;
@@ -21,13 +27,10 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::error::ArrowError;
 use futures::StreamExt;
 use tokio_postgres::config::Host;
-use tokio_postgres::{Config, NoTls, SimpleColumn, SimpleQueryMessage, SimpleQueryRow};
+use tokio_postgres::tls::MakeTlsConnect;
+use tokio_postgres::{Config, NoTls, SimpleColumn, SimpleQueryMessage, SimpleQueryRow, Socket};
 
 use crate::cli::OutputFormat;
-
-/// User name sent when the URL doesn't have one. Matches the embedded
-/// `--user` default.
-const DEFAULT_USER: &str = "dataglot";
 
 /// Rows per Arrow batch while a result streams in.
 const ROWS_PER_BATCH: usize = 1024;
@@ -36,7 +39,7 @@ const ROWS_PER_BATCH: usize = 1024;
 /// whether the shell can keep going.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    /// `--server` isn't a URL or `key=value` string tokio-postgres accepts.
+    /// `--server` or a `PG*` variable has a value that can't be used.
     #[error("invalid --server value: {0}")]
     InvalidServer(String),
     /// The server couldn't be reached, or refused the connection.
@@ -104,40 +107,34 @@ pub struct RemoteSession {
 
 impl RemoteSession {
     /// Connect to `server`, a `postgres://` URL or a libpq-style
-    /// `key=value` string. A missing user defaults to `dataglot`, a missing
-    /// host to `localhost`. Without a database the server picks its default
-    /// catalog.
+    /// `key=value` string. Anything it leaves out comes from the `PG*`
+    /// environment variables, then from the defaults: user `dataglot`, host
+    /// `localhost`, `sslmode=prefer`. Without a database the server picks
+    /// its default catalog.
     ///
     /// # Errors
-    /// [`ClientError::InvalidServer`] if `server` doesn't parse,
-    /// [`ClientError::Connect`] if the connection or the login fails.
+    /// [`ClientError::InvalidServer`] if `server` or a `PG*` variable can't
+    /// be used, [`ClientError::Connect`] if the TLS setup, the connection or
+    /// the login fails.
     pub async fn connect(server: &str) -> Result<Self, ClientError> {
-        let mut config: Config = server
-            .parse()
-            .map_err(|e: tokio_postgres::Error| ClientError::InvalidServer(describe(&e)))?;
-        if config.get_user().is_none() {
-            config.user(DEFAULT_USER);
-        }
-        if config.get_hosts().is_empty() && config.get_hostaddrs().is_empty() {
-            config.host("localhost");
-        }
-        let target = target(&config);
-        // No TLS yet, that is a follow up. Until then `sllmode=require` fails to connect.
-        let (client, connection) = match config.connect(NoTls).await {
-            Ok(connected) => connected,
-            Err(e) => {
-                return Err(ClientError::Connect {
-                    target,
-                    message: describe(&e),
-                })
+        let env = |key: &str| std::env::var(key).ok();
+        let settings = settings::resolve(server, &env).map_err(ClientError::InvalidServer)?;
+        let target = target(&settings.config);
+        let opened = match settings.tls() {
+            None => open(&settings.config, NoTls).await,
+            Some(tls) => {
+                // Loading the trust store or CA file is blocking file I/O.
+                match tokio::task::spawn_blocking(move || tls.make_connector()).await {
+                    Ok(Ok(connector)) => open(&settings.config, connector).await,
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(e) => Err(format!("TLS setup failed: {e}")),
+                }
             }
         };
-        // The connection future does the socket I/O. Once it ends, calls on
-        // `client` fail as closed, to show up a dead server.
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        Ok(Self { client, target })
+        match opened {
+            Ok(client) => Ok(Self { client, target }),
+            Err(message) => Err(ClientError::Connect { target, message }),
+        }
     }
 
     /// `host:port` of the server, for messages.
@@ -220,6 +217,28 @@ impl RemoteSession {
             ClientError::Statement(describe(e))
         }
     }
+}
+
+/// Open the connection and hand its I/O future to the runtime.
+async fn open<T>(config: &Config, tls: T) -> Result<tokio_postgres::Client, String>
+where
+    T: MakeTlsConnect<Socket>,
+    T::Stream: Send + 'static,
+{
+    let (client, connection) = config.connect(tls).await.map_err(|e| {
+        let message = describe(&e);
+        if message == "password missing" {
+            "the server asked for a password; put it in the URL or set PGPASSWORD".to_string()
+        } else {
+            message
+        }
+    })?;
+    // The connection future does the socket I/O. Once it ends, calls on
+    // `client` fail as closed to show a dead server.
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    Ok(client)
 }
 
 /// `dataglot query --server`: connect, run `sql`, write the results to `out`

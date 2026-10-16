@@ -193,8 +193,11 @@ pub struct ShellArgs {
 
     /// Send statements to a running Dataglot server instead of starting an
     /// embedded engine, e.g. `postgres://admin@localhost:5432/files`. A
-    /// libpq `key=value` string works too. `--config` isn't read in this
-    /// mode; the server's own config applies.
+    /// libpq `key=value` string works too. `sslmode` and `sslrootcert`
+    /// behave as in psql, and `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`,
+    /// `PGDATABASE`, `PGSSLMODE` and `PGSSLROOTCERT` fill in what the URL
+    /// leaves out. `--config` isn't read in this mode; the server's own
+    /// config applies.
     #[arg(long, value_name = "URL", env = "DATAGLOT_SERVER")]
     pub server: Option<String>,
 }
@@ -243,8 +246,11 @@ pub struct QueryArgs {
 
     /// Send statements to a running Dataglot server instead of starting an
     /// embedded engine, e.g. `postgres://admin@localhost:5432/files`. A
-    /// libpq `key=value` string works too. `--config` isn't read in this
-    /// mode; the server's own config applies.
+    /// libpq `key=value` string works too. `sslmode` and `sslrootcert`
+    /// behave as in psql, and `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`,
+    /// `PGDATABASE`, `PGSSLMODE` and `PGSSLROOTCERT` fill in what the URL
+    /// leaves out. `--config` isn't read in this mode; the server's own
+    /// config applies.
     #[arg(long, value_name = "URL", env = "DATAGLOT_SERVER")]
     pub server: Option<String>,
 }
