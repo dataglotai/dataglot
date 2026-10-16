@@ -79,10 +79,13 @@ fn install_default_crypto_provider() {
 impl PgTls {
     /// Build a [`MakeRustlsConnect`] for `tokio_postgres::Config::connect`.
     ///
+    /// Reads the OS trust store or the CA file from disk, so async callers should run
+    /// it on `tokio::task::spawn_blocking`.
+    ///
     /// # Errors
     /// Returns [`DataglotError::Configuration`] if the native trust store
     /// or a CA file can't be loaded / contains no usable certificates.
-    pub(crate) fn make_connector(&self) -> DataglotResult<MakeRustlsConnect> {
+    pub fn make_connector(&self) -> DataglotResult<MakeRustlsConnect> {
         install_default_crypto_provider();
 
         let config = if self.accept_invalid_certs {
