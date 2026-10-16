@@ -14,9 +14,13 @@
 //! whitelists apply — including org-scoped rules created at runtime with
 //! `CREATE MASK` / `CREATE ROW FILTER` — as well as what `current_user` /
 //! `session_user` return.
+//!
+//! With `--server` none of the above happens locally: the statement goes to a
+//! running server (see [`crate::client`]).
 
 use std::borrow::Cow;
 use std::io::{Read, Write};
+use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use datafusion::arrow::array::RecordBatch;
@@ -225,17 +229,31 @@ pub(crate) async fn build_session(args: &Args, user: &str) -> Result<EmbeddedSes
 
 /// Run `dataglot query`: load config (honouring the global `--config`), build
 /// the federation + governance session, execute one statement, print it.
+/// With `--server`, send the SQL to that server instead.
 ///
 /// # Errors
 /// If no SQL is provided, the engine fails to initialize, or the query fails.
-pub async fn run(args: &Args, q: &QueryArgs) -> Result<()> {
+/// In client mode failures are reported on stderr and come back as the exit
+/// code instead (1 for a failed statement, 2 for a failed connection).
+pub async fn run(args: &Args, q: &QueryArgs) -> Result<ExitCode> {
     let sql = resolve_sql(q)?;
     let sql = sql.trim();
     if sql.is_empty() {
         anyhow::bail!("no SQL provided (pass a statement, --file <path>, or pipe via stdin)");
     }
+    if let Some(server) = &q.server {
+        return Ok(crate::client::run_query(
+            server,
+            sql,
+            q.format,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )
+        .await);
+    }
     let session = build_session(args, &q.user).await?;
-    session.execute_and_print(sql, q.format).await
+    session.execute_and_print(sql, q.format).await?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Render `batches` to stdout in the requested format.
@@ -277,6 +295,7 @@ mod tests {
             file,
             format: OutputFormat::Table,
             user: "dataglot".to_string(),
+            server: None,
         }
     }
 

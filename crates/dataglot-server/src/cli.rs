@@ -154,11 +154,15 @@ pub enum Command {
     ///   dataglot query -c dataglot.toml "SELECT * FROM pg.public.users LIMIT 5"
     ///   dataglot query -c dataglot.toml -f report.sql
     ///   echo "SELECT 1" | dataglot query -c dataglot.toml -
+    ///
+    /// With `--server <URL>` the statement runs on a running server instead,
+    /// e.g. `--server postgres://admin@localhost:5432`.
     Query(QueryArgs),
 
     /// Interactive SQL shell over the embedded engine — a lightweight REPL for
     /// the configured catalogs, no server or `psql` needed. Type SQL and press
     /// Enter; `\q` or Ctrl-D to quit. Results go to stdout, prompts to stderr.
+    /// With `--server <URL>` it talks to a running server instead.
     Shell(ShellArgs),
 
     /// Print a shell completion script to stdout and exit.
@@ -182,9 +186,17 @@ pub struct ShellArgs {
 
     /// Identity to run as. Governance (masks, row filters, grants, column
     /// whitelists) applies as for a pg-wire connection with this username;
-    /// also sets what `current_user` / `session_user` return.
-    #[arg(long, default_value = "dataglot")]
+    /// also sets what `current_user` / `session_user` return. With
+    /// `--server`, put the user in the URL instead.
+    #[arg(long, default_value = "dataglot", conflicts_with = "server")]
     pub user: String,
+
+    /// Send statements to a running Dataglot server instead of starting an
+    /// embedded engine, e.g. `postgres://admin@localhost:5432/files`. A
+    /// libpq `key=value` string works too. `--config` isn't read in this
+    /// mode; the server's own config applies.
+    #[arg(long, value_name = "URL", env = "DATAGLOT_SERVER")]
+    pub server: Option<String>,
 }
 
 /// Arguments for `dataglot completions`.
@@ -224,9 +236,17 @@ pub struct QueryArgs {
 
     /// Identity to run as. Governance (masks, row filters, grants, column
     /// whitelists) applies as for a pg-wire connection with this username;
-    /// also sets what `current_user` / `session_user` return.
-    #[arg(long, default_value = "dataglot")]
+    /// also sets what `current_user` / `session_user` return. With
+    /// `--server`, put the user in the URL instead.
+    #[arg(long, default_value = "dataglot", conflicts_with = "server")]
     pub user: String,
+
+    /// Send statements to a running Dataglot server instead of starting an
+    /// embedded engine, e.g. `postgres://admin@localhost:5432/files`. A
+    /// libpq `key=value` string works too. `--config` isn't read in this
+    /// mode; the server's own config applies.
+    #[arg(long, value_name = "URL", env = "DATAGLOT_SERVER")]
+    pub server: Option<String>,
 }
 
 /// Result-set rendering for `dataglot query`.
@@ -440,5 +460,40 @@ mod tests {
         let args = Args::parse_from(["dataglot", "--healthcheck", "--port", "15432"]);
         assert!(args.healthcheck);
         assert_eq!(args.port, Some(15432));
+    }
+
+    #[test]
+    fn server_flag_selects_client_mode_for_query_and_shell() {
+        let url = "postgres://admin@localhost:5432/files";
+        match Args::parse_from(["dataglot", "query", "--server", url, "SELECT 1"]).command {
+            Some(Command::Query(q)) => assert_eq!(q.server.as_deref(), Some(url)),
+            other => panic!("expected Query, got {other:?}"),
+        }
+        match Args::parse_from(["dataglot", "shell", "--server", url]).command {
+            Some(Command::Shell(s)) => assert_eq!(s.server.as_deref(), Some(url)),
+            other => panic!("expected Shell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_flag_conflicts_with_server() {
+        // The user goes in the URL in client mode; a second place to set it
+        // would only invite the two disagreeing.
+        for sub in ["query", "shell"] {
+            let err = Args::try_parse_from([
+                "dataglot",
+                sub,
+                "--server",
+                "postgres://localhost",
+                "--user",
+                "alice",
+            ])
+            .expect_err("--user with --server must be refused");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{sub}"
+            );
+        }
     }
 }

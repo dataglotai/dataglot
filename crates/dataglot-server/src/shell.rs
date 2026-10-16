@@ -7,18 +7,24 @@
 //! go to stdout; the banner, prompt, and errors go to stderr, so a piped
 //! session's stdout stays result-only.
 //!
+//! With `--server` the same loop sends each statement to a running server
+//! instead (see [`crate::client`]). If that connection drops, the shell exits
+//! with code 2 rather than failing every statement after it.
+//!
 //! Dependency-free by design (no readline crate): line editing and history are
 //! a shell / `rlwrap` concern, and pulling in `rustyline` would add a
 //! dependency for marginal value over `dataglot query` + your shell's history.
 
 use std::io::{BufRead, Write};
 use std::ops::Range;
+use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::tokenizer::{Location, Token, Tokenizer, TokenizerError};
 
 use crate::cli::{Args, ShellArgs};
+use crate::client::{ClientError, RemoteSession};
 
 const PROMPT: &str = "dataglot> ";
 // Same markers as psql, so it's obvious when a quote or comment is still open.
@@ -30,13 +36,29 @@ const IN_COMMENT_PROMPT: &str = "dataglot*> ";
 /// Run the interactive shell.
 ///
 /// # Errors
-/// If the engine fails to initialize or stdin can't be read. A per-statement
-/// query error is printed and the loop continues; only a fatal stdin I/O error
-/// ends the shell non-zero.
-pub async fn run(args: &Args, s: &ShellArgs) -> Result<()> {
-    let session = crate::query::build_session(args, &s.user).await?;
+/// If the engine fails to initialize or stdin can't be read. A per-statement query error
+/// is printed and the loop continues; only a fatal stdin I/O error ends the shell non-zero.
+/// In client mode a failed or lost connection is printed and returned as exit code 2.
+pub async fn run(args: &Args, s: &ShellArgs) -> Result<ExitCode> {
     let stdin = std::io::stdin();
-    repl(stdin.lock(), &mut std::io::stderr(), async |sql: &str| {
+    let mut stderr = std::io::stderr();
+    if let Some(server) = &s.server {
+        let remote = match RemoteSession::connect(server).await {
+            Ok(remote) => remote,
+            Err(e) => {
+                let _ = writeln!(stderr, "error: {e}");
+                return Ok(e.exit_code());
+            }
+        };
+        let _ = writeln!(stderr, "Connected to {}.", remote.target());
+        let mut stdout = std::io::stdout();
+        return repl(stdin.lock(), &mut stderr, async |sql: &str| {
+            Ok(remote.execute(sql, s.format, &mut stdout).await?)
+        })
+        .await;
+    }
+    let session = crate::query::build_session(args, &s.user).await?;
+    repl(stdin.lock(), &mut stderr, async |sql: &str| {
         session.execute_and_print(sql, s.format).await
     })
     .await
@@ -44,7 +66,7 @@ pub async fn run(args: &Args, s: &ShellArgs) -> Result<()> {
 
 /// The read loop, generic over its input and prompt output so tests can drive
 /// it without a terminal.
-async fn repl<R, W, F>(mut input: R, stderr: &mut W, mut execute: F) -> Result<()>
+async fn repl<R, W, F>(mut input: R, stderr: &mut W, mut execute: F) -> Result<ExitCode>
 where
     R: BufRead,
     W: Write,
@@ -67,7 +89,9 @@ where
             // often leave the `;` off their last statement.
             let _ = writeln!(stderr);
             if let Some(sql) = buffer.finish() {
-                run_statement(&mut execute, &sql, stderr).await;
+                if let Some(code) = run_statement(&mut execute, &sql, stderr).await {
+                    return Ok(code);
+                }
             }
             break;
         }
@@ -81,21 +105,26 @@ where
             break;
         }
         for sql in buffer.push_line(line) {
-            run_statement(&mut execute, &sql, stderr).await;
+            if let Some(code) = run_statement(&mut execute, &sql, stderr).await {
+                return Ok(code);
+            }
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
-async fn run_statement<F, W>(execute: &mut F, sql: &str, stderr: &mut W)
+/// Run one statement and report its error. Returns an exit code only when the
+/// shell has to stop, which is when the server connection is gone.
+async fn run_statement<F, W>(execute: &mut F, sql: &str, stderr: &mut W) -> Option<ExitCode>
 where
     F: AsyncFnMut(&str) -> Result<()>,
     W: Write,
 {
-    // A failing statement is reported, not fatal.
-    if let Err(e) = execute(sql).await {
-        let _ = writeln!(stderr, "error: {e:#}");
-    }
+    let e = execute(sql).await.err()?;
+    let _ = writeln!(stderr, "error: {e:#}");
+    e.downcast_ref::<ClientError>()
+        .filter(|e| e.is_fatal())
+        .map(ClientError::exit_code)
 }
 
 /// Collects input lines and hands statements back as their `;` arrives.
@@ -386,6 +415,39 @@ mod tests {
         .await
         .expect("repl");
         (ran, String::from_utf8(stderr).expect("utf-8"))
+    }
+
+    #[tokio::test]
+    async fn repl_stops_once_the_server_connection_is_lost() {
+        let mut ran = Vec::new();
+        let mut stderr = Vec::new();
+        let code = repl(
+            Cursor::new("SELECT 1;\nSELECT 2;\nSELECT 3;\n"),
+            &mut stderr,
+            async |sql: &str| {
+                ran.push(sql.to_string());
+                match sql {
+                    "SELECT 1" => Err(ClientError::Statement("no such table".into()).into()),
+                    "SELECT 2" => Err(ClientError::ConnectionLost {
+                        target: "localhost:5432".into(),
+                        message: "connection closed".into(),
+                    }
+                    .into()),
+                    _ => Ok(()),
+                }
+            },
+        )
+        .await
+        .expect("repl");
+        // A rejected statement is just reported; a dead connection ends it.
+        assert_eq!(code, ExitCode::from(2));
+        assert_eq!(ran, ["SELECT 1", "SELECT 2"]);
+        let stderr = String::from_utf8(stderr).expect("utf-8");
+        assert!(stderr.contains("error: no such table\n"), "{stderr}");
+        assert!(
+            stderr.contains("error: lost the connection to localhost:5432: connection closed\n"),
+            "{stderr}"
+        );
     }
 
     #[tokio::test]

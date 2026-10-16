@@ -19,6 +19,7 @@
 pub mod ballista;
 pub mod catalog_admin;
 pub mod cli;
+pub mod client;
 pub mod cluster;
 pub mod config;
 pub mod connectors;

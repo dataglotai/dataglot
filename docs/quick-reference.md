@@ -146,6 +146,19 @@ Subcommands: `dataglot init` (write a starter config) · `dataglot query "<SQL>"
 (one-shot, in-process, no server) · `dataglot shell` (REPL) ·
 `dataglot completions`.
 
+`query` and `shell` take `--server <URL>` (or `DATAGLOT_SERVER`) to run against
+a running server over pgwire instead of in-process. The server then handles
+everything, control-plane DDL included, under the user in the URL:
+
+```bash
+dataglot query --server postgres://admin@localhost:5432 "SELECT * FROM files.public.users"
+dataglot shell --server postgres://admin@localhost:5432/files
+```
+
+In this mode `--config` and `--user` don't apply. Values arrive as text, so
+`--format json` prints them as strings. Exit codes: 0 ok, 1 statement failed,
+2 no connection (couldn't connect, or lost it mid-session).
+
 ## Dashboard
 
 - **Operational dashboard (served by the engine):** <http://127.0.0.1:9090/ui>

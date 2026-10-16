@@ -11,6 +11,7 @@
 //! [`run_healthcheck`] helper.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -78,7 +79,7 @@ async fn run_healthcheck(port: u16) -> i32 {
 /// negligible — and it protects deep single-node plans too.
 const WORKER_STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     // A hand-built runtime (vs `#[tokio::main]`) so worker threads get a
     // larger stack — see `WORKER_STACK_SIZE`.
     tokio::runtime::Builder::new_multi_thread()
@@ -88,7 +89,7 @@ fn main() -> Result<()> {
         .block_on(run())
 }
 
-async fn run() -> Result<()> {
+async fn run() -> Result<ExitCode> {
     // Parse CLI arguments first — we need the resolved config before we can
     // initialize tracing, since the format/filter are part of the config.
     let args = Args::parse_args();
@@ -97,7 +98,7 @@ async fn run() -> Result<()> {
     // config/tracing work, so `dataglot completions <shell>` output is clean.
     if let Some(dataglot_server::cli::Command::Completions(c)) = &args.command {
         dataglot_server::cli::print_completions(c.shell);
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     // Subcommand short-circuit (one-shot utilities that never boot the
@@ -113,7 +114,7 @@ async fn run() -> Result<()> {
             "Next: set the DSN env var it names, then run:  dataglot --config {}",
             init.path.display()
         );
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     // Print-example-config short-circuit. Runs before everything else so
@@ -121,7 +122,7 @@ async fn run() -> Result<()> {
     // starter file (no tracing/banner noise on stdout).
     if args.print_example_config {
         dataglot_server::first_run::print_example_config()?;
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     // Health-probe short-circuit. Runs before config loading and
@@ -140,9 +141,10 @@ async fn run() -> Result<()> {
         std::process::exit(run_healthcheck(args.port.unwrap_or(5432)).await);
     }
 
-    // Query short-circuit: run one SQL statement in-process and exit. It
-    // loads config + builds the engine itself (no pg-wire listener) and prints
-    // results to stdout, so it runs before tracing init to keep stdout clean.
+    // Query short-circuit: run one SQL statement in-process (or on a running
+    // server with `--server`) and exit. It loads config + builds the engine
+    // itself (no pg-wire listener) and prints results to stdout, so it runs
+    // before tracing init to keep stdout clean.
     if let Some(dataglot_server::cli::Command::Query(q)) = &args.command {
         return dataglot_server::query::run(&args, q).await;
     }
@@ -217,5 +219,5 @@ async fn run() -> Result<()> {
     let server = DataglotServer::new(config).await?;
     server.run().await?;
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
