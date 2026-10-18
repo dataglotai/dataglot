@@ -11,6 +11,10 @@
 //! instead (see [`crate::client`]). If that connection drops, the shell exits
 //! with code 2 rather than failing every statement after it.
 //!
+//! Ctrl-C works as in psql: it cancels a running statement (on the server,
+//! in client mode) and otherwise throws away the statement being typed. It
+//! never ends the shell; `\q` or Ctrl-D does.
+//!
 //! Dependency-free by design (no readline crate): line editing and history are
 //! a shell / `rlwrap` concern, and pulling in `rustyline` would add a
 //! dependency for marginal value over `dataglot query` + your shell's history.
@@ -22,9 +26,11 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::tokenizer::{Location, Token, Tokenizer, TokenizerError};
+use tokio::sync::mpsc;
 
 use crate::cli::{Args, ShellArgs};
 use crate::client::{ClientError, Endpoint, RemoteSession};
+use crate::interrupt::{CtrlC, INTERRUPTED};
 
 const PROMPT: &str = "dataglot> ";
 // Same markers as psql, so it's obvious when a quote or comment is still open.
@@ -40,7 +46,6 @@ const IN_COMMENT_PROMPT: &str = "dataglot*> ";
 /// is printed and the loop continues; only a fatal stdin I/O error ends the shell non-zero.
 /// In client mode a failed or lost connection is printed and returned as exit code 2.
 pub async fn run(args: &Args, s: &ShellArgs) -> Result<ExitCode> {
-    let stdin = std::io::stdin();
     let mut stderr = std::io::stderr();
     let endpoint = match Endpoint::from_args(s.server.as_deref(), s.profile.as_deref()) {
         Ok(endpoint) => endpoint,
@@ -49,8 +54,14 @@ pub async fn run(args: &Args, s: &ShellArgs) -> Result<ExitCode> {
             return Ok(e.exit_code());
         }
     };
+    let ctrl_c = CtrlC::listen();
+    let stdin = std::io::BufReader::new(std::io::stdin());
     if let Some(endpoint) = endpoint {
-        let remote = match RemoteSession::connect_to(&endpoint).await {
+        let connected = tokio::select! {
+            connected = RemoteSession::connect_to(&endpoint) => connected,
+            () = ctrl_c.after(0) => return Ok(ExitCode::from(INTERRUPTED)),
+        };
+        let remote = match connected {
             Ok(remote) => remote,
             Err(e) => {
                 let _ = writeln!(stderr, "error: {e}");
@@ -59,23 +70,47 @@ pub async fn run(args: &Args, s: &ShellArgs) -> Result<ExitCode> {
         };
         let _ = writeln!(stderr, "Connected to {}.", remote.target());
         let mut stdout = std::io::stdout();
-        return repl(stdin.lock(), &mut stderr, async |sql: &str| {
-            Ok(remote.execute(sql, s.format, &mut stdout).await?)
-        })
+        return repl(
+            stdin,
+            &mut stderr,
+            async |sql: &str| {
+                Ok(remote
+                    .execute_until(sql, s.format, &mut stdout, &ctrl_c)
+                    .await?)
+            },
+            &ctrl_c,
+        )
         .await;
     }
-    let session = crate::query::build_session(args, &s.user).await?;
-    repl(stdin.lock(), &mut stderr, async |sql: &str| {
-        session.execute_and_print(sql, s.format).await
-    })
+    let session = tokio::select! {
+        session = Box::pin(crate::query::build_session(args, &s.user)) => session?,
+        () = ctrl_c.after(0) => return Ok(ExitCode::from(INTERRUPTED)),
+    };
+    repl(
+        stdin,
+        &mut stderr,
+        async |sql: &str| {
+            // Dropping the running plan is all it takes to stop it in-process.
+            let seen = ctrl_c.count();
+            tokio::select! {
+                result = session.execute_and_print(sql, s.format) => result,
+                () = ctrl_c.after(seen) => Err(ClientError::Cancelled.into()),
+            }
+        },
+        &ctrl_c,
+    )
     .await
 }
 
 /// The read loop, generic over its input and prompt output so tests can drive
 /// it without a terminal.
-async fn repl<R, W, F>(mut input: R, stderr: &mut W, mut execute: F) -> Result<ExitCode>
+///
+/// Ctrl-C at the prompt throws away what has been typed of the current
+/// statement and starts over, as in psql. Stopping a running statement is
+/// up to `execute`.
+async fn repl<R, W, F>(input: R, stderr: &mut W, mut execute: F, ctrl_c: &CtrlC) -> Result<ExitCode>
 where
-    R: BufRead,
+    R: BufRead + Send + 'static,
     W: Write,
     F: AsyncFnMut(&str) -> Result<()>,
 {
@@ -84,24 +119,37 @@ where
         "dataglot shell — end statements with `;`; \\q or Ctrl-D to quit."
     );
 
+    let mut lines = read_lines(input);
     let mut buffer = StatementBuffer::default();
-    let mut raw = Vec::new();
     loop {
         let _ = write!(stderr, "{}", buffer.prompt());
         let _ = stderr.flush();
 
-        raw.clear();
-        if input.read_until(b'\n', &mut raw).context("reading stdin")? == 0 {
-            // Finish the prompt line, then run whatever is left: piped scripts
-            // often leave the `;` off their last statement.
-            let _ = writeln!(stderr);
-            if let Some(sql) = buffer.finish() {
-                if let Some(code) = run_statement(&mut execute, &sql, stderr).await {
-                    return Ok(code);
-                }
+        let seen = ctrl_c.count();
+        let read = tokio::select! {
+            read = lines.recv() => read,
+            () = ctrl_c.after(seen) => {
+                buffer = StatementBuffer::default();
+                let _ = writeln!(stderr);
+                continue;
             }
-            break;
-        }
+        };
+        let raw = match read {
+            Some(Ok(raw)) if !raw.is_empty() => raw,
+            Some(Err(e)) => return Err(e).context("reading stdin"),
+            // End of input.
+            Some(Ok(_)) | None => {
+                // Finish the prompt line, then run whatever is left: piped scripts
+                // often leave the `;` off their last statement.
+                let _ = writeln!(stderr);
+                if let Some(sql) = buffer.finish() {
+                    if let Some(code) = run_statement(&mut execute, &sql, stderr).await {
+                        return Ok(code);
+                    }
+                }
+                break;
+            }
+        };
         // Read bytes rather than lines: a terminal in a legacy code page can
         // send a byte that isn't UTF-8, and that shouldn't end the session.
         // It turns into U+FFFD and the statement fails or runs as usual.
@@ -120,6 +168,25 @@ where
     Ok(ExitCode::SUCCESS)
 }
 
+/// Read `input` line by line on a thread of its own. A blocking read on a
+/// runtime thread would stall the runtime, and it couldn't be raced against
+/// Ctrl-C. The last item is an empty line (end of input) or an error.
+fn read_lines<R>(mut input: R) -> mpsc::Receiver<std::io::Result<Vec<u8>>>
+where
+    R: BufRead + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel(1);
+    std::thread::spawn(move || loop {
+        let mut raw = Vec::new();
+        let read = input.read_until(b'\n', &mut raw).map(|_| raw);
+        let last = !matches!(&read, Ok(raw) if !raw.is_empty());
+        if tx.blocking_send(read).is_err() || last {
+            break;
+        }
+    });
+    rx
+}
+
 /// Run one statement and report its error. Returns an exit code only when the
 /// shell has to stop, which is when the server connection is gone.
 async fn run_statement<F, W>(execute: &mut F, sql: &str, stderr: &mut W) -> Option<ExitCode>
@@ -128,8 +195,13 @@ where
     W: Write,
 {
     let e = execute(sql).await.err()?;
+    let client_error = e.downcast_ref::<ClientError>();
+    if matches!(client_error, Some(ClientError::Cancelled)) {
+        let _ = writeln!(stderr, "Cancelled.");
+        return None;
+    }
     let _ = writeln!(stderr, "error: {e:#}");
-    e.downcast_ref::<ClientError>()
+    client_error
         .filter(|e| e.is_fatal())
         .map(ClientError::exit_code)
 }
@@ -409,7 +481,7 @@ mod tests {
         let mut ran = Vec::new();
         let mut stderr = Vec::new();
         repl(
-            Cursor::new(input.as_ref()),
+            Cursor::new(input.as_ref().to_vec()),
             &mut stderr,
             async |sql: &str| {
                 ran.push(sql.to_string());
@@ -418,6 +490,7 @@ mod tests {
                 }
                 Ok(())
             },
+            &CtrlC::never(),
         )
         .await
         .expect("repl");
@@ -443,6 +516,7 @@ mod tests {
                     _ => Ok(()),
                 }
             },
+            &CtrlC::never(),
         )
         .await
         .expect("repl");
@@ -455,6 +529,85 @@ mod tests {
             stderr.contains("error: lost the connection to localhost:5432: connection closed\n"),
             "{stderr}"
         );
+    }
+
+    /// Input that arrives when the test sends it, like a terminal.
+    struct Typed(std::sync::mpsc::Receiver<Vec<u8>>, Vec<u8>);
+
+    impl std::io::Read for Typed {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.1.is_empty() {
+                match self.0.recv() {
+                    Ok(bytes) => self.1 = bytes,
+                    // The test dropped its sender: end of input.
+                    Err(_) => return Ok(0),
+                }
+            }
+            let n = buf.len().min(self.1.len());
+            buf[..n].copy_from_slice(&self.1[..n]);
+            self.1.drain(..n);
+            Ok(n)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ctrl_c_at_the_prompt_drops_the_statement_being_typed() {
+        let (typing, typed) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (press, ctrl_c) = CtrlC::manual();
+        let user = tokio::spawn(async move {
+            let pause = || tokio::time::sleep(std::time::Duration::from_millis(100));
+            typing.send(b"SELECT 'half\n".to_vec()).expect("type");
+            pause().await;
+            press.send(1).expect("press");
+            pause().await;
+            typing.send(b"SELECT 2;\n".to_vec()).expect("type");
+            pause().await;
+            // Dropping `typing` here ends the input.
+        });
+        let mut ran = Vec::new();
+        let mut stderr = Vec::new();
+        repl(
+            std::io::BufReader::new(Typed(typed, Vec::new())),
+            &mut stderr,
+            async |sql: &str| {
+                ran.push(sql.to_string());
+                Ok(())
+            },
+            &ctrl_c,
+        )
+        .await
+        .expect("repl");
+        user.await.expect("typing task");
+        let stderr = String::from_utf8(stderr).expect("utf-8");
+        // The half-typed statement is gone; only the one after Ctrl-C ran.
+        assert_eq!(ran, ["SELECT 2"]);
+        // Inside the open string the prompt was `'>`; after Ctrl-C it's fresh.
+        assert!(stderr.contains("dataglot'> \ndataglot> "), "{stderr}");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_statement_is_reported_and_the_shell_goes_on() {
+        let mut ran = Vec::new();
+        let mut stderr = Vec::new();
+        let code = repl(
+            Cursor::new("SELECT slow;\nSELECT 2;\n"),
+            &mut stderr,
+            async |sql: &str| {
+                ran.push(sql.to_string());
+                if sql == "SELECT slow" {
+                    return Err(ClientError::Cancelled.into());
+                }
+                Ok(())
+            },
+            &CtrlC::never(),
+        )
+        .await
+        .expect("repl");
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(ran, ["SELECT slow", "SELECT 2"]);
+        let stderr = String::from_utf8(stderr).expect("utf-8");
+        assert!(stderr.contains("Cancelled.\n"), "{stderr}");
+        assert!(!stderr.contains("error:"), "{stderr}");
     }
 
     #[tokio::test]
@@ -541,6 +694,7 @@ mod tests {
                 );
                 Ok(())
             },
+            &CtrlC::never(),
         )
         .await
         .expect("repl");

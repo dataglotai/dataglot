@@ -29,6 +29,7 @@ use datafusion::prelude::SessionContext;
 use crate::cli::{Args, OutputFormat, QueryArgs};
 use crate::client::Endpoint;
 use crate::config::ServerConfig;
+use crate::interrupt::{CtrlC, INTERRUPTED};
 use crate::server::DataglotServer;
 
 /// Resolve the SQL text from the positional argument, `--file`, or stdin.
@@ -236,7 +237,8 @@ pub(crate) async fn build_session(args: &Args, user: &str) -> Result<EmbeddedSes
 /// If no SQL is provided, the engine fails to initialize, or the query fails.
 /// In client mode failures are reported on stderr and come back as the exit
 /// code instead (1 for a failed statement, 2 for a failed connection or an
-/// unusable profile).
+/// unusable profile). Ctrl-C stops the statement, cancelling it on the server
+/// in client mode, and exits 130.
 pub async fn run(args: &Args, q: &QueryArgs) -> Result<ExitCode> {
     // Before reading the SQL, so a bad profile doesn't wait on stdin first.
     let endpoint = match Endpoint::from_args(q.server.as_deref(), q.profile.as_deref()) {
@@ -251,19 +253,35 @@ pub async fn run(args: &Args, q: &QueryArgs) -> Result<ExitCode> {
     if sql.is_empty() {
         anyhow::bail!("no SQL provided (pass a statement, --file <path>, or pipe via stdin)");
     }
+    // Only now: with the handler in place, Ctrl-C can't interrupt the stdin
+    // read above any more.
+    let ctrl_c = CtrlC::listen();
     if let Some(endpoint) = endpoint {
-        return Ok(crate::client::run_query(
+        return Ok(crate::client::run_query_with_ctrl_c(
             endpoint,
             sql,
             q.format,
             &mut std::io::stdout(),
             &mut std::io::stderr(),
+            &ctrl_c,
         )
         .await);
     }
-    let session = build_session(args, &q.user).await?;
-    session.execute_and_print(sql, q.format).await?;
-    Ok(ExitCode::SUCCESS)
+
+    // Dropping the session's future stops the plan, so embedded mode needs
+    // no cancel request.
+    let embedded = async {
+        let session = build_session(args, &q.user).await?;
+        session.execute_and_print(sql, q.format).await
+    };
+
+    tokio::select! {
+        result = Box::pin(embedded) => result.map(|()| ExitCode::SUCCESS),
+        () = ctrl_c.after(0) => {
+            let _ = writeln!(std::io::stderr(), "Cancelled.");
+            Ok(ExitCode::from(INTERRUPTED))
+        }
+    }
 }
 
 /// Render `batches` to stdout in the requested format.

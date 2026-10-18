@@ -54,6 +54,7 @@ pub mod governance;
 // (config / JWT / LDAP) that populates `Identity::org_groups` from an external
 // identity provider.
 pub mod group_resolver;
+pub mod interrupt;
 // Internal — the EL upsert merge core is a server internal (touches warehouse
 // write internals); its REST-endpoint consumer lands in a follow-up. The two
 // symbols below are re-exported (module stays private) so the Trino-retirement
