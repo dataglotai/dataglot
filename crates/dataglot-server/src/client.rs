@@ -25,16 +25,19 @@ mod settings;
 use std::io::{BufWriter, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use datafusion::arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::error::ArrowError;
+use dataglot_federation::pg_tls::PgTls;
 use futures::StreamExt;
 use tokio_postgres::config::Host;
 use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres::{Config, NoTls, SimpleColumn, SimpleQueryMessage, SimpleQueryRow, Socket};
 
 use crate::cli::OutputFormat;
+use crate::interrupt::{CtrlC, INTERRUPTED};
 
 /// Rows per Arrow batch while a result streams in.
 const ROWS_PER_BATCH: usize = 1024;
@@ -72,6 +75,9 @@ pub enum ClientError {
     /// or a profile that can't be used as written.
     #[error("{0}")]
     Profile(String),
+    /// Ctrl-C stopped the statement. A cancel request went to the server.
+    #[error("query cancelled")]
+    Cancelled,
 }
 
 impl ClientError {
@@ -85,6 +91,7 @@ impl ClientError {
             | Self::ConnectionLost { .. }
             | Self::Profile(_) => ExitCode::from(2),
             Self::Statement(_) | Self::Output(_) => ExitCode::FAILURE,
+            Self::Cancelled => ExitCode::from(INTERRUPTED),
         }
     }
 
@@ -178,6 +185,8 @@ impl From<String> for Endpoint {
 pub struct RemoteSession {
     client: tokio_postgres::Client,
     target: String,
+    /// Kept for cancel requests, which open a connection of their own.
+    tls: Option<PgTls>,
 }
 
 impl RemoteSession {
@@ -211,7 +220,8 @@ impl RemoteSession {
         let settings =
             settings::resolve(&endpoint.server, &env).map_err(ClientError::InvalidServer)?;
         let target = target(&settings.config);
-        let opened = match settings.tls() {
+        let tls = settings.tls();
+        let opened = match tls.clone() {
             None => open(&settings.config, NoTls).await,
             Some(tls) => {
                 // Loading the trust store or CA file is blocking file I/O.
@@ -223,7 +233,11 @@ impl RemoteSession {
             }
         };
         match opened {
-            Ok(client) => Ok(Self { client, target }),
+            Ok(client) => Ok(Self {
+                client,
+                target,
+                tls,
+            }),
             Err(message) => Err(ClientError::Connect { target, message }),
         }
     }
@@ -293,6 +307,55 @@ impl RemoteSession {
         Ok(())
     }
 
+    /// Like [`Self::execute`], but Ctrl-C stops it: the server gets a cancel
+    /// request and this returns [`ClientError::Cancelled`] without waiting for
+    /// the server to confirm. The session stays usable.
+    ///
+    /// # Errors
+    /// As for [`Self::execute`], plus [`ClientError::Cancelled`].
+    pub async fn execute_until<W: Write>(
+        &self,
+        sql: &str,
+        format: OutputFormat,
+        out: &mut W,
+        ctrl_c: &CtrlC,
+    ) -> Result<(), ClientError> {
+        let seen = ctrl_c.count();
+        tokio::select! {
+            result = self.execute(sql, format, out) => result,
+            () = ctrl_c.after(seen) => {
+                // A second Ctrl-C stops waiting for the cancel request to go out.
+                tokio::select! {
+                    () = self.cancel() => {}
+                    () = ctrl_c.after(seen + 1) => {}
+                }
+                Err(ClientError::Cancelled)
+            }
+        }
+    }
+
+    /// Ask the server to stop whatever this session is running. Best effort:
+    /// failures are ignored and it gives up after two seconds.
+    pub async fn cancel(&self) {
+        let token = self.client.cancel_token();
+        let tls = self.tls.clone();
+        let send = async move {
+            match tls {
+                None => {
+                    let _ = token.cancel_query(NoTls).await;
+                }
+                Some(tls) => {
+                    if let Ok(Ok(connector)) =
+                        tokio::task::spawn_blocking(move || tls.make_connector()).await
+                    {
+                        let _ = token.cancel_query(connector).await;
+                    }
+                }
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(2), send).await;
+    }
+
     fn classify(&self, e: &tokio_postgres::Error) -> ClientError {
         // A FATAL from the server (shutdown, terminated backend) closes the
         // connection right after, possibly before `is_closed` notices.
@@ -344,12 +407,33 @@ pub async fn run_query<O: Write, E: Write>(
     out: &mut O,
     err: &mut E,
 ) -> ExitCode {
-    let result = match RemoteSession::connect_to(&endpoint.into()).await {
-        Ok(session) => session.execute(sql, format, out).await,
-        Err(e) => Err(e),
+    run_query_with_ctrl_c(endpoint, sql, format, out, err, &CtrlC::never()).await
+}
+
+/// [`run_query`] that stops on Ctrl-C: a statement gets cancelled on the
+/// server, and the exit code is 130.
+pub async fn run_query_with_ctrl_c<O: Write, E: Write>(
+    endpoint: impl Into<Endpoint>,
+    sql: &str,
+    format: OutputFormat,
+    out: &mut O,
+    err: &mut E,
+    ctrl_c: &CtrlC,
+) -> ExitCode {
+    let endpoint = endpoint.into();
+    let result = tokio::select! {
+        connected = RemoteSession::connect_to(&endpoint) => match connected {
+            Ok(session) => session.execute_until(sql, format, out, ctrl_c).await,
+            Err(e) => Err(e),
+        },
+        () = ctrl_c.after(0) => Err(ClientError::Cancelled),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(ClientError::Cancelled) => {
+            let _ = writeln!(err, "Cancelled.");
+            ExitCode::from(INTERRUPTED)
+        }
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
             e.exit_code()
@@ -560,6 +644,100 @@ mod tests {
         }
         .is_fatal());
         assert!(!ClientError::Statement(String::new()).is_fatal());
+    }
+
+    #[test]
+    fn cancelled_exits_130_and_isnt_fatal() {
+        assert_eq!(ClientError::Cancelled.exit_code(), ExitCode::from(130));
+        assert!(!ClientError::Cancelled.is_fatal());
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_before_the_connection_is_up_exits_130() {
+        let port = dataglot_test_support::reserve_loopback_port();
+        let (press, ctrl_c) = CtrlC::manual();
+        press.send(1).expect("press");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_query_with_ctrl_c(
+            format!("postgres://127.0.0.1:{port}"),
+            "SELECT 1",
+            OutputFormat::Table,
+            &mut out,
+            &mut err,
+            &ctrl_c,
+        )
+        .await;
+        assert_eq!(code, ExitCode::from(130));
+        assert_eq!(String::from_utf8(err).expect("utf-8"), "Cancelled.\n");
+    }
+
+    /// Ctrl-C during a long query cancels it on the server, so the same
+    /// connection is free for the next statement right away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ctrl_c_cancels_a_running_query_on_the_server() {
+        use std::time::{Duration, Instant};
+
+        let port = dataglot_test_support::reserve_loopback_port();
+        let config = crate::config::ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            observability: crate::observability::ObservabilityConfig {
+                metrics_addr: None,
+                ..crate::observability::ObservabilityConfig::default()
+            },
+            ..crate::config::ServerConfig::default()
+        };
+        let server = Box::pin(crate::server::DataglotServer::new(config))
+            .await
+            .expect("server boots");
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        let url = format!("postgres://127.0.0.1:{port}");
+        let mut session = None;
+        for _ in 0..50 {
+            if let Ok(connected) = RemoteSession::connect(&url).await {
+                session = Some(connected);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let session = session.expect("server ready");
+
+        let (press, ctrl_c) = CtrlC::manual();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = press.send(1);
+            // Keep the channel open so a second press never happens by accident.
+            std::future::pending::<()>().await;
+        });
+        let started = Instant::now();
+        let mut out = Vec::new();
+        let result = session
+            .execute_until(
+                "SELECT count(*) FROM generate_series(1, 100000000000)",
+                OutputFormat::Csv,
+                &mut out,
+                &ctrl_c,
+            )
+            .await;
+        assert!(matches!(result, Err(ClientError::Cancelled)), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancel took too long"
+        );
+
+        // If the server were still counting, this would queue behind it.
+        let mut out = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            session.execute("SELECT 1 AS n", OutputFormat::Csv, &mut out),
+        )
+        .await
+        .expect("the server stopped the cancelled query")
+        .expect("next statement runs");
+        assert_eq!(String::from_utf8(out).expect("utf-8"), "n\n1\n");
     }
 
     #[tokio::test]

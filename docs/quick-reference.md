@@ -157,7 +157,14 @@ dataglot shell --server postgres://admin@localhost:5432/files
 
 In this mode `--config` and `--user` don't apply. Values arrive as text, so
 `--format json` prints them as strings. Exit codes: 0 ok, 1 statement failed,
-2 no connection (couldn't connect, or lost it mid-session).
+2 no connection (couldn't connect, or lost it mid-session), 130 Ctrl-C.
+
+Ctrl-C works as in psql, with or without `--server`: it stops the running
+statement (with `--server` it also sends the server a cancel request, so the
+query stops there too). `query` then exits with 130; `shell` prints
+`Cancelled.` and stays open. At the shell prompt Ctrl-C throws away the
+statement being typed. `\q` or Ctrl-D quits.
+
 
 Connection settings follow psql. `sslmode` defaults to `prefer`: encrypted
 when the server offers TLS, without checking its certificate, same as
