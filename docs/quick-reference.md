@@ -173,6 +173,26 @@ ends up in shell history and the process list.
 PGPASSWORD=... dataglot query --server "postgres://alice@db.example.com/files?sslmode=verify-full" "SELECT 1"
 ```
 
+Connections you use often can go in a profiles file instead: `DATAGLOT_CLI_CONFIG`
+if set, otherwise `~/.config/dataglot/cli.toml` (`$XDG_CONFIG_HOME/dataglot/cli.toml`
+when that's set, `%APPDATA%\dataglot\cli.toml` on Windows):
+
+```toml
+[profiles.prod]
+url = "postgres://alice@db.example.com/files?sslmode=verify-full"
+password_env = "DATAGLOT_PROD_PASSWORD"   # optional; names a variable, never the password
+```
+
+```bash
+dataglot query --profile prod "SELECT 1"
+DATAGLOT_PROFILE=prod dataglot shell
+```
+
+`url` takes anything `--server` takes. A url with a password in it is refused;
+use `password_env` instead, which takes precedence over `PGPASSWORD`.
+`--profile` conflicts with `--server` and `--user`, and there is no default
+profile, so without either flag the CLI stays embedded.
+
 ## Dashboard
 
 - **Operational dashboard (served by the engine):** <http://127.0.0.1:9090/ui>
