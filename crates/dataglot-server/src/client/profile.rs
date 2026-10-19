@@ -81,7 +81,7 @@ pub(super) fn load_from(
         Err(e) => return Err(fail(format!("can't read {}: {e}", path.display()))),
     };
     let config: CliConfig =
-        toml::from_str(&text).map_err(|e| fail(format!("{}: {e}", path.display())))?;
+        toml::from_str(&text).map_err(|e| fail(parse_error(path, &text, &e)))?;
 
     let Some(profile) = config.profiles.get(name) else {
         let known: Vec<&str> = config.profiles.keys().map(String::as_str).collect();
@@ -121,6 +121,43 @@ pub(super) fn load_from(
         server: profile.url.clone(),
         password,
     })
+}
+
+/// toml's own `Display` quotes the line it choked on, and that line may be
+/// a password someone put in the file by mistake. Say which line instead.
+fn parse_error(path: &Path, text: &str, e: &toml::de::Error) -> String {
+    let message = without_value(e.message());
+    match e.span() {
+        Some(span) => {
+            let before = text.get(..span.start).unwrap_or(text);
+            let line = before.matches('\n').count() + 1;
+            format!("{}, line {line}: {message}", path.display())
+        }
+        None => format!("{}: {message}", path.display()),
+    }
+}
+
+/// serde puts the value it got into type errors (`invalid type: string
+/// "...", expected a map`). Keep what kind of value it was, drop the value.
+fn without_value(message: &str) -> String {
+    for prefix in ["invalid type: ", "invalid value: "] {
+        if let Some(rest) = message.strip_prefix(prefix) {
+            // The expected part comes from our own types, so split at the
+            // last one in case the value contains ", expected " itself.
+            let (found, expected) = rest.rsplit_once(", expected ").unwrap_or((rest, ""));
+            let kind = found
+                .split(['"', '`'])
+                .next()
+                .unwrap_or_default()
+                .trim_end();
+            return if expected.is_empty() {
+                format!("{prefix}{kind}")
+            } else {
+                format!("{prefix}{kind}, expected {expected}")
+            };
+        }
+    }
+    message.to_string()
 }
 
 #[cfg(test)]
@@ -250,6 +287,56 @@ mod tests {
                 "the password must not be echoed: {err}"
             );
         }
+    }
+
+    /// A broken file must not put its contents on stderr: the line toml
+    /// stopped at may be a password.
+    #[test]
+    fn parse_errors_say_which_line_without_echoing_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases = [
+            (
+                "[profiles.p]\nurl = \"postgres://h\"\npassword = \"s3cret-PROD-pw\"\n",
+                "line 3: unknown field `password`, expected `url` or `password_env`",
+            ),
+            (
+                "[profiles.p]\nurl = \"postgres://h\"\npassword = s3cret-PROD-pw\n",
+                "line 3: string values must be quoted",
+            ),
+            (
+                "profiles = \"s3cret-PROD-pw\"\n",
+                "line 1: invalid type: string, expected a map",
+            ),
+            (
+                "[profiles.p]\nurl = \"postgres://h\"\npassword_env = 20481024\n",
+                "line 3: invalid type: integer, expected a string",
+            ),
+        ];
+        for (text, expected) in cases {
+            let path = write(&dir, text);
+            let err = message(load_from(&path, "p", &env_of(&[])));
+            assert!(err.contains(expected), "{text:?}: {err}");
+            assert!(
+                !err.contains("s3cret") && !err.contains("20481024"),
+                "the value must not be echoed: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_value_keeps_the_kind_and_drops_the_value() {
+        assert_eq!(
+            without_value("invalid type: string \"a, expected b\", expected a map"),
+            "invalid type: string, expected a map"
+        );
+        assert_eq!(
+            without_value("invalid type: floating point `1.5`, expected a string"),
+            "invalid type: floating point, expected a string"
+        );
+        assert_eq!(
+            without_value("unknown field `x`, expected `url`"),
+            "unknown field `x`, expected `url`"
+        );
     }
 
     #[test]
