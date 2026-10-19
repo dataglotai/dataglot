@@ -296,15 +296,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cases = [
             (
-                "[profiles.p]\nurl = \"postgres://h\"\npassword = \"s3cret-PROD-pw\"\n",
+                "[profiles.p]\nurl = \"postgres://h\"\npassword = \"s3cret\"\n",
                 "line 3: unknown field `password`, expected `url` or `password_env`",
             ),
             (
-                "[profiles.p]\nurl = \"postgres://h\"\npassword = s3cret-PROD-pw\n",
+                "[profiles.p]\nurl = \"postgres://h\"\npassword = s3cret\n",
                 "line 3: string values must be quoted",
             ),
             (
-                "profiles = \"s3cret-PROD-pw\"\n",
+                "profiles = \"s3cret\"\n",
                 "line 1: invalid type: string, expected a map",
             ),
             (
