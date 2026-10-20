@@ -155,6 +155,12 @@ async fn run() -> Result<ExitCode> {
         return dataglot_server::shell::run(&args, s).await;
     }
 
+    // Ops short-circuit: read a running server's HTTP API and exit. Needs no
+    // config of its own.
+    if let Some(dataglot_server::cli::Command::Ops(o)) = &args.command {
+        return Ok(dataglot_server::ops::run(o).await);
+    }
+
     // Load configuration
     let config = ServerConfig::load(&args)?;
 
