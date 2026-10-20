@@ -9,6 +9,11 @@
 //! `url` takes the same values as `--server`. Passwords never go in the
 //! file: `password_env` names the environment variable that holds one, and a
 //! url with a password in it is refused.
+//!
+//! A profile can also point `dataglot ops` at the same server: `api_url` is
+//! its HTTP API (the metrics address), `explain_url` its policy-explain
+//! endpoint, and `api_token_env` names the variable holding the bearer token
+//! for both. They're optional, and only `dataglot ops` reads them.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +34,34 @@ struct CliConfig {
 struct Profile {
     url: String,
     password_env: Option<String>,
+    api_url: Option<String>,
+    explain_url: Option<String>,
+    api_token_env: Option<String>,
+}
+
+/// What a profile says about the server's HTTP endpoints, for `dataglot ops`.
+///
+/// No `Debug`, so the token can't end up in a log line by accident.
+pub struct OpsTarget {
+    /// The HTTP API (metrics address), if the profile names one.
+    pub api_url: Option<String>,
+    /// The policy-explain endpoint, if the profile names one.
+    pub explain_url: Option<String>,
+    /// The bearer token from the variable `api_token_env` names, if set.
+    pub token: Option<String>,
+}
+
+impl OpsTarget {
+    /// Look up profile `name` in the default profiles file (see
+    /// [`super::Endpoint::from_profile`] for where that is).
+    ///
+    /// # Errors
+    /// [`ClientError::Profile`] if the file or the profile can't be used,
+    /// a URL carries a password, or `api_token_env` names an unset variable.
+    pub fn from_profile(name: &str) -> Result<Self, ClientError> {
+        let env = |key: &str| std::env::var(key).ok();
+        load_ops_from(&default_path(&env)?, name, &env)
+    }
 }
 
 /// Where the profiles file is: `DATAGLOT_CLI_CONFIG` if set, otherwise
@@ -50,16 +83,19 @@ fn config_path(env: &dyn Fn(&str) -> Option<String>, windows: bool) -> Option<Pa
     Some(base.join("dataglot").join("cli.toml"))
 }
 
-/// Look up profile `name` in the default profiles file.
-pub(super) fn load(name: &str) -> Result<Endpoint, ClientError> {
-    let env = |key: &str| std::env::var(key).ok();
-    let path = config_path(&env, cfg!(windows)).ok_or_else(|| {
+fn default_path(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, ClientError> {
+    config_path(env, cfg!(windows)).ok_or_else(|| {
         ClientError::Profile(
             "can't tell where the profiles file is; set DATAGLOT_CLI_CONFIG to its path"
                 .to_string(),
         )
-    })?;
-    load_from(&path, name, &env)
+    })
+}
+
+/// Look up profile `name` in the default profiles file.
+pub(super) fn load(name: &str) -> Result<Endpoint, ClientError> {
+    let env = |key: &str| std::env::var(key).ok();
+    load_from(&default_path(&env)?, name, &env)
 }
 
 /// Look up profile `name` in the file at `path`. `env` supplies the
@@ -70,31 +106,7 @@ pub(super) fn load_from(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Endpoint, ClientError> {
     let fail = |message: String| ClientError::Profile(message);
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(fail(format!(
-                "no profiles file at {} (set DATAGLOT_CLI_CONFIG to use another one)",
-                path.display()
-            )));
-        }
-        Err(e) => return Err(fail(format!("can't read {}: {e}", path.display()))),
-    };
-    let config: CliConfig =
-        toml::from_str(&text).map_err(|e| fail(parse_error(path, &text, &e)))?;
-
-    let Some(profile) = config.profiles.get(name) else {
-        let known: Vec<&str> = config.profiles.keys().map(String::as_str).collect();
-        return Err(fail(if known.is_empty() {
-            format!("no profiles in {}", path.display())
-        } else {
-            format!(
-                "no profile \"{name}\" in {} (profiles there: {})",
-                path.display(),
-                known.join(", ")
-            )
-        }));
-    };
+    let profile = find(path, name)?;
 
     // Parse with an empty environment so only the url itself counts.
     let parsed = super::settings::resolve(&profile.url, &|_| None)
@@ -118,9 +130,81 @@ pub(super) fn load_from(
         },
     };
     Ok(Endpoint {
-        server: profile.url.clone(),
+        server: profile.url,
         password,
     })
+}
+
+/// The `dataglot ops` side of profile `name` in the file at `path`.
+fn load_ops_from(
+    path: &Path,
+    name: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<OpsTarget, ClientError> {
+    let fail = |message: String| ClientError::Profile(message);
+    let profile = find(path, name)?;
+    for (key, value) in [
+        ("api_url", &profile.api_url),
+        ("explain_url", &profile.explain_url),
+    ] {
+        let has_password = value
+            .as_deref()
+            .and_then(|url| reqwest::Url::parse(url).ok())
+            .is_some_and(|url| url.password().is_some());
+        if has_password {
+            return Err(fail(format!(
+                "profile \"{name}\" has a password in its {key}; put the token in an \
+                 environment variable and name that variable with api_token_env"
+            )));
+        }
+    }
+    let token = match &profile.api_token_env {
+        None => None,
+        Some(var) => match env(var).filter(|value| !value.is_empty()) {
+            Some(token) => Some(token),
+            None => {
+                return Err(fail(format!(
+                    "profile \"{name}\" reads its API token from {var}, which isn't set"
+                )));
+            }
+        },
+    };
+    Ok(OpsTarget {
+        api_url: profile.api_url,
+        explain_url: profile.explain_url,
+        token,
+    })
+}
+
+/// Read the file at `path` and take profile `name` out of it.
+fn find(path: &Path, name: &str) -> Result<Profile, ClientError> {
+    let fail = |message: String| ClientError::Profile(message);
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(fail(format!(
+                "no profiles file at {} (set DATAGLOT_CLI_CONFIG to use another one)",
+                path.display()
+            )));
+        }
+        Err(e) => return Err(fail(format!("can't read {}: {e}", path.display()))),
+    };
+    let mut config: CliConfig =
+        toml::from_str(&text).map_err(|e| fail(parse_error(path, &text, &e)))?;
+
+    let Some(profile) = config.profiles.remove(name) else {
+        let known: Vec<&str> = config.profiles.keys().map(String::as_str).collect();
+        return Err(fail(if known.is_empty() {
+            format!("no profiles in {}", path.display())
+        } else {
+            format!(
+                "no profile \"{name}\" in {} (profiles there: {})",
+                path.display(),
+                known.join(", ")
+            )
+        }));
+    };
+    Ok(profile)
 }
 
 /// toml's own `Display` quotes the line it choked on, and that line may be
@@ -297,7 +381,7 @@ mod tests {
         let cases = [
             (
                 "[profiles.p]\nurl = \"postgres://h\"\npassword = \"s3cret\"\n",
-                "line 3: unknown field `password`, expected `url` or `password_env`",
+                "line 3: unknown field `password`, expected one of `url`, `password_env`,",
             ),
             (
                 "[profiles.p]\nurl = \"postgres://h\"\npassword = s3cret\n",
@@ -337,6 +421,64 @@ mod tests {
             without_value("unknown field `x`, expected `url`"),
             "unknown field `x`, expected `url`"
         );
+    }
+
+    #[test]
+    fn ops_settings_come_from_the_same_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write(
+            &dir,
+            r#"
+            [profiles.prod]
+            url = "postgres://alice@db.example.com/files"
+            api_url = "https://db.example.com:9090"
+            explain_url = "https://db.example.com:8085"
+            api_token_env = "PROD_API_TOKEN"
+
+            [profiles.sql_only]
+            url = "postgres://h"
+            "#,
+        );
+        let env = env_of(&[("PROD_API_TOKEN", "t0ken")]);
+
+        let prod = load_ops_from(&path, "prod", &env).expect("prod");
+        assert_eq!(prod.api_url.as_deref(), Some("https://db.example.com:9090"));
+        assert_eq!(
+            prod.explain_url.as_deref(),
+            Some("https://db.example.com:8085")
+        );
+        assert_eq!(prod.token.as_deref(), Some("t0ken"));
+
+        let sql_only = load_ops_from(&path, "sql_only", &env).expect("sql_only");
+        assert!(sql_only.api_url.is_none() && sql_only.explain_url.is_none());
+        assert!(sql_only.token.is_none());
+
+        // The pg-wire side ignores the new fields.
+        let endpoint = load_from(&path, "prod", &env).expect("endpoint");
+        assert_eq!(endpoint.server, "postgres://alice@db.example.com/files");
+
+        let Err(e) = load_ops_from(&path, "prod", &env_of(&[])) else {
+            panic!("an unset api_token_env must be an error");
+        };
+        assert_eq!(
+            e.to_string(),
+            "profile \"prod\" reads its API token from PROD_API_TOKEN, which isn't set"
+        );
+    }
+
+    #[test]
+    fn ops_urls_with_a_password_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write(
+            &dir,
+            "[profiles.p]\nurl = \"postgres://h\"\napi_url = \"http://ops:s3cret@h:9090\"\n",
+        );
+        let Err(e) = load_ops_from(&path, "p", &env_of(&[])) else {
+            panic!("a password in api_url must be refused");
+        };
+        let err = e.to_string();
+        assert!(err.contains("has a password in its api_url"), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
     }
 
     #[test]

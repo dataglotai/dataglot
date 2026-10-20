@@ -168,11 +168,19 @@ pub enum Command {
     /// Look at a running server: its settings, sources, sessions and queries.
     ///
     /// Reads the HTTP API the dashboard uses, on the server's metrics address
-    /// (`--api`, default `http://127.0.0.1:9090`). Read-only.
+    /// (`--api`, default `http://127.0.0.1:9090`). Everything is read-only
+    /// except `queries cancel`.
     #[command(after_long_help = "Examples:
     dataglot ops status
     dataglot ops queries history --format csv
-    dataglot ops sessions --api http://db.example.com:9090")]
+    dataglot ops queries cancel 6f1c2a9e-...
+    dataglot ops policy explain --user alice \"SELECT * FROM files.public.users\"
+    dataglot ops sessions --api http://db.example.com:9090
+    dataglot ops status --profile prod
+
+    A bearer token for the server, when it needs one, comes from DATAGLOT_API_TOKEN
+    or from the variable a profile's api_token_env names. It's never a flag, so it
+    doesn't end up in shell history.")]
     Ops(OpsArgs),
 
     /// Print a shell completion script to stdout and exit.
@@ -233,15 +241,27 @@ pub struct ShellArgs {
 #[derive(clap::Args, Debug)]
 pub struct OpsArgs {
     /// Base URL of the server's HTTP API, which is its metrics address
-    /// (`metrics_addr` / `--metrics-addr` on the server).
+    /// (`metrics_addr` / `--metrics-addr` on the server). Default
+    /// `http://127.0.0.1:9090`.
+    #[arg(long, value_name = "URL", env = "DATAGLOT_API", global = true)]
+    pub api: Option<String>,
+
+    /// Base URL of the server's policy-explain endpoint (`[policy_explain]
+    /// addr`), used by `policy explain`. Default `http://127.0.0.1:8085`.
+    #[arg(long, value_name = "URL", env = "DATAGLOT_EXPLAIN_API", global = true)]
+    pub explain_api: Option<String>,
+
+    /// Take `--api`, `--explain-api` and the token from this profile
+    /// (`api_url`, `explain_url`, `api_token_env`), from the same file as
+    /// `query --profile`.
     #[arg(
         long,
-        value_name = "URL",
-        env = "DATAGLOT_API",
-        default_value = "http://127.0.0.1:9090",
-        global = true
+        value_name = "NAME",
+        env = "DATAGLOT_PROFILE",
+        global = true,
+        conflicts_with_all = ["api", "explain_api"]
     )]
-    pub api: String,
+    pub profile: Option<String>,
 
     /// Output format. `json` prints the server's response unchanged, with
     /// every field; table and CSV show a selection.
@@ -262,11 +282,14 @@ pub enum OpsCommand {
     Sources,
     /// Connected pg-wire sessions, longest-connected first.
     Sessions,
-    /// Running queries, longest-running first; `history` for finished ones.
+    /// Running queries, longest-running first; `history` for finished ones,
+    /// `cancel <RUN_ID>` to stop one.
     Queries(QueriesArgs),
     /// Catalogs, secrets (names only), users, roles, grants and policies in
     /// the server's meta store.
     ControlPlane,
+    /// Which masks, row filters and denials a query would get.
+    Policy(PolicyArgs),
 }
 
 /// Arguments for `dataglot ops queries`.
@@ -277,13 +300,40 @@ pub struct QueriesArgs {
     pub command: Option<QueriesCommand>,
 }
 
-/// `dataglot ops queries` and `dataglot ops queries history`.
-#[derive(clap::Subcommand, Debug, Clone, Copy)]
+/// `dataglot ops queries` and its subcommands.
+#[derive(clap::Subcommand, Debug)]
 pub enum QueriesCommand {
     /// Running queries (the default).
     List,
     /// Recently finished queries, newest first.
     History,
+    /// Stop a running query. The run id is the first column of `queries`.
+    Cancel {
+        /// Run id of the query to stop.
+        run_id: String,
+    },
+}
+
+/// Arguments for `dataglot ops policy`.
+#[derive(clap::Args, Debug)]
+pub struct PolicyArgs {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: PolicyCommand,
+}
+
+/// `dataglot ops policy` subcommands.
+#[derive(clap::Subcommand, Debug)]
+pub enum PolicyCommand {
+    /// Show the policy decisions a query would get, without running it. Needs
+    /// the server's `[policy_explain]` endpoint.
+    Explain {
+        /// Evaluate for this user. Leave out for an anonymous session.
+        #[arg(long)]
+        user: Option<String>,
+        /// The query to explain.
+        sql: String,
+    },
 }
 
 /// Arguments for `dataglot completions`.
