@@ -22,6 +22,8 @@
 mod profile;
 mod settings;
 
+pub use profile::OpsTarget;
+
 use std::io::{BufWriter, Write};
 use std::process::ExitCode;
 use std::sync::Arc;

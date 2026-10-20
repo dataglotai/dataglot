@@ -211,12 +211,28 @@ dataglot ops sessions                # connected pg-wire sessions
 dataglot ops queries                 # running queries
 dataglot ops queries history         # recently finished ones
 dataglot ops control-plane           # objects in the meta store (needs [catalog_service])
+dataglot ops queries cancel <RUN_ID> # stop a running query
+dataglot ops policy explain --user alice "SELECT * FROM files.public.users"
 ```
 
-All of them are read-only. `--format csv` works as for `query`; `--format json`
-prints the server's response unchanged, with every field. Exit codes: 0 ok,
-1 the server answered with an error, 2 no usable answer (nothing listening,
-or not a Dataglot API).
+Everything except `queries cancel` is read-only. `policy explain` talks to the
+`[policy_explain]` endpoint instead, at `--explain-api <URL>` or
+`DATAGLOT_EXPLAIN_API` (default `http://127.0.0.1:8085`). `--format csv` works
+as for `query`; `--format json` prints the server's response unchanged, with
+every field. Exit codes: 0 ok, 1 the server answered with an error, 2 no usable
+answer (nothing listening, or not a Dataglot API).
+
+When the server wants a bearer token (`[policy_explain] token_env`), put it in
+`DATAGLOT_API_TOKEN`; it's sent with every request. A profile can carry the
+ops addresses too, so `--profile prod` works for `ops` as for `query`:
+
+```toml
+[profiles.prod]
+url = "postgres://alice@db.example.com/files?sslmode=verify-full"
+api_url = "https://db.example.com:9090"
+explain_url = "https://db.example.com:8085"
+api_token_env = "DATAGLOT_PROD_API_TOKEN"   # optional; names a variable, never the token
+```
 
 ## Dashboard
 
