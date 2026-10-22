@@ -1,6 +1,7 @@
 //! Client mode TLS and password handling against a real `DataglotServer`.
 //!
 //! One server requires TLS on pg-wire, so a plaintext client can't get in.
+//! Its certificates come from a CA generated per test with rcgen.
 //! Another uses `scram-sha-256` auth for the password cases, including a
 //! connection profile that reads its password from `password_env`.
 
@@ -16,31 +17,40 @@ use dataglot_server::config::{
 };
 use dataglot_server::observability::ObservabilityConfig;
 use dataglot_server::server::DataglotServer;
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use tempfile::TempDir;
 
-// Self-signed P-256 cert (CN=scheduler.local), shared with dataglot-ballista's
-// TLS tests; its key is allowlisted in .gitleaks.toml. It's a CA certificate,
-// which rustls never accepts as a server certificate, so every verifying mode
-// has to reject it. `prefer` and `require` don't check it and connect fine.
-const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
-MIIBiDCCAS+gAwIBAgIUb98gUuOUxnAhMfepW6NntDu7VZYwCgYIKoZIzj0EAwIw
-GjEYMBYGA1UEAwwPc2NoZWR1bGVyLmxvY2FsMB4XDTI2MDcyNjEyMDAyNVoXDTM2
-MDcyMzEyMDAyNVowGjEYMBYGA1UEAwwPc2NoZWR1bGVyLmxvY2FsMFkwEwYHKoZI
-zj0CAQYIKoZIzj0DAQcDQgAETzUXqYk4eMz44cNunQlm7aThDOPr2ndG7Rb9qeEC
-xMBm6J+Asof4pj0OylI2atId/rEQqrKQLcilncVtPmgkrKNTMFEwHQYDVR0OBBYE
-FIxfUshEjRv4FhU87aYS6QYBDn4hMB8GA1UdIwQYMBaAFIxfUshEjRv4FhU87aYS
-6QYBDn4hMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgKHi1cNac
-966q2qODy0xn8Pap2NHo8xJURe37PdrfChECIBasPNSDlU7Ze5Bj2wpdAH5Hb4E3
-ad3f4PDq8AK0DZyR
------END CERTIFICATE-----
-";
+/// A CA, and a server certificate it signed, all as PEM. Generated on every
+/// run, so no private key lives in the repository.
+struct Pki {
+    ca: String,
+    cert: String,
+    key: String,
+}
 
-const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg39O4wyy9L1tFEkod
-yvaloMCgN5HGjXQ95KMlDfK/8E+hRANCAARPNRepiTh4zPjhw26dCWbtpOEM4+va
-d0btFv2p4QLEwGbon4Cyh/imPQ7KUjZq0h3+sRCqspAtyKWdxW0+aCSs
------END PRIVATE KEY-----
-";
+/// A fresh CA and a server certificate from it, valid for `names`.
+fn issue(names: &[&str]) -> Pki {
+    let ca_key = KeyPair::generate().expect("CA key");
+    let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca.distinguished_name
+        .push(DnType::CommonName, "dataglot test CA");
+    ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca_cert = ca.self_signed(&ca_key).expect("self-sign CA");
+    let issuer = Issuer::new(ca, ca_key);
+
+    let key = KeyPair::generate().expect("server key");
+    let names: Vec<String> = names.iter().map(ToString::to_string).collect();
+    let cert = CertificateParams::new(names)
+        .expect("server params")
+        .signed_by(&key, &issuer)
+        .expect("sign server certificate");
+    Pki {
+        ca: ca_cert.pem(),
+        cert: cert.pem(),
+        key: key.serialize_pem(),
+    }
+}
 
 fn base_config(port: u16) -> ServerConfig {
     ServerConfig {
@@ -72,18 +82,30 @@ async fn start(config: ServerConfig, ready_url: &str) {
     panic!("server did not become ready for {ready_url}");
 }
 
-/// A server that only accepts TLS connections. Returns its base URL and
-/// the path of its certificate.
-async fn boot_tls_only() -> (String, String, TempDir) {
+/// A server that only accepts TLS connections.
+struct TlsServer {
+    /// `postgres://dataglot@127.0.0.1:<port>`
+    url: String,
+    /// Path of the CA that signed the server's certificate, ready for
+    /// `sslrootcert=`.
+    ca: String,
+    _dir: TempDir,
+}
+
+/// Boot a TLS-only server whose certificate is valid for `names`.
+async fn boot_tls_only(names: &[&str]) -> TlsServer {
+    let pki = issue(names);
     let dir = tempfile::tempdir().expect("tempdir");
+    let ca = dir.path().join("ca.pem");
     let cert = dir.path().join("cert.pem");
     let key = dir.path().join("key.pem");
-    std::fs::write(&cert, CERT_PEM).expect("write cert");
-    std::fs::write(&key, KEY_PEM).expect("write key");
+    std::fs::write(&ca, &pki.ca).expect("write CA");
+    std::fs::write(&cert, &pki.cert).expect("write cert");
+    std::fs::write(&key, &pki.key).expect("write key");
     let port = dataglot_test_support::reserve_loopback_port();
     let config = ServerConfig {
         pgwire_tls: Some(PgwireTlsConfig {
-            cert_file: cert.clone(),
+            cert_file: cert,
             key_file: key,
             mode: PgwireTlsMode::Require,
         }),
@@ -91,7 +113,18 @@ async fn boot_tls_only() -> (String, String, TempDir) {
     };
     let url = format!("postgres://dataglot@127.0.0.1:{port}");
     start(config, &format!("{url}?sslmode=require")).await;
-    (url, path_for_url(&cert), dir)
+    TlsServer {
+        url,
+        ca: path_for_url(&ca),
+        _dir: dir,
+    }
+}
+
+/// Write `pem` to a file in `dir` and return its path for `sslrootcert=`.
+fn root_file(dir: &TempDir, pem: &str) -> String {
+    let path = dir.path().join("other-ca.pem");
+    std::fs::write(&path, pem).expect("write root");
+    path_for_url(&path)
 }
 
 /// Forward slashes, so the path can go into a URL on Windows too.
@@ -117,21 +150,25 @@ async fn query(server: &str) -> (ExitCode, String, String) {
     )
 }
 
+/// The names the test server's certificate is valid for.
+const SERVER_NAMES: &[&str] = &["127.0.0.1", "localhost"];
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn require_and_prefer_connect_over_tls() {
-    let (url, _cert, _dir) = boot_tls_only().await;
+    let server = boot_tls_only(SERVER_NAMES).await;
+    let url = &server.url;
     // The server refuses plaintext, so getting a result proves TLS was used.
-    for server in [format!("{url}?sslmode=require"), url.clone()] {
-        let (code, out, err) = query(&server).await;
-        assert_eq!(code, ExitCode::SUCCESS, "{server}: {err}");
-        assert_eq!(out, "n\n1\n", "{server}");
+    for target in [format!("{url}?sslmode=require"), url.clone()] {
+        let (code, out, err) = query(&target).await;
+        assert_eq!(code, ExitCode::SUCCESS, "{target}: {err}");
+        assert_eq!(out, "n\n1\n", "{target}");
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disable_is_plaintext_and_gets_refused() {
-    let (url, _cert, _dir) = boot_tls_only().await;
-    let (code, out, err) = query(&format!("{url}?sslmode=disable")).await;
+    let server = boot_tls_only(SERVER_NAMES).await;
+    let (code, out, err) = query(&format!("{}?sslmode=disable", server.url)).await;
     assert_eq!(code, ExitCode::from(2), "{err}");
     assert_eq!(out, "");
     assert!(
@@ -141,31 +178,62 @@ async fn disable_is_plaintext_and_gets_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verifying_modes_accept_a_certificate_from_the_given_root() {
+    let server = boot_tls_only(SERVER_NAMES).await;
+    let (url, ca) = (&server.url, &server.ca);
+    for target in [
+        format!("{url}?sslmode=verify-full&sslrootcert={ca}"),
+        format!("{url}?sslmode=verify-ca&sslrootcert={ca}"),
+        // A root certificate makes `require` verify too, as in libpq.
+        format!("{url}?sslmode=require&sslrootcert={ca}"),
+    ] {
+        let (code, out, err) = query(&target).await;
+        assert_eq!(code, ExitCode::SUCCESS, "{target}: {err}");
+        assert_eq!(out, "n\n1\n", "{target}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verifying_modes_reject_an_untrusted_certificate() {
-    let (url, cert, _dir) = boot_tls_only().await;
-    for server in [
+    let server = boot_tls_only(SERVER_NAMES).await;
+    let url = &server.url;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let other_ca = root_file(&dir, &issue(SERVER_NAMES).ca);
+    for target in [
         // Not signed by anything in the OS trust store.
         format!("{url}?sslmode=verify-full"),
         format!("{url}?sslmode=verify-ca"),
-        // Trusted as a root, but still not usable as a server certificate.
-        format!("{url}?sslmode=verify-full&sslrootcert={cert}"),
-        // A root certificate makes `require` verify too, as in libpq.
-        format!("{url}?sslmode=require&sslrootcert={cert}"),
+        // Signed, but not by the root we were told to trust.
+        format!("{url}?sslmode=verify-full&sslrootcert={other_ca}"),
+        format!("{url}?sslmode=require&sslrootcert={other_ca}"),
     ] {
-        let (code, _, err) = query(&server).await;
-        assert_eq!(code, ExitCode::from(2), "expected connection failure");
-        assert!(
-            err.contains("certificate"),
-            "expected certificate-related error"
-        );
+        let (code, _, err) = query(&target).await;
+        assert_eq!(code, ExitCode::from(2), "{target}: expected a failure");
+        assert!(err.contains("invalid peer certificate"), "{target}: {err}");
+    }
+}
+
+/// Unlike libpq, `verify-ca` checks the host name too (see
+/// `docs/quick-reference.md`), so both verifying modes refuse a certificate
+/// issued for another host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verifying_modes_reject_a_certificate_for_another_host() {
+    let server = boot_tls_only(&["db.example.com"]).await;
+    let (url, ca) = (&server.url, &server.ca);
+    for mode in ["verify-full", "verify-ca"] {
+        let target = format!("{url}?sslmode={mode}&sslrootcert={ca}");
+        let (code, _, err) = query(&target).await;
+        assert_eq!(code, ExitCode::from(2), "{target}: expected a failure");
+        assert!(err.contains("not valid for name"), "{target}: {err}");
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_missing_root_certificate_file_is_reported() {
-    let (url, _cert, _dir) = boot_tls_only().await;
+    let server = boot_tls_only(SERVER_NAMES).await;
     let (code, _, err) = query(&format!(
-        "{url}?sslmode=verify-full&sslrootcert=/no/such/dir/ca.pem"
+        "{}?sslmode=verify-full&sslrootcert=/no/such/dir/ca.pem",
+        server.url
     ))
     .await;
     assert_eq!(code, ExitCode::from(2), "{err}");

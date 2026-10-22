@@ -249,6 +249,8 @@ adbc_driver_manager.workspace = true
 # table. Pinned to v58 to match `arrow` and the rest of the
 # workspace's parquet usage in `dataglot-tests`.
 parquet.workspace = true
+# Generates the CA and server certificates for tests/client_tls_e2e.rs.
+rcgen.workspace = true
 tempfile.workspace = true
 # Test-only: the materialization tests (src/materialization.rs) build an
 # in-memory warehouse (MemoryCatalog + LocalFs) to exercise the refresh

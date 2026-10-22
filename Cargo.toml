@@ -181,6 +181,9 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 rstest = "0.26"
+# Certificates generated at test time, so no private key is committed. Its
+# default crypto backend is ring, the one rustls already uses here.
+rcgen = "0.14"
 
 # Testing - Property-based
 proptest = "1.4"
