@@ -144,7 +144,7 @@ file > default.
 
 Subcommands: `dataglot init` (write a starter config) · `dataglot query "<SQL>"`
 (one-shot, in-process, no server) · `dataglot shell` (REPL) ·
-`dataglot completions`.
+`dataglot ops` (look at a running server) · `dataglot completions`.
 
 `query` and `shell` take `--server <URL>` (or `DATAGLOT_SERVER`) to run against
 a running server over pgwire instead of in-process. The server then handles
@@ -199,6 +199,24 @@ DATAGLOT_PROFILE=prod dataglot shell
 use `password_env` instead, which takes precedence over `PGPASSWORD`.
 `--profile` conflicts with `--server` and `--user`, and there is no default
 profile, so without either flag the CLI stays embedded.
+
+`dataglot ops` reads a running server's HTTP API, the one the dashboard uses,
+on its metrics address. Point it elsewhere with `--api <URL>` or
+`DATAGLOT_API` (default `http://127.0.0.1:9090`):
+
+```bash
+dataglot ops status                  # versions, ports, auth and governance settings
+dataglot ops sources                 # configured catalogs and whether they're reachable
+dataglot ops sessions                # connected pg-wire sessions
+dataglot ops queries                 # running queries
+dataglot ops queries history         # recently finished ones
+dataglot ops control-plane           # objects in the meta store (needs [catalog_service])
+```
+
+All of them are read-only. `--format csv` works as for `query`; `--format json`
+prints the server's response unchanged, with every field. Exit codes: 0 ok,
+1 the server answered with an error, 2 no usable answer (nothing listening,
+or not a Dataglot API).
 
 ## Dashboard
 

@@ -78,6 +78,7 @@ pub use maintenance::{
     build_compaction_jobs, build_orphan_sweep_jobs, compact_table, CompactOutcome,
 };
 pub mod observability;
+pub mod ops;
 pub mod policy_admin;
 pub mod policy_explain;
 pub mod propagation;

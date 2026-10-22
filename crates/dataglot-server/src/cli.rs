@@ -165,6 +165,16 @@ pub enum Command {
     /// With `--server <URL>` it talks to a running server instead.
     Shell(ShellArgs),
 
+    /// Look at a running server: its settings, sources, sessions and queries.
+    ///
+    /// Reads the HTTP API the dashboard uses, on the server's metrics address
+    /// (`--api`, default `http://127.0.0.1:9090`). Read-only.
+    #[command(after_long_help = "Examples:
+    dataglot ops status
+    dataglot ops queries history --format csv
+    dataglot ops sessions --api http://db.example.com:9090")]
+    Ops(OpsArgs),
+
     /// Print a shell completion script to stdout and exit.
     ///
     /// Install it where your shell looks for completions, e.g.:
@@ -217,6 +227,63 @@ pub struct ShellArgs {
         conflicts_with = "server"
     )]
     pub profile: Option<String>,
+}
+
+/// Arguments for `dataglot ops`.
+#[derive(clap::Args, Debug)]
+pub struct OpsArgs {
+    /// Base URL of the server's HTTP API, which is its metrics address
+    /// (`metrics_addr` / `--metrics-addr` on the server).
+    #[arg(
+        long,
+        value_name = "URL",
+        env = "DATAGLOT_API",
+        default_value = "http://127.0.0.1:9090",
+        global = true
+    )]
+    pub api: String,
+
+    /// Output format. `json` prints the server's response unchanged, with
+    /// every field; table and CSV show a selection.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table, global = true)]
+    pub format: OutputFormat,
+
+    /// What to show.
+    #[command(subcommand)]
+    pub command: OpsCommand,
+}
+
+/// The `dataglot ops` commands.
+#[derive(clap::Subcommand, Debug)]
+pub enum OpsCommand {
+    /// Versions, ports, execution mode, auth, governance and build settings.
+    Status,
+    /// Configured catalogs, and whether each one is reachable.
+    Sources,
+    /// Connected pg-wire sessions, longest-connected first.
+    Sessions,
+    /// Running queries, longest-running first; `history` for finished ones.
+    Queries(QueriesArgs),
+    /// Catalogs, secrets (names only), users, roles, grants and policies in
+    /// the server's meta store.
+    ControlPlane,
+}
+
+/// Arguments for `dataglot ops queries`.
+#[derive(clap::Args, Debug)]
+pub struct QueriesArgs {
+    /// Leave out for running queries.
+    #[command(subcommand)]
+    pub command: Option<QueriesCommand>,
+}
+
+/// `dataglot ops queries` and `dataglot ops queries history`.
+#[derive(clap::Subcommand, Debug, Clone, Copy)]
+pub enum QueriesCommand {
+    /// Running queries (the default).
+    List,
+    /// Recently finished queries, newest first.
+    History,
 }
 
 /// Arguments for `dataglot completions`.
