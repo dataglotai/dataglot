@@ -45,7 +45,7 @@ use datafusion::common::tree_node::Transformed;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
 
-use crate::{Identity, PolicyEnforcer};
+use crate::{Identity, PolicyDecision, PolicyEnforcer};
 
 /// Swap wrapper around `Arc<dyn PolicyEnforcer>`.
 ///
@@ -125,6 +125,13 @@ impl PolicyEnforcer for MutableEnforcer {
         let current = self.current();
         current.rewrite(plan, identity)
     }
+
+    // Without this the trait's default (no decisions) answers instead of the
+    // inner enforcer, and `/policy/explain` reports nothing on a running
+    // server even for queries that `rewrite` masks.
+    fn explain(&self, plan: &LogicalPlan, identity: &Identity) -> Vec<PolicyDecision> {
+        self.current().explain(plan, identity)
+    }
 }
 
 #[cfg(test)]
@@ -153,6 +160,19 @@ mod tests {
         ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Transformed::no(plan))
+        }
+    }
+
+    /// Test enforcer that explains every plan with one decision naming it.
+    #[derive(Debug)]
+    struct NamedExplainer(&'static str);
+    impl PolicyEnforcer for NamedExplainer {
+        fn explain(&self, _plan: &LogicalPlan, _identity: &Identity) -> Vec<PolicyDecision> {
+            vec![PolicyDecision::new(
+                crate::PolicyAction::Mask,
+                self.0,
+                "from the inner enforcer",
+            )]
         }
     }
 
@@ -201,6 +221,21 @@ mod tests {
             1,
             "new enforcer must receive the post-swap call"
         );
+    }
+
+    #[test]
+    fn explain_comes_from_the_current_enforcer() {
+        let mutable = MutableEnforcer::new(Arc::new(NamedExplainer("first")));
+        let resources = |m: &MutableEnforcer| -> Vec<String> {
+            m.explain(&empty_plan(), &Identity::anonymous())
+                .into_iter()
+                .map(|d| d.resource)
+                .collect()
+        };
+        assert_eq!(resources(&mutable), ["first"]);
+
+        let _ = mutable.swap(Arc::new(NamedExplainer("second")));
+        assert_eq!(resources(&mutable), ["second"]);
     }
 
     /// Stress test: many readers + occasional writers race against
