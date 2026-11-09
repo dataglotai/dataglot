@@ -178,9 +178,9 @@ pub enum Command {
     dataglot ops sessions --api http://db.example.com:9090
     dataglot ops status --profile prod
 
-    A bearer token for the server, when it needs one, comes from DATAGLOT_API_TOKEN
-    or from the variable a profile's api_token_env names. It's never a flag, so it
-    doesn't end up in shell history.")]
+    The explain endpoint's bearer token comes from DATAGLOT_API_TOKEN or from the
+    variable a profile's api_token_env names. It's never a flag, so it doesn't end
+    up in shell history, and it's never sent over plain http to another machine.")]
     Ops(OpsArgs),
 
     /// Print a shell completion script to stdout and exit.

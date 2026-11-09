@@ -9,8 +9,11 @@
 //! worth reading at a glance.
 //!
 //! A bearer token, when the server wants one, comes from `DATAGLOT_API_TOKEN`
-//! or a profile's `api_token_env`, and goes with every request. Today only
-//! the policy-explain endpoint checks it.
+//! or a profile's `api_token_env`. It only goes to the policy-explain
+//! endpoint, the one place the server checks a token today, and never over
+//! plain `http://` to a host other than this machine. Redirects aren't
+//! followed: the API never sends one, and following it could carry the
+//! request somewhere else.
 //!
 //! Exit codes match client mode: 0 when the server answered, 1 when it
 //! answered with an error (an endpoint this server doesn't have, a query
@@ -56,6 +59,12 @@ pub enum OpsError {
     /// `--profile` can't be used, or doesn't have a URL the command needs.
     #[error("{0}")]
     Profile(String),
+    /// A token would go over plain http to another machine.
+    #[error(
+        "not sending the API token over plain http to {0}; use https, or reach the \
+         endpoint on this machine (localhost)"
+    )]
+    PlaintextToken(String),
     /// Nothing answered, or the connection broke off.
     #[error("could not reach {url}: {message}")]
     Unreachable {
@@ -95,6 +104,7 @@ impl OpsError {
         match self {
             Self::InvalidUrl(_)
             | Self::Profile(_)
+            | Self::PlaintextToken(_)
             | Self::Unreachable { .. }
             | Self::NotJson { .. } => ExitCode::from(2),
             Self::Server { .. } | Self::Output(_) => ExitCode::FAILURE,
@@ -292,17 +302,23 @@ impl Target {
         })
     }
 
+    /// The HTTP API. It checks no token, so none is sent.
     fn api(&self) -> Result<Api, OpsError> {
-        self.connect(self.api.as_deref(), "api_url")
+        self.connect(self.api.as_deref(), "api_url", None)
     }
 
     fn explain(&self) -> Result<Api, OpsError> {
-        self.connect(self.explain.as_deref(), "explain_url")
+        self.connect(self.explain.as_deref(), "explain_url", self.token.clone())
     }
 
-    fn connect(&self, url: Option<&str>, key: &str) -> Result<Api, OpsError> {
+    fn connect(
+        &self,
+        url: Option<&str>,
+        key: &str,
+        token: Option<String>,
+    ) -> Result<Api, OpsError> {
         match url {
-            Some(url) => Api::new(url, self.token.clone()),
+            Some(url) => Api::new(url, token),
             None => Err(OpsError::Profile(format!(
                 "profile \"{}\" has no {key}; add one to the profile",
                 self.profile.as_deref().unwrap_or_default()
@@ -324,8 +340,12 @@ impl Api {
         if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
             return Err(OpsError::InvalidUrl(base.to_string()));
         }
+        if token.is_some() && url.scheme() == "http" && !is_loopback(&url) {
+            return Err(OpsError::PlaintextToken(origin(&url)));
+        }
         let http = reqwest::Client::builder()
             .timeout(TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| OpsError::Unreachable {
                 url: origin(&url),
@@ -371,10 +391,15 @@ impl Api {
         let status = response.status();
         let body = response.bytes().await.map_err(|e| unreachable(&e))?;
         if !status.is_success() {
+            let message = if status.is_redirection() {
+                "redirects aren't followed; point the URL at the server itself".to_string()
+            } else {
+                server_message(&body)
+            };
             return Err(OpsError::Server {
                 url: without_credentials(&url),
                 status: status.to_string(),
-                message: server_message(&body),
+                message,
             });
         }
         let value = serde_json::from_slice(&body).map_err(|e| OpsError::NotJson {
@@ -382,6 +407,16 @@ impl Api {
             message: e.to_string(),
         })?;
         Ok((body.to_vec(), value))
+    }
+}
+
+/// Whether `url` points at this machine, so plain http never leaves it.
+fn is_loopback(url: &reqwest::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
     }
 }
 
@@ -941,6 +976,80 @@ mod tests {
     }
 
     #[test]
+    fn the_token_only_goes_to_the_explain_endpoint() {
+        let target = Target {
+            api: Some("http://127.0.0.1:9090".to_string()),
+            explain: Some("http://127.0.0.1:8085".to_string()),
+            token: Some("t0ken".to_string()),
+            profile: None,
+        };
+        assert!(target.api().expect("api").token.is_none());
+        assert_eq!(
+            target.explain().expect("explain").token.as_deref(),
+            Some("t0ken")
+        );
+    }
+
+    #[test]
+    fn a_token_never_goes_over_plain_http_to_another_machine() {
+        let token = || Some("t0ken".to_string());
+        for refused in ["http://db.example.com:8085", "http://10.0.0.5:8085"] {
+            assert!(
+                matches!(Api::new(refused, token()), Err(OpsError::PlaintextToken(_))),
+                "{refused}"
+            );
+        }
+        for allowed in [
+            "http://127.0.0.1:8085",
+            "http://127.1.2.3:8085",
+            "http://localhost:8085",
+            "http://[::1]:8085",
+            "https://db.example.com:8085",
+        ] {
+            assert!(Api::new(allowed, token()).is_ok(), "{allowed}");
+        }
+        // Without a token there's nothing to protect.
+        assert!(Api::new("http://db.example.com:9090", None).is_ok());
+        let Err(e) = Api::new("http://db.example.com:8085", token()) else {
+            panic!("refused above");
+        };
+        assert!(!e.to_string().contains("t0ken"), "{e}");
+    }
+
+    /// A one-shot HTTP server that answers every request with `response`.
+    async fn answer_once(response: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        let base = answer_once(
+            "HTTP/1.1 302 Found\r\nLocation: http://example.com/\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let api = Api::new(&base, None).expect("api");
+        let Err(e) = api.send(Method::GET, &["api", "server"], None).await else {
+            panic!("a redirect must not count as an answer");
+        };
+        let err = e.to_string();
+        assert!(err.contains("302 Found"), "{err}");
+        assert!(err.contains("redirects aren't followed"), "{err}");
+        assert_eq!(e.exit_code(), ExitCode::FAILURE);
+    }
+
+    #[test]
     fn messages_never_show_credentials() {
         let url = reqwest::Url::parse("http://ops:s3cret@h:9090/api/server").expect("url");
         assert_eq!(origin(&url), "http://h:9090");
@@ -970,6 +1079,10 @@ mod tests {
         );
         assert_eq!(
             OpsError::Profile(String::new()).exit_code(),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            OpsError::PlaintextToken(String::new()).exit_code(),
             ExitCode::from(2)
         );
         let server = OpsError::Server {

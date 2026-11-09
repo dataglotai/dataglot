@@ -222,9 +222,20 @@ as for `query`; `--format json` prints the server's response unchanged, with
 every field. Exit codes: 0 ok, 1 the server answered with an error, 2 no usable
 answer (nothing listening, or not a Dataglot API).
 
-When the server wants a bearer token (`[policy_explain] token_env`), put it in
-`DATAGLOT_API_TOKEN`; it's sent with every request. A profile can carry the
-ops addresses too, so `--profile prod` works for `ops` as for `query`:
+When the explain endpoint wants a bearer token (`[policy_explain] token_env`),
+put it in `DATAGLOT_API_TOKEN`. It's only sent to the explain endpoint, and
+never over plain `http://` to another machine. The endpoint itself speaks plain
+HTTP, so to reach it on a remote server, go through an SSH tunnel
+(`ssh -L 8085:127.0.0.1:8085 db.example.com`, then the default
+`--explain-api` works) or a TLS-terminating proxy.
+
+`/api/*` has no authentication yet (<23>). Anyone who can reach the metrics
+address can list sessions and queries and cancel queries, so keep it on
+loopback or a trusted network. The Docker image binds it to `0.0.0.0:9090`;
+publish it only to the host itself (`-p 127.0.0.1:9090:9090`).
+
+A profile can carry the ops addresses too, so `--profile prod` works for `ops`
+as for `query`:
 
 ```toml
 [profiles.prod]

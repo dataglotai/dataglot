@@ -187,9 +187,9 @@ async fn cancel_stops_a_running_query() {
     assert!(err.contains("404"), "{err}");
 }
 
-/// A server with one CSV table and the policy-explain endpoint behind a
-/// token. Returns the explain URL, the name of the variable holding the
-/// token, and the temp dir keeping the files alive.
+/// A server with one CSV table, a mask on it, and the policy-explain
+/// endpoint behind a token. Returns the explain URL, the name of the
+/// variable holding the token, and the temp dir keeping the files alive.
 async fn boot_with_explain() -> (String, String, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let csv = dir.path().join("users.csv");
@@ -211,6 +211,11 @@ kind = "object_storage"
 name = "users"
 url = "file://{csv}"
 format = "csv"
+
+[[masks]]
+table = "files.public.users"
+column = "email"
+mask_literal = "***@example.com"
 
 [policy_explain]
 addr = "127.0.0.1:{explain_port}"
@@ -292,9 +297,11 @@ url = "postgres://127.0.0.1"
     ])
     .await;
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
-    // What the decisions are is the endpoint's business (and its own
-    // tests'); here it's enough that the token got the request through.
-    assert!(out.starts_with("action,resource,detail\n"), "{out}");
+    assert_eq!(
+        out,
+        "action,resource,detail\n\
+         mask,files.public.users.email,column value masked at projection\n"
+    );
 
     let (code, out, err) = ops(&["policy", "explain", sql, "--profile", "with_token"]).await;
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
