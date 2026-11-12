@@ -1,14 +1,23 @@
-//! `dataglot ops`: read-only views of a running server.
+//! `dataglot ops`: a look at a running server.
 //!
-//! The commands read the HTTP API the dashboard uses, served on the server's
-//! metrics address (`127.0.0.1:9090` unless configured otherwise). Each one is
-//! a single GET. `--format json` prints the response body exactly as the
+//! Most commands read the HTTP API the dashboard uses, served on the server's
+//! metrics address (`127.0.0.1:9090` unless configured otherwise), with a
+//! single GET. `queries cancel` posts to the same API. `policy explain` talks
+//! to the separate policy-explain endpoint (`[policy_explain]`, documented on
+//! `127.0.0.1:8085`). `--format json` prints the response body exactly as the
 //! server sent it, so scripts get every field; table and CSV show the columns
 //! worth reading at a glance.
 //!
+//! A bearer token, when the server wants one, comes from `DATAGLOT_API_TOKEN`
+//! or a profile's `api_token_env`. It only goes to the policy-explain
+//! endpoint, the one place the server checks a token today, and never over
+//! plain `http://` to a host other than this machine. Redirects aren't
+//! followed: the API never sends one, and following it could carry the
+//! request somewhere else.
+//!
 //! Exit codes match client mode: 0 when the server answered, 1 when it
-//! answered with an error (an endpoint this server doesn't have, say), 2 when
-//! there was no usable answer at all.
+//! answered with an error (an endpoint this server doesn't have, a query
+//! that's already finished), 2 when there was no usable answer at all.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -18,9 +27,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::error::ArrowError;
+use reqwest::Method;
 use serde_json::Value;
 
-use crate::cli::{OpsArgs, OpsCommand, OutputFormat, QueriesCommand};
+use crate::cli::{OpsArgs, OpsCommand, OutputFormat, PolicyCommand, QueriesCommand};
+use crate::client::OpsTarget;
+
+/// The server's default metrics address.
+const DEFAULT_API: &str = "http://127.0.0.1:9090";
+
+/// The policy-explain address the configuration docs use. The server has no
+/// default; the endpoint is off unless `[policy_explain]` is set.
+const DEFAULT_EXPLAIN_API: &str = "http://127.0.0.1:8085";
+
+/// The variable a token comes from when no profile names another one.
+const TOKEN_ENV: &str = "DATAGLOT_API_TOKEN";
 
 /// How long one request may take, connecting included.
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -32,9 +53,18 @@ const SQL_IN_TABLE: usize = 60;
 /// What can go wrong talking to the API.
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
-    /// `--api` isn't an http(s) URL.
-    #[error("invalid --api value {0:?}: expected an http:// or https:// URL")]
+    /// A URL that isn't http(s).
+    #[error("invalid API URL {0:?}: expected an http:// or https:// URL")]
     InvalidUrl(String),
+    /// `--profile` can't be used, or doesn't have a URL the command needs.
+    #[error("{0}")]
+    Profile(String),
+    /// A token would go over plain http to another machine.
+    #[error(
+        "not sending the API token over plain http to {0}; use https, or reach the \
+         endpoint on this machine (localhost)"
+    )]
+    PlaintextToken(String),
     /// Nothing answered, or the connection broke off.
     #[error("could not reach {url}: {message}")]
     Unreachable {
@@ -54,7 +84,7 @@ pub enum OpsError {
         message: String,
     },
     /// Something answered, but not with JSON, so probably not a Dataglot API.
-    #[error("{url} didn't answer with JSON ({message}); is --api the server's metrics address?")]
+    #[error("{url} didn't answer with JSON ({message}); is that the right address?")]
     NotJson {
         /// The full request URL, without credentials.
         url: String,
@@ -72,9 +102,11 @@ impl OpsError {
     #[must_use]
     pub fn exit_code(&self) -> ExitCode {
         match self {
-            Self::InvalidUrl(_) | Self::Unreachable { .. } | Self::NotJson { .. } => {
-                ExitCode::from(2)
-            }
+            Self::InvalidUrl(_)
+            | Self::Profile(_)
+            | Self::PlaintextToken(_)
+            | Self::Unreachable { .. }
+            | Self::NotJson { .. } => ExitCode::from(2),
             Self::Server { .. } | Self::Output(_) => ExitCode::FAILURE,
         }
     }
@@ -110,31 +142,43 @@ pub async fn run_with<O: Write, E: Write>(args: &OpsArgs, out: &mut O, err: &mut
 }
 
 async fn execute<O: Write>(args: &OpsArgs, out: &mut O) -> Result<(), OpsError> {
-    let api = Api::new(&args.api)?;
-    let (path, table): (&str, fn(&Value) -> Rows) = match &args.command {
-        OpsCommand::Status => ("api/server", status_rows),
-        OpsCommand::Sources => ("api/connectors", source_rows),
-        OpsCommand::Sessions => ("api/sessions", session_rows),
-        OpsCommand::Queries(q) => match q.command.unwrap_or(QueriesCommand::List) {
-            QueriesCommand::List => ("api/queries", running_rows),
-            QueriesCommand::History => ("api/queries/history", history_rows),
-        },
-        OpsCommand::ControlPlane => ("api/control-plane", control_plane_rows),
-    };
-    let (body, value) = api.get(path).await.map_err(|e| match e {
-        // The route only exists when the server has a meta store.
-        OpsError::Server { url, status, .. }
-            if path == "api/control-plane" && status.starts_with("404") =>
-        {
-            OpsError::Server {
-                url,
-                status,
-                message: "this server has no control plane (it runs without [catalog_service])"
-                    .to_string(),
+    let target = Target::resolve(args)?;
+    let (path, table): (&[&str], fn(&Value) -> Rows) = match &args.command {
+        OpsCommand::Status => (&["api", "server"], status_rows),
+        OpsCommand::Sources => (&["api", "connectors"], source_rows),
+        OpsCommand::Sessions => (&["api", "sessions"], session_rows),
+        OpsCommand::Queries(q) => match &q.command {
+            None | Some(QueriesCommand::List) => (&["api", "queries"], running_rows),
+            Some(QueriesCommand::History) => (&["api", "queries", "history"], history_rows),
+            Some(QueriesCommand::Cancel { run_id }) => {
+                return cancel(&target.api()?, run_id, args.format, out).await;
             }
-        }
-        e => e,
-    })?;
+        },
+        OpsCommand::ControlPlane => (&["api", "control-plane"], control_plane_rows),
+        OpsCommand::Policy(p) => match &p.command {
+            PolicyCommand::Explain { user, sql } => {
+                return explain(&target.explain()?, user.as_deref(), sql, args.format, out).await;
+            }
+        },
+    };
+    let control_plane = matches!(args.command, OpsCommand::ControlPlane);
+    let (body, value) = target
+        .api()?
+        .send(Method::GET, path, None)
+        .await
+        .map_err(|e| match e {
+            // The route only exists when the server has a meta store.
+            OpsError::Server { url, status, .. } if control_plane && status.starts_with("404") => {
+                OpsError::Server {
+                    url,
+                    status,
+                    message: "this server has no control plane (it runs without \
+                              [catalog_service])"
+                        .to_string(),
+                }
+            }
+            e => e,
+        })?;
     if matches!(args.format, OutputFormat::Json) {
         out.write_all(&body)?;
         writeln!(out)?;
@@ -145,58 +189,217 @@ async fn execute<O: Write>(args: &OpsArgs, out: &mut O) -> Result<(), OpsError> 
     Ok(())
 }
 
-/// The server's HTTP API.
+/// `queries cancel`: ask the server to stop one query. It answers 404 for a
+/// query that has already finished, which is reported as is.
+async fn cancel<O: Write>(
+    api: &Api,
+    run_id: &str,
+    format: OutputFormat,
+    out: &mut O,
+) -> Result<(), OpsError> {
+    let (body, _) = api
+        .send(Method::POST, &["api", "queries", run_id, "cancel"], None)
+        .await?;
+    if matches!(format, OutputFormat::Json) {
+        out.write_all(&body)?;
+        writeln!(out)?;
+    } else {
+        // The server signals the query; it may take a moment to stop.
+        writeln!(out, "Cancel sent to {run_id}.")?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// `policy explain`: the decisions `sql` would get as `user`, from the
+/// policy-explain endpoint. The query is planned there, never run.
+async fn explain<O: Write>(
+    api: &Api,
+    user: Option<&str>,
+    sql: &str,
+    format: OutputFormat,
+    out: &mut O,
+) -> Result<(), OpsError> {
+    let request = serde_json::json!({ "sql": sql, "user": user });
+    let (body, value) = api
+        .send(Method::POST, &["policy", "explain"], Some(&request))
+        .await
+        .map_err(|e| match e {
+            OpsError::Unreachable { url, message } => OpsError::Unreachable {
+                url,
+                message: format!(
+                    "{message} (is [policy_explain] enabled on the server, and is \
+                     --explain-api its address?)"
+                ),
+            },
+            OpsError::Server {
+                url,
+                status,
+                message,
+            } if status.starts_with("401") => OpsError::Server {
+                url,
+                status,
+                message: format!("{message}; set {TOKEN_ENV}, or api_token_env in the profile"),
+            },
+            e => e,
+        })?;
+    match format {
+        OutputFormat::Json => {
+            out.write_all(&body)?;
+            writeln!(out)?;
+        }
+        OutputFormat::Csv => decision_rows(&value).write(format, out)?,
+        OutputFormat::Table => {
+            let who = match value.get("user").and_then(Value::as_str) {
+                Some(user) => format!("user {user}"),
+                None => "anonymous session".to_string(),
+            };
+            let groups = field(&value, "groups");
+            if groups.is_empty() {
+                writeln!(out, "Policy decisions for {who}:")?;
+            } else {
+                writeln!(out, "Policy decisions for {who} (groups: {groups}):")?;
+            }
+            decision_rows(&value).write(format, out)?;
+        }
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// Where requests go, and the token that goes with them.
+struct Target {
+    api: Option<String>,
+    explain: Option<String>,
+    token: Option<String>,
+    profile: Option<String>,
+}
+
+impl Target {
+    fn resolve(args: &OpsArgs) -> Result<Self, OpsError> {
+        let env_token = || std::env::var(TOKEN_ENV).ok().filter(|t| !t.is_empty());
+        let Some(name) = &args.profile else {
+            return Ok(Self {
+                api: Some(args.api.clone().unwrap_or_else(|| DEFAULT_API.to_string())),
+                explain: Some(
+                    args.explain_api
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_EXPLAIN_API.to_string()),
+                ),
+                token: env_token(),
+                profile: None,
+            });
+        };
+        let from_profile =
+            OpsTarget::from_profile(name).map_err(|e| OpsError::Profile(e.to_string()))?;
+        Ok(Self {
+            api: from_profile.api_url,
+            explain: from_profile.explain_url,
+            // As with password_env and PGPASSWORD: the profile's variable
+            // wins, the default one is the fallback.
+            token: from_profile.token.or_else(env_token),
+            profile: Some(name.clone()),
+        })
+    }
+
+    /// The HTTP API. It checks no token, so none is sent.
+    fn api(&self) -> Result<Api, OpsError> {
+        self.connect(self.api.as_deref(), "api_url", None)
+    }
+
+    fn explain(&self) -> Result<Api, OpsError> {
+        self.connect(self.explain.as_deref(), "explain_url", self.token.clone())
+    }
+
+    fn connect(
+        &self,
+        url: Option<&str>,
+        key: &str,
+        token: Option<String>,
+    ) -> Result<Api, OpsError> {
+        match url {
+            Some(url) => Api::new(url, token),
+            None => Err(OpsError::Profile(format!(
+                "profile \"{}\" has no {key}; add one to the profile",
+                self.profile.as_deref().unwrap_or_default()
+            ))),
+        }
+    }
+}
+
+/// One of the server's HTTP endpoints.
 struct Api {
     base: reqwest::Url,
     http: reqwest::Client,
+    token: Option<String>,
 }
 
 impl Api {
-    fn new(base: &str) -> Result<Self, OpsError> {
-        let mut url =
-            reqwest::Url::parse(base).map_err(|_| OpsError::InvalidUrl(base.to_string()))?;
+    fn new(base: &str, token: Option<String>) -> Result<Self, OpsError> {
+        let url = reqwest::Url::parse(base).map_err(|_| OpsError::InvalidUrl(base.to_string()))?;
         if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
             return Err(OpsError::InvalidUrl(base.to_string()));
         }
-        // Without a trailing slash, `join` would replace the last path segment
-        // of an API behind a prefix (`http://proxy/dataglot`).
-        if !url.path().ends_with('/') {
-            let path = format!("{}/", url.path());
-            url.set_path(&path);
+        if token.is_some() && url.scheme() == "http" && !is_loopback(&url) {
+            return Err(OpsError::PlaintextToken(origin(&url)));
         }
         let http = reqwest::Client::builder()
             .timeout(TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| OpsError::Unreachable {
                 url: origin(&url),
                 message: e.to_string(),
             })?;
-        Ok(Self { base: url, http })
+        Ok(Self {
+            base: url,
+            http,
+            token,
+        })
     }
 
-    /// GET `path`: the body as sent, and parsed.
-    async fn get(&self, path: &str) -> Result<(Vec<u8>, Value), OpsError> {
-        let url = self
-            .base
-            .join(path)
-            .map_err(|_| OpsError::InvalidUrl(self.base.to_string()))?;
+    /// `segments` appended to the base URL, each one escaped, so an API
+    /// behind a path prefix (`http://proxy/dataglot`) works too.
+    fn url(&self, segments: &[&str]) -> reqwest::Url {
+        let mut url = self.base.clone();
+        if let Ok(mut path) = url.path_segments_mut() {
+            path.pop_if_empty().extend(segments);
+        }
+        url
+    }
+
+    /// Send a request; returns the body as sent, and parsed.
+    async fn send(
+        &self,
+        method: Method,
+        path: &[&str],
+        json: Option<&Value>,
+    ) -> Result<(Vec<u8>, Value), OpsError> {
+        let url = self.url(path);
         let unreachable = |e: &reqwest::Error| OpsError::Unreachable {
             url: origin(&self.base),
             message: describe(e),
         };
-        let response = self
-            .http
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|e| unreachable(&e))?;
+        let mut request = self.http.request(method, url.clone());
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        if let Some(json) = json {
+            request = request.json(json);
+        }
+        let response = request.send().await.map_err(|e| unreachable(&e))?;
         let status = response.status();
         let body = response.bytes().await.map_err(|e| unreachable(&e))?;
         if !status.is_success() {
+            let message = if status.is_redirection() {
+                "redirects aren't followed; point the URL at the server itself".to_string()
+            } else {
+                server_message(&body)
+            };
             return Err(OpsError::Server {
                 url: without_credentials(&url),
                 status: status.to_string(),
-                message: server_message(&body),
+                message,
             });
         }
         let value = serde_json::from_slice(&body).map_err(|e| OpsError::NotJson {
@@ -204,6 +407,16 @@ impl Api {
             message: e.to_string(),
         })?;
         Ok((body.to_vec(), value))
+    }
+}
+
+/// Whether `url` points at this machine, so plain http never leaves it.
+fn is_loopback(url: &reqwest::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
     }
 }
 
@@ -513,6 +726,18 @@ fn control_plane_rows(value: &Value) -> Rows {
     }
 }
 
+/// `policy explain`: one row per decision.
+fn decision_rows(value: &Value) -> Rows {
+    let rows = items(value, Some("decisions"))
+        .iter()
+        .map(|d| vec![field(d, "action"), field(d, "resource"), field(d, "detail")])
+        .collect();
+    Rows {
+        columns: &["action", "resource", "detail"],
+        rows,
+    }
+}
+
 fn elapsed(query: &Value) -> String {
     query
         .get("elapsed_ms")
@@ -687,6 +912,24 @@ mod tests {
     }
 
     #[test]
+    fn explain_lists_the_decisions() {
+        let rows = decision_rows(&json!({
+            "user": "carol",
+            "groups": ["contractor"],
+            "decisions": [
+                {"action": "mask", "resource": "users.email", "detail": "masked with '***'"},
+                {"action": "deny", "resource": "users.dept", "detail": "denied for contractor"},
+            ],
+        }));
+        assert_eq!(
+            render(rows, OutputFormat::Csv),
+            "action,resource,detail\n\
+             mask,users.email,masked with '***'\n\
+             deny,users.dept,denied for contractor\n"
+        );
+    }
+
+    #[test]
     fn an_empty_list_still_prints_the_header() {
         let table = render(session_rows(&json!([])), OutputFormat::Table);
         assert!(
@@ -713,15 +956,97 @@ mod tests {
             "not a url",
         ] {
             assert!(
-                matches!(Api::new(bad), Err(OpsError::InvalidUrl(_))),
+                matches!(Api::new(bad, None), Err(OpsError::InvalidUrl(_))),
                 "{bad} should be rejected"
             );
         }
-        let api = Api::new("http://h:9090/dataglot").expect("valid");
+        for base in ["http://h:9090/dataglot", "http://h:9090/dataglot/"] {
+            let api = Api::new(base, None).expect("valid");
+            assert_eq!(
+                api.url(&["api", "server"]).as_str(),
+                "http://h:9090/dataglot/api/server"
+            );
+        }
+        // A run id is one path segment, whatever it contains.
+        let api = Api::new("http://h:9090", None).expect("valid");
         assert_eq!(
-            api.base.join("api/server").expect("join").as_str(),
-            "http://h:9090/dataglot/api/server"
+            api.url(&["api", "queries", "a/b?c", "cancel"]).as_str(),
+            "http://h:9090/api/queries/a%2Fb%3Fc/cancel"
         );
+    }
+
+    #[test]
+    fn the_token_only_goes_to_the_explain_endpoint() {
+        let target = Target {
+            api: Some("http://127.0.0.1:9090".to_string()),
+            explain: Some("http://127.0.0.1:8085".to_string()),
+            token: Some("t0ken".to_string()),
+            profile: None,
+        };
+        assert!(target.api().expect("api").token.is_none());
+        assert_eq!(
+            target.explain().expect("explain").token.as_deref(),
+            Some("t0ken")
+        );
+    }
+
+    #[test]
+    fn a_token_never_goes_over_plain_http_to_another_machine() {
+        let token = || Some("t0ken".to_string());
+        for refused in ["http://db.example.com:8085", "http://10.0.0.5:8085"] {
+            assert!(
+                matches!(Api::new(refused, token()), Err(OpsError::PlaintextToken(_))),
+                "{refused}"
+            );
+        }
+        for allowed in [
+            "http://127.0.0.1:8085",
+            "http://127.1.2.3:8085",
+            "http://localhost:8085",
+            "http://[::1]:8085",
+            "https://db.example.com:8085",
+        ] {
+            assert!(Api::new(allowed, token()).is_ok(), "{allowed}");
+        }
+        // Without a token there's nothing to protect.
+        assert!(Api::new("http://db.example.com:9090", None).is_ok());
+        let Err(e) = Api::new("http://db.example.com:8085", token()) else {
+            panic!("refused above");
+        };
+        assert!(!e.to_string().contains("t0ken"), "{e}");
+    }
+
+    /// A one-shot HTTP server that answers every request with `response`.
+    async fn answer_once(response: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        let base = answer_once(
+            "HTTP/1.1 302 Found\r\nLocation: http://example.com/\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let api = Api::new(&base, None).expect("api");
+        let Err(e) = api.send(Method::GET, &["api", "server"], None).await else {
+            panic!("a redirect must not count as an answer");
+        };
+        let err = e.to_string();
+        assert!(err.contains("302 Found"), "{err}");
+        assert!(err.contains("redirects aren't followed"), "{err}");
+        assert_eq!(e.exit_code(), ExitCode::FAILURE);
     }
 
     #[test]
@@ -750,6 +1075,14 @@ mod tests {
         assert_eq!(unreachable.exit_code(), ExitCode::from(2));
         assert_eq!(
             OpsError::InvalidUrl(String::new()).exit_code(),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            OpsError::Profile(String::new()).exit_code(),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            OpsError::PlaintextToken(String::new()).exit_code(),
             ExitCode::from(2)
         );
         let server = OpsError::Server {
