@@ -85,7 +85,7 @@ pub enum ClientError {
 impl ClientError {
     /// Process exit code, following psql: 2 when there is no usable
     /// connection, 1 when a statement or the output failed.
-    #[must_use]
+    #[must_use = "the process should exit with this code"]
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::InvalidServer(_)
