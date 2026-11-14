@@ -110,6 +110,15 @@ pub struct ObservabilityConfig {
     /// appears only after an on-demand "Check now" in the dashboard.
     #[serde(default = "default_connector_health_interval_secs")]
     pub connector_health_interval_secs: u64,
+    /// Name of the environment variable holding the bearer token for full
+    /// access to `/api/*` (reads, cancel, probe). Only the name goes in
+    /// config, never the token. See [`crate::api_auth`].
+    #[serde(default)]
+    pub api_token_env: Option<String>,
+    /// Name of the environment variable holding an optional read-only token
+    /// for `/api/*`. Needs `api_token_env` as well.
+    #[serde(default)]
+    pub api_read_token_env: Option<String>,
 }
 
 const fn default_connector_health_interval_secs() -> u64 {
@@ -140,6 +149,8 @@ impl Default for ObservabilityConfig {
             health_check_enabled: true,
             capture_query_sources: false,
             connector_health_interval_secs: default_connector_health_interval_secs(),
+            api_token_env: None,
+            api_read_token_env: None,
         }
     }
 }
@@ -982,6 +993,7 @@ pub async fn spawn_metrics_server(
     maintenance: crate::maintenance_registry::MaintenanceRegistry,
     server_info: ServerInfo,
     control_plane: Option<(Arc<dyn dataglot_catalog::MetaStore>, String)>,
+    api_auth: crate::api_auth::ApiAuth,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(addr)
@@ -1006,6 +1018,7 @@ pub async fn spawn_metrics_server(
     if let Some((store, org)) = control_plane {
         router = router.merge(crate::control_plane::router(store, org));
     }
+    let router = crate::api_auth::protect(router, api_auth, bound);
 
     tracing::info!(%bound, "Metrics HTTP server listening");
     // Announce the operational dashboard when it's compiled in — otherwise the

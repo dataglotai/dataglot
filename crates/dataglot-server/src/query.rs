@@ -351,9 +351,10 @@ mod tests {
         // `["dataglot"]` → default Args (no --config), command left unset.
         let args = Args::try_parse_from(["dataglot"]).expect("parse default args");
         let q = qargs(Some("SELECT 1 AS n, 'x' AS s"), None);
-        run(&args, &q)
+        let code = run(&args, &q)
             .await
             .expect("constant query runs in-process");
+        assert_eq!(code, ExitCode::SUCCESS);
     }
 
     /// A missing table surfaces as an error, not a panic — the CLI exits

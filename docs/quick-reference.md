@@ -229,10 +229,13 @@ HTTP, so to reach it on a remote server, go through an SSH tunnel
 (`ssh -L 8085:127.0.0.1:8085 db.example.com`, then the default
 `--explain-api` works) or a TLS-terminating proxy.
 
-`/api/*` has no authentication yet (<23>). Anyone who can reach the metrics
-address can list sessions and queries and cancel queries, so keep it on
-loopback or a trusted network. The Docker image binds it to `0.0.0.0:9090`;
-publish it only to the host itself (`-p 127.0.0.1:9090:9090`).
+The server can require a bearer token on `/api/*` (`[observability]
+api_token_env`, see [configuration](configuration.md#authentication-for-api)).
+Without one, a server on a non-loopback address refuses cancel with 403, and
+anyone who can reach it can still list sessions and queries. The Docker image
+binds it to `0.0.0.0:9090`; publish it only to the host itself
+(`-p 127.0.0.1:9090:9090`). `dataglot ops` doesn't send the token to `/api/*`
+yet.
 
 A profile can carry the ops addresses too, so `--profile prod` works for `ops`
 as for `query`:
