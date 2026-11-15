@@ -93,7 +93,10 @@ and the rest) accepts an `Authorization: Bearer <token>` header:
   `0.0.0.0:9090`), reads stay open and the server logs a warning at boot.
   Cancel and probe return 403 until `api_token_env` is set.
 
-If a variable named here is unset or empty, the server refuses to start rather than serving `/api` without the token. `/metrics`, `/health`, `/lineage` and `/ui` are not covered. The dashboard doesn't send a token yet, so with `api_token_env` set its pages can't load data.
+If a variable named here is unset or empty, the server refuses to start rather than serving `/api` without the token. `/metrics`, `/health`, `/`/lineage` and `/ui` are not covered. When `/api` answers 401, the
+dashboard asks for the token and keeps it in the browser tab's
+`sessionStorage`, so it's gone when the tab closes. Either token works
+there; with the read-only one, Cancel and "Check now" report the 403.
 
 ```toml 
 [observability]
