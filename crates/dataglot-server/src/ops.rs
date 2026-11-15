@@ -9,11 +9,10 @@
 //! worth reading at a glance.
 //!
 //! A bearer token, when the server wants one, comes from `DATAGLOT_API_TOKEN`
-//! or a profile's `api_token_env`. It only goes to the policy-explain
-//! endpoint, the one place the server checks a token today, and never over
-//! plain `http://` to a host other than this machine. Redirects aren't
-//! followed: the API never sends one, and following it could carry the
-//! request somewhere else.
+//! or a profile's `api_token_env`. It goes to both the HTTP API and the
+//! policy-explain endpoint, and never over plain `http://` to a host other
+//! than this machine. Redirects aren't followed: the API never sends one, and
+//! following it could carry the request (and the token) somewhere else.
 //!
 //! Exit codes match client mode: 0 when the server answered, 1 when it
 //! answered with an error (an endpoint this server doesn't have, a query
@@ -232,15 +231,6 @@ async fn explain<O: Write>(
                      --explain-api its address?)"
                 ),
             },
-            OpsError::Server {
-                url,
-                status,
-                message,
-            } if status.starts_with("401") => OpsError::Server {
-                url,
-                status,
-                message: format!("{message}; set {TOKEN_ENV}, or api_token_env in the profile"),
-            },
             e => e,
         })?;
     match format {
@@ -302,9 +292,8 @@ impl Target {
         })
     }
 
-    /// The HTTP API. It checks no token, so none is sent.
     fn api(&self) -> Result<Api, OpsError> {
-        self.connect(self.api.as_deref(), "api_url", None)
+        self.connect(self.api.as_deref(), "api_url", self.token.clone())
     }
 
     fn explain(&self) -> Result<Api, OpsError> {
@@ -393,6 +382,11 @@ impl Api {
         if !status.is_success() {
             let message = if status.is_redirection() {
                 "redirects aren't followed; point the URL at the server itself".to_string()
+            } else if status == reqwest::StatusCode::UNAUTHORIZED {
+                format!(
+                    "{}; set {TOKEN_ENV}, or api_token_env in the profile",
+                    server_message(&body)
+                )
             } else {
                 server_message(&body)
             };
@@ -976,14 +970,14 @@ mod tests {
     }
 
     #[test]
-    fn the_token_only_goes_to_the_explain_endpoint() {
+    fn the_token_goes_to_the_api_and_the_explain_endpoint() {
         let target = Target {
             api: Some("http://127.0.0.1:9090".to_string()),
             explain: Some("http://127.0.0.1:8085".to_string()),
             token: Some("t0ken".to_string()),
             profile: None,
         };
-        assert!(target.api().expect("api").token.is_none());
+        assert_eq!(target.api().expect("api").token.as_deref(), Some("t0ken"));
         assert_eq!(
             target.explain().expect("explain").token.as_deref(),
             Some("t0ken")
@@ -1046,6 +1040,24 @@ mod tests {
         let err = e.to_string();
         assert!(err.contains("302 Found"), "{err}");
         assert!(err.contains("redirects aren't followed"), "{err}");
+        assert_eq!(e.exit_code(), ExitCode::FAILURE);
+    }
+
+    #[tokio::test]
+    async fn a_401_says_where_the_token_goes() {
+        let base = answer_once(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\
+             Content-Length: 43\r\nConnection: close\r\n\r\n\
+             {\"error\":\"missing or invalid bearer token\"}",
+        )
+        .await;
+        let api = Api::new(&base, None).expect("api");
+        let Err(e) = api.send(Method::GET, &["api", "server"], None).await else {
+            panic!("a 401 is an error");
+        };
+        let err = e.to_string();
+        assert!(err.contains("missing or invalid bearer token"), "{err}");
+        assert!(err.contains("set DATAGLOT_API_TOKEN"), "{err}");
         assert_eq!(e.exit_code(), ExitCode::FAILURE);
     }
 

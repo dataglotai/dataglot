@@ -187,15 +187,17 @@ async fn cancel_stops_a_running_query() {
     assert!(err.contains("404"), "{err}");
 }
 
-/// A server with one CSV table, a mask on it, and the policy-explain
-/// endpoint behind a token. Returns the explain URL, the name of the
-/// variable holding the token, and the temp dir keeping the files alive.
-async fn boot_with_explain() -> (String, String, tempfile::TempDir) {
+/// A server with one CSV table, a mask on it, and both the HTTP API and the
+/// policy-explain endpoint behind the same token. Returns the API URL, the
+/// explain URL, the name of the variable holding the token, and the temp dir
+/// keeping the files alive.
+async fn boot_with_tokens() -> (String, String, String, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let csv = dir.path().join("users.csv");
     std::fs::write(&csv, "id,email\n1,alice@acme.com\n").expect("write csv");
     let pg_port = dataglot_test_support::reserve_loopback_port();
     let explain_port = dataglot_test_support::reserve_loopback_port();
+    let api_port = dataglot_test_support::reserve_loopback_port();
     // Unique per run, so nothing else in the process reads or writes it.
     let token_env = format!("DATAGLOT_OPS_E2E_TOKEN_{explain_port}");
     std::env::set_var(&token_env, "t0ken");
@@ -220,6 +222,10 @@ mask_literal = "***@example.com"
 [policy_explain]
 addr = "127.0.0.1:{explain_port}"
 token_env = "{token_env}"
+
+[observability]
+metrics_addr = "127.0.0.1:{api_port}"
+api_token_env = "{token_env}"
 "#,
             csv = csv.display(),
         ),
@@ -233,8 +239,6 @@ token_env = "{token_env}"
         "127.0.0.1",
         "--port",
         &pg_port.to_string(),
-        "--metrics-addr",
-        "off",
     ])
     .expect("parse");
     let config = ServerConfig::load(&args).expect("config loads");
@@ -244,22 +248,22 @@ token_env = "{token_env}"
     tokio::spawn(async move {
         server.run().await.expect("server runs");
     });
+    let api = format!("http://127.0.0.1:{api_port}");
     let explain = format!("http://127.0.0.1:{explain_port}");
     for _ in 0..50 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", explain_port))
-            .await
-            .is_ok()
-        {
-            return (explain, token_env, dir);
+        let up = |port| tokio::net::TcpStream::connect(("127.0.0.1", port));
+        if up(api_port).await.is_ok() && up(explain_port).await.is_ok() {
+            return (api, explain, token_env, dir);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("the policy-explain endpoint did not come up");
+    panic!("the HTTP API or the policy-explain endpoint did not come up");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn policy_explain_uses_the_profile_and_its_token() {
-    let (explain, token_env, dir) = boot_with_explain().await;
+
+async fn the_profile_token_goes_to_the_api_and_explain() {
+    let (api, explain, token_env, dir) = boot_with_tokens().await;
     let profiles = dir.path().join("cli.toml");
     std::fs::write(
         &profiles,
@@ -267,11 +271,13 @@ async fn policy_explain_uses_the_profile_and_its_token() {
             r#"
 [profiles.with_token]
 url = "postgres://127.0.0.1"
+api_url = "{api}"
 explain_url = "{explain}"
 api_token_env = "{token_env}"
 
 [profiles.without_token]
 url = "postgres://127.0.0.1"
+api_url = "{api}"
 explain_url = "{explain}"
 
 [profiles.sql_only]
@@ -313,6 +319,16 @@ url = "postgres://127.0.0.1"
     // Without the token the endpoint refuses, and the message says where
     // the token goes.
     let (code, out, err) = ops(&["policy", "explain", sql, "--profile", "without_token"]).await;
+    assert_eq!(code, ExitCode::FAILURE, "{err}");
+    assert_eq!(out, "");
+    assert!(err.contains("401"), "{err}");
+    assert!(err.contains("DATAGLOT_API_TOKEN"), "{err}");
+
+    // The same token opens the HTTP API.
+    let (code, out, err) = ops(&["status", "--profile", "with_token"]).await;
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(out.contains("| execution_mode "), "{out}");
+    let (code, out, err) = ops(&["status", "--profile", "without_token"]).await;
     assert_eq!(code, ExitCode::FAILURE, "{err}");
     assert_eq!(out, "");
     assert!(err.contains("401"), "{err}");
