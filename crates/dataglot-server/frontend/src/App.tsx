@@ -151,7 +151,7 @@ export function App() {
         </span>
       </div>
 
-            {needToken && (
+        {needToken && (
         <form className="token" onSubmit={submitToken}>
           <span>
             {apiToken()
