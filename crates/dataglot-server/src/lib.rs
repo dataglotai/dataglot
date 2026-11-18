@@ -16,6 +16,7 @@
 #![warn(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+pub mod api_auth;
 pub mod ballista;
 pub mod catalog_admin;
 pub mod cli;

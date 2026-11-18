@@ -99,7 +99,7 @@ pub enum OpsError {
 impl OpsError {
     /// Process exit code: 2 without a usable answer, 1 for an error the
     /// server reported or a failed write.
-    #[must_use]
+    #[must_use = "the process should exit with this code"]
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::InvalidUrl(_)

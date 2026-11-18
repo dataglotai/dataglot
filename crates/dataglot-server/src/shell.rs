@@ -480,7 +480,7 @@ mod tests {
     async fn drive(input: impl AsRef<[u8]>) -> (Vec<String>, String) {
         let mut ran = Vec::new();
         let mut stderr = Vec::new();
-        repl(
+        let code = repl(
             Cursor::new(input.as_ref().to_vec()),
             &mut stderr,
             async |sql: &str| {
@@ -494,6 +494,7 @@ mod tests {
         )
         .await
         .expect("repl");
+        assert_eq!(code, ExitCode::SUCCESS);
         (ran, String::from_utf8(stderr).expect("utf-8"))
     }
 
@@ -566,7 +567,7 @@ mod tests {
         });
         let mut ran = Vec::new();
         let mut stderr = Vec::new();
-        repl(
+        let code = repl(
             std::io::BufReader::new(Typed(typed, Vec::new())),
             &mut stderr,
             async |sql: &str| {
@@ -577,6 +578,7 @@ mod tests {
         )
         .await
         .expect("repl");
+        assert_eq!(code, ExitCode::SUCCESS);
         user.await.expect("typing task");
         let stderr = String::from_utf8(stderr).expect("utf-8");
         // The half-typed statement is gone; only the one after Ctrl-C ran.
@@ -684,7 +686,7 @@ mod tests {
             .expect("build session");
         let mut rendered = String::new();
         let mut stderr = Vec::new();
-        repl(
+        let code = repl(
             Cursor::new("SELECT\n  41 + 1 AS n,\n  'a;b' AS s\n;\n"),
             &mut stderr,
             async |sql: &str| {
@@ -698,6 +700,7 @@ mod tests {
         )
         .await
         .expect("repl");
+        assert_eq!(code, ExitCode::SUCCESS);
         assert!(rendered.contains("| 42 | a;b |"), "{rendered}");
     }
 }

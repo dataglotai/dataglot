@@ -50,6 +50,7 @@ async fn metrics_endpoint_serves_well_formed_prometheus_text() {
         dataglot_server::maintenance_registry::MaintenanceRegistry::empty(),
         dataglot_server::observability::ServerInfo::for_tests(),
         None,
+        dataglot_server::api_auth::ApiAuth::default(),
         shutdown_rx,
     )
     .await
@@ -184,4 +185,67 @@ async fn router_uses_prometheus_text_content_type() {
         .to_string();
     assert!(ct.contains("text/plain"));
     assert!(ct.contains("version=0.0.4"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_needs_the_token_once_one_is_configured() {
+    // A name no other test uses, so setting it can't affect anything else.
+    std::env::set_var("DATAGLOT_OBS_TEST_API_TOKEN", "obs-test-token");
+    let cfg = dataglot_server::observability::ObservabilityConfig {
+        api_token_env: Some("DATAGLOT_OBS_TEST_API_TOKEN".into()),
+        ..Default::default()
+    };
+    let auth = dataglot_server::api_auth::ApiAuth::from_config(&cfg).expect("token is set");
+
+    let addr = ephemeral_addr().await;
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    let handle = spawn_metrics_server(
+        addr,
+        Metrics::new().unwrap(),
+        true,
+        &dataglot_server::lineage_snapshot::LineageSnapshot::default(),
+        dataglot_server::query_registry::QueryRegistry::new(),
+        dataglot_server::session_registry::SessionRegistry::new(),
+        dataglot_server::cluster::ClusterMonitor::new(None),
+        dataglot_server::connectors::ConnectorMonitor::empty(),
+        dataglot_server::materialization_registry::MaterializationRegistry::empty(),
+        dataglot_server::maintenance_registry::MaintenanceRegistry::empty(),
+        dataglot_server::observability::ServerInfo::for_tests(),
+        None,
+        auth,
+        shutdown_rx,
+    )
+    .await
+    .expect("spawn metrics server");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let url = format!("http://{addr}/api/server");
+
+    let without = client.get(&url).send().await.unwrap();
+    assert_eq!(without.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let with = client
+        .get(&url)
+        .bearer_auth("obs-test-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(with.status(), reqwest::StatusCode::OK);
+
+    // /metrics is out of scope and stays open.
+    let metrics = client
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metrics.status(), reqwest::StatusCode::OK);
+
+    shutdown_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("metrics server task should drain on shutdown")
+        .expect("task should not panic");
 }

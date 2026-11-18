@@ -1811,6 +1811,7 @@ impl DataglotServer {
                     self.control_plane_store
                         .as_ref()
                         .map(|s| (Arc::clone(s), self.boot_org.clone())),
+                    crate::api_auth::ApiAuth::from_config(&self.config.observability)?,
                     self.shutdown_tx.subscribe(),
                 )
                 .await

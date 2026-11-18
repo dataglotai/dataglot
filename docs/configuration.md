@@ -75,6 +75,32 @@ Plus the nested blocks documented below: `observability`, `catalogs`,
 | `health_check_enabled` | bool | `true` | Expose `/health` alongside `/metrics` |
 | `capture_query_sources` | bool | `false` | Plan each query once up front to record the source catalogs it federates across (dashboard federation breakdown), and — when execution is single-partition single-node — capture the per-source pushdown profile shown in the dashboard query treeview. Does **not** change parallelism. The pushdown→query correlation runs on the connection task, which DataFusion's parallel execution spawns past, so the treeview populates only with `partitions = 1` (an explicit profiling choice — it serializes local execution). In distributed mode pushdowns run in the executor processes and aren't captured by the scheduler dashboard. |
 | `connector_health_interval_secs` | int (seconds) | `30` | Background source-health probe interval feeding the dashboard's live connector status and the `dataglot_connector_up` gauge; `0` disables the poller (sources then carry zero monitoring load, liveness only via an on-demand "Check now") |
+| `api_token_env` | string or `null` | `null` | Name of the environment variable holding the bearer token for `/api/*`. Gives full access, including cancel and probe |
+| `api_read_token_env` | string or `null` | `null` | Name of the environment variable holding a read-only token for `/api/*`. Needs `api_token_env` as well |
+
+### Authentication for `/api/*`
+
+The HTTP API on `metrics_addr` (`/api/queries`, `/api/sessions`,
+`POST /api/queries/{run_id}/cancel`, `POST /api/connectors/{name}/probe`,
+and the rest) accepts an `Authorization: Bearer <token>` header:
+
+- With `api_token_env` set, every `/api/*` request needs a token. GET
+  requests accept either token; cancel and probe need the
+  `api_token_env` one.
+- Without a token on a loopback address (the default `127.0.0.1:9090`),
+  everything stays open, as before.
+- Without a token on any other address (the Docker image binds
+  `0.0.0.0:9090`), reads stay open and the server logs a warning at boot.
+  Cancel and probe return 403 until `api_token_env` is set.
+
+If a variable named here is unset or empty, the server refuses to start rather than serving `/api` without the token. `/metrics`, `/health`, `/lineage` and `/ui` are not covered. The dashboard doesn't send a token yet, so with `api_token_env` set its pages can't load data.
+
+```toml 
+[observability]
+metrics_addr = "0.0.0.0:9090"
+api_token_env = "DATAGLOT_API_TOKEN"
+api_read_token_env = "DATAGLOT_API_READ_TOKEN"   # optional
+```
 
 The same listener serves `GET /lineage`: the boot-time column-lineage
 graph across declared `derived_products`, as JSON

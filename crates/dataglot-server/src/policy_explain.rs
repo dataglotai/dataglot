@@ -107,7 +107,7 @@ struct ExplainState {
 /// match the expected token? Compares SHA-256 digests so the comparison
 /// is fixed-width regardless of token length (no length/content timing
 /// leak). `None` expected ⇒ always authorized (unauthenticated endpoint).
-fn authorized(expected: Option<&str>, headers: &axum::http::HeaderMap) -> bool {
+pub(crate) fn authorized(expected: Option<&str>, headers: &axum::http::HeaderMap) -> bool {
     use sha2::{Digest, Sha256};
     let Some(expected) = expected else {
         return true;
