@@ -1,14 +1,17 @@
-import { useCallback, useEffect, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useState } from "react";
 
 import {
   type ActiveQuery,
+  apiToken,
   type ClusterSummary,
   getCluster,
   getQueries,
   getServerInfo,
   getSessions,
+  onAuthRequired,
   type ServerInfo,
   type Session,
+  setApiToken,
 } from "./api";
 import { Cluster } from "./Cluster";
 import { Connectors } from "./Connectors";
@@ -41,6 +44,20 @@ export function App() {
   const [server, setServer] = useState<ServerInfo | null>(null);
   // run_id whose per-source pushdown profile overlay is open.
   const [profileRunId, setProfileRunId] = useState<string | null>(null);
+
+  // The server answered 401: ask for the /api token.
+  const [needToken, setNeedToken] = useState(false);
+  const [tokenInput, setTokenInput] = useState("");
+
+  useEffect(() => onAuthRequired(() => setNeedToken(true)), []);
+
+  const submitToken = (e: FormEvent) => {
+    e.preventDefault();
+    if (!tokenInput) return;
+    setApiToken(tokenInput);
+    // Reload so every tab fetches again, now with the token.
+    window.location.reload();
+  };
 
   // Static server metadata (version + ports) — fetch once for the header.
   useEffect(() => {
@@ -133,6 +150,28 @@ export function App() {
           {online ? "live" : "offline"}
         </span>
       </div>
+
+        {needToken && (
+        <form className="token" onSubmit={submitToken}>
+          <span>
+            {apiToken()
+              ? "The server refused this token."
+              : "This server needs an API token ([observability] api_token_env)."}
+          </span>
+          <input
+            type="password"
+            autoComplete="off"
+            placeholder="token"
+            aria-label="API token"
+            value={tokenInput}
+            onChange={(e) => setTokenInput(e.target.value)}
+          />
+          <button type="submit" className="btn-check">
+            Use token
+          </button>
+        </form>
+      )}
+
       <div className="tabs">
         <button
           className={`tab ${tab === "cluster" ? "active" : ""}`}
