@@ -222,20 +222,21 @@ as for `query`; `--format json` prints the server's response unchanged, with
 every field. Exit codes: 0 ok, 1 the server answered with an error, 2 no usable
 answer (nothing listening, or not a Dataglot API).
 
-When the explain endpoint wants a bearer token (`[policy_explain] token_env`),
-put it in `DATAGLOT_API_TOKEN`. It's only sent to the explain endpoint, and
-never over plain `http://` to another machine. The endpoint itself speaks plain
-HTTP, so to reach it on a remote server, go through an SSH tunnel
-(`ssh -L 8085:127.0.0.1:8085 db.example.com`, then the default
-`--explain-api` works) or a TLS-terminating proxy.
+When the server wants a bearer token, on `/api/*` (`[observability]
+api_token_env`, see [configuration](configuration.md#authentication-for-api))
+or on the explain endpoint (`[policy_explain] token_env`), put it in
+`DATAGLOT_API_TOKEN`. The same token goes to both, so if the server checks
+both, give them the same token. It's never sent over plain `http://` to
+another machine: with a token set, `ops` refuses an `http://` URL that isn't
+this machine. Both endpoints speak plain HTTP, so to reach them on a remote
+server, go through an SSH tunnel
+(`ssh -L 9090:127.0.0.1:9090 -L 8085:127.0.0.1:8085 db.example.com`, then the
+defaults work) or a TLS-terminating proxy.
 
-The server can require a bearer token on `/api/*` (`[observability]
-api_token_env`, see [configuration](configuration.md#authentication-for-api)).
-Without one, a server on a non-loopback address refuses cancel with 403, and
-anyone who can reach it can still list sessions and queries. The Docker image
-binds it to `0.0.0.0:9090`; publish it only to the host itself
-(`-p 127.0.0.1:9090:9090`). `dataglot ops` doesn't send the token to `/api/*`
-yet.
+Without a token, a server on a non-loopback address refuses cancel with 403,
+and anyone who can reach it can still list sessions and queries. The Docker
+image binds the API to `0.0.0.0:9090`; publish it only to the host itself
+(`-p 127.0.0.1:9090:9090`).
 
 A profile can carry the ops addresses too, so `--profile prod` works for `ops`
 as for `query`:
