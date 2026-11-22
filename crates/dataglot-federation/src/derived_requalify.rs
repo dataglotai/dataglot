@@ -1,4 +1,4 @@
-//!  /  — dialect-independent requalification of the dangling
+//! Dialect-independent requalification of the dangling
 //! derived-table column references the DataFusion unparser leaves on a
 //! pushed-down `DISTINCT` / `GROUP BY`. Shared by every SQL connector's
 //! [`SQLExecutor::ast_analyzer`](datafusion_federation::sql::SQLExecutor), chained
@@ -9,10 +9,10 @@
 //!
 //! 1. An ALIASED derived table `… AS derived_projection` whose outer references
 //!    still carry the leaked source qualifier (the `SELECT DISTINCT` / `GROUP BY`
-//!    wrapping, ) — requalified to the alias.
+//!    wrapping) — requalified to the alias.
 //! 2. An UNNAMED derived table `FROM (SELECT …)` the unparser emits for a
 //!    federated `EXCEPT` / `INTERSECT` or a correlated scalar subquery in `WHERE`
-//! — repaired by [`repair_unnamed_derived`] (unwrap a trivial
+//!    — repaired by [`repair_unnamed_derived`] (unwrap a trivial
 //!    wrapper, else give it a fresh alias).
 //!
 //! **Known limitation.** A branch-filtered set operation
