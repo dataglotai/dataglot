@@ -1107,10 +1107,11 @@ impl CatalogService {
             .collect())
     }
 
-    /// Every org with a persisted policy, sorted. Powers the
-    /// boot-time per-org policy replay — `SELECT DISTINCT org_id` over the
-    /// policy table so an org contributes exactly once regardless of how
-    /// many masks / row filters it owns.
+    /// Every org the store knows — the `org` table, which every org-scoped
+    /// table references by FK and every writer registers into first
+    /// (`ensure_org`). Used by boot replay (`load_all_grants`,
+    /// `load_persisted_policies`) so an org that owns only grants, only users,
+    /// or only secrets is replayed too.
     ///
     /// # Errors
     /// [`CatalogServiceError::Pool`] on checkout, [`CatalogServiceError::Query`]
@@ -1123,11 +1124,16 @@ impl CatalogService {
             .map_err(|e| CatalogServiceError::Pool(e.to_string()))?;
         let rows = client
             .query(
-                // `org_id` is `NOT NULL` in the schema, but guard defensively:
-                // a NULL row would make the `String` decode below panic. The
-                // filter is a no-op today and cheap insurance against a future
-                // schema change (Gemini review).
-                "SELECT DISTINCT org_id FROM db_policy WHERE org_id IS NOT NULL ORDER BY org_id",
+                // The `org` table is the FK target of EVERY org-scoped table
+                // (`db_policy`, `db_grant`, `db_user`, `db_role`,
+                // `db_role_member`, `secret`, `catalog_binding`, …) and every
+                // writer calls `ensure_org` first, so it is a guaranteed
+                // superset of "orgs that own anything". Enumerating it — not
+                // `db_policy` alone — is what makes a grant-only org visible to
+                // boot replay (: a `GRANT` under open mode was invisible
+                // to `load_all_grants` until the org also had a policy).
+                // `org_id` is the primary key, so it is never NULL.
+                "SELECT org_id FROM org ORDER BY org_id",
                 &[],
             )
             .await

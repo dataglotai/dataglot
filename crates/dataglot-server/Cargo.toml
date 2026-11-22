@@ -76,6 +76,18 @@ oracle-pure = ["dataglot-federation/oracle-pure"]
 # error.
 adbc = ["dataglot-federation/adbc"]
 
+# Phase 4 spec 05 — read from a remote Arrow Flight SQL server.
+# Turns on `dataglot-federation`'s `flightsql` feature, making
+# `kind = "flightsql"` catalogs usable. Pure Rust (gRPC over tonic), so it
+# adds no native dependency — it is opt-in only to keep the default build
+# free of arrow-flight + tonic-tls.
+#
+# NOT the same as the `flight_sql` feature below, which is the opposite
+# direction: that one makes this server *serve* Flight SQL to clients. A
+# `kind = "flightsql"` catalog on a binary built with only `flight_sql` is
+# rejected at boot with a message saying so.
+flightsql-source = ["dataglot-federation/flightsql"]
+
 # Phase 4 spec 04 — Arrow Flight SQL egress on :32010, the
 # native-Arrow half of the dual-egress commitment. Pulls `arrow-flight`
 # (with the Flight SQL server surface) + `tonic` (gRPC) + `tokio-stream`
@@ -126,7 +138,7 @@ clap_complete = "4"
 datafusion.workspace = true
 futures.workspace = true
 # Object storage for the `object_storage` catalog kind. Pinned
-# to 0.13 to match DataFusion 53.1's transitive `object_store` exactly —
+# to 0.13 to match DataFusion 55's transitive `object_store` exactly —
 # a version skew would make our `Arc<dyn ObjectStore>` a different type
 # than the one DataFusion's RuntimeEnv accepts. The `aws` feature adds
 # the S3 client (reqwest + rustls/ring — all pure-Rust / already in the

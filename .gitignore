@@ -50,3 +50,7 @@ node_modules/
 # Golden sidecar files pinned via the testbench (slice 3c) — local, not committed
 *.golden.json
 .claude/worktrees/
+
+# Scratch output written by the imported DataFusion sqllogictest corpus
+# (e.g. grouping.slt COPY TO), mirroring upstream's own ignore.
+crates/dataglot-tests/test_files/scratch/

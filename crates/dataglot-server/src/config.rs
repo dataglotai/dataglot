@@ -1944,6 +1944,19 @@ pub enum CatalogConfig {
     /// [`Self::Odata`]; unlike OData there's no metadata document, so each
     /// table's Arrow schema is declared. Pure-Rust, always compiled in.
     Rest(RestCatalogConfig),
+    /// Arrow Flight SQL source — see [`FlightSqlCatalogConfig`]. Phase 4
+    /// task 05. A `SQLExecutor` source like [`Self::Adbc`], but
+    /// reached over gRPC instead of by loading a driver, so it needs no
+    /// native library on the host. The config surface is always compiled;
+    /// the connector lives behind the server's `flightsql-source` feature,
+    /// and a `kind = "flightsql"` catalog on a server built without it is
+    /// rejected at boot with a clear error.
+    ///
+    /// Not to be confused with the server's own `[flight_sql]` block, which
+    /// is the listener Dataglot *exposes*. This is the opposite
+    /// direction: a Flight SQL server Dataglot *reads*.
+    #[serde(rename = "flightsql")]
+    FlightSql(FlightSqlCatalogConfig),
 }
 
 impl fmt::Debug for CatalogConfig {
@@ -1961,6 +1974,7 @@ impl fmt::Debug for CatalogConfig {
             Self::SapS4hana(c) => f.debug_tuple("SapS4hana").field(c).finish(),
             Self::Adbc(c) => f.debug_tuple("Adbc").field(c).finish(),
             Self::Rest(c) => f.debug_tuple("Rest").field(c).finish(),
+            Self::FlightSql(c) => f.debug_tuple("FlightSql").field(c).finish(),
         }
     }
 }
@@ -2049,6 +2063,20 @@ impl CatalogConfig {
             // (auth is a separate field), so the first table's URL is a safe
             // hint (rule 12). `<no tables>` is defensive — boot rejects an
             // empty table list.
+            // Redacted, not rendered verbatim. The comment here used to
+            // argue that `validate()` refuses userinfo so the endpoint is
+            // safe to print — but that check lives in
+            // `FlightSqlConfig::validate` in the federation crate, i.e. at
+            // *connect* time. Boot persists this binding before any
+            // connector is built, and with `tolerate_unreachable_catalogs`
+            // it can publish the binding even when the connector later
+            // rejects the endpoint. A `grpc+tls://user:pass@host` would
+            // therefore reach the catalog-service store and the UI (rule
+            // 12). Same treatment as Postgres/MySQL above.
+            Self::FlightSql(c) => CatalogBinding::LiveConnector(LiveConnectorBinding {
+                kind: LiveConnectorKind::FlightSql,
+                endpoint_hint: redacted_endpoint_hint(Some(&c.endpoint), None),
+            }),
             Self::Rest(c) => CatalogBinding::LiveConnector(LiveConnectorBinding {
                 kind: LiveConnectorKind::Rest,
                 endpoint_hint: c
@@ -2076,8 +2104,8 @@ impl CatalogConfig {
         // OData / SAP / REST are direct `TableProvider`s (rule 3) — like
         // Warehouse / ObjectStorage, they produce no `VirtualExecutionPlan`,
         // so they don't need the federation filter-pushdown strip.
-        // Adbc is a `SQLExecutor` source like the four bespoke SQL
-        // connectors — without this classification its
+        // Adbc and FlightSql are `SQLExecutor` sources like the four
+        // bespoke SQL connectors — without this classification their
         // `FederatedTableProviderAdaptor` never gets rewritten and
         // every scan fails with "cannot scan".
         matches!(
@@ -2087,6 +2115,7 @@ impl CatalogConfig {
                 | Self::Snowflake(_)
                 | Self::Oracle(_)
                 | Self::Adbc(_)
+                | Self::FlightSql(_)
         )
     }
 }
@@ -2112,9 +2141,23 @@ fn redacted_endpoint_hint(dsn: Option<&str>, dsn_env: Option<&str>) -> String {
         if let Some(after_scheme) = dsn.find("://") {
             let scheme = &dsn[..after_scheme];
             let rest = &dsn[after_scheme + 3..];
-            // Drop userinfo if `@` appears before the first `/`.
-            let path_start = rest.find('/').unwrap_or(rest.len());
-            let authority = &rest[..path_start];
+            // The authority ends at the first `/`, `?` or `#`. Cutting only
+            // at `/` was a leak: an endpoint with no path, such as
+            // `grpc+tls://flight.example:443?access_token=hunter2`, kept its
+            // whole query string because there was no `/` to stop at — and
+            // this helper feeds both the persisted binding and `Debug`.
+            let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            let authority = &rest[..authority_end];
+            // An `@` *after* the authority cutoff means the string is not the
+            // shape this parser assumes. The case that matters:
+            // `grpc+tls://svc:p?ss@host:443` — a password containing a raw
+            // `?` (invalid; it must be percent-encoded, but we are redacting
+            // precisely because the input may be malformed). Cutting at `?`
+            // would yield `svc:p` and publish half a password as if it were
+            // a host. Fail closed rather than emit a confident wrong answer.
+            if rest[authority_end..].contains('@') {
+                return "<host: redacted>".to_string();
+            }
             let host_port = match authority.rfind('@') {
                 Some(at) => &authority[at + 1..],
                 None => authority,
@@ -2488,6 +2531,152 @@ impl fmt::Debug for OracleCatalogConfig {
                 },
             )
             .field("password_env", &self.password_env)
+            .finish()
+    }
+}
+
+/// Arrow Flight SQL catalog configuration — Phase 4 spec task 05
+///
+/// Declared under `[catalogs.<name>]` with `kind = "flightsql"`:
+///
+/// ```toml
+/// [catalogs.lakehouse]
+/// kind = "flightsql"
+/// endpoint = "grpc+tls://dremio.internal:32010"
+/// # Dremio has no DataFusion unparser dialect; `postgresql` is the
+/// # closest supported spelling (`dialect = "dremio"` is refused).
+/// dialect = "postgresql"
+/// auth = "basic"
+/// username = "svc_dataglot"
+/// password_env = "LAKEHOUSE_PASSWORD"
+/// handshake = true
+/// schema = "analytics"
+/// ```
+///
+/// Sibling of [`AdbcCatalogConfig`]: both are `SQLExecutor` sources, but
+/// this one speaks a wire protocol instead of loading a driver, so it
+/// needs no native library on the host and no `driver_path`.
+///
+/// # Not the `[flight_sql]` block
+///
+/// The server's own `[flight_sql]` section configures the listener
+/// Dataglot **exposes** to Flight SQL clients. This is the
+/// opposite direction — a Flight SQL server Dataglot **reads** — and it
+/// is gated behind the separate `flightsql-source` feature.
+///
+/// # Credentials
+///
+/// Passwords and tokens come only from `password_env` / `token_env`,
+/// resolved at connect and never stored. The `endpoint` is refused at
+/// boot if it carries userinfo, which is what keeps it safe to render in
+/// bindings and errors (rule 12).
+///
+/// # Pairs with
+///
+/// `dataglot_federation::flightsql::FlightSqlConnector::connect(FlightSqlConfig)`
+/// — the field vocabulary is kept aligned deliberately (hard rule 4).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlightSqlCatalogConfig {
+    /// Endpoint URI. `grpc://`, `grpc+tcp://` and `http://` are
+    /// plaintext; `grpc+tls://` and `https://` enable TLS.
+    pub endpoint: String,
+    /// Mandatory SQL dialect of the serving engine. Validated at boot
+    /// against the connector's whitelist (`datafusion | postgresql |
+    /// mysql | sqlite | duckdb | bigquery`).
+    pub dialect: String,
+    /// Authentication method: `none` (default), `basic`, or `bearer`.
+    #[serde(default = "default_flightsql_auth")]
+    pub auth: String,
+    /// Username for `auth = "basic"`.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Name of an environment variable holding the password for
+    /// `auth = "basic"`. Resolved at connect, never stored or logged.
+    #[serde(default)]
+    pub password_env: Option<String>,
+    /// Name of an environment variable holding the token for
+    /// `auth = "bearer"`.
+    #[serde(default)]
+    pub token_env: Option<String>,
+    /// Exchange the Basic credential for a bearer token once at connect
+    /// instead of sending Basic on every RPC. Only meaningful with
+    /// `auth = "basic"`.
+    #[serde(default)]
+    pub handshake: bool,
+    /// PEM file with a custom CA to trust. TLS endpoints only.
+    #[serde(default)]
+    pub tls_ca_file: Option<String>,
+    /// Override the SNI / certificate domain name. TLS endpoints only.
+    #[serde(default)]
+    pub tls_domain: Option<String>,
+    /// Source-side catalog scope. Omit to address tables as
+    /// `schema.table` against the server's default catalog.
+    #[serde(default)]
+    pub catalog: Option<String>,
+    /// Source-side schema scope for discovery. Omit to list every schema
+    /// the server reports.
+    #[serde(default)]
+    pub schema: Option<String>,
+    /// TCP + TLS handshake budget for the initial connect.
+    #[serde(default = "default_flightsql_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// Per-RPC budget, **and** the inactivity deadline while a result
+    /// stream is being consumed. Omit for no client-side deadline.
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
+    /// Follow `GetFlightInfo` result locations pointing at a host other
+    /// than `endpoint`. Off by default: following one sends this
+    /// catalog's credentials wherever the remote nominates.
+    #[serde(default)]
+    pub follow_endpoint_locations: bool,
+}
+
+/// Spec default: no authentication.
+fn default_flightsql_auth() -> String {
+    "none".to_string()
+}
+
+/// Spec default: 10s to complete the TCP + TLS handshake.
+fn default_flightsql_connect_timeout_secs() -> u64 {
+    10
+}
+
+impl fmt::Debug for FlightSqlCatalogConfig {
+    /// Credential-safe `Debug` per hard rule 12.
+    ///
+    /// Visible: everything that is a name or a knob, including
+    /// `password_env` / `token_env` (the variable names, not their
+    /// values).
+    /// Redacted: `username`, matching the Oracle / Snowflake / ADBC
+    /// treatment of auth-adjacent fields, and any userinfo in
+    /// `endpoint`.
+    ///
+    /// `endpoint` used to print verbatim, on the reasoning that boot
+    /// refuses one carrying userinfo. That check lives in
+    /// `FlightSqlConfig::validate` in the federation crate and runs at
+    /// connect time, whereas `Debug` is reachable from config parsing and
+    /// error reporting well before it — so the reasoning protected
+    /// nothing at the moment it mattered. Redacting costs a host:port
+    /// that stays visible anyway.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlightSqlCatalogConfig")
+            .field(
+                "endpoint",
+                &redacted_endpoint_hint(Some(&self.endpoint), None),
+            )
+            .field("dialect", &self.dialect)
+            .field("auth", &self.auth)
+            .field("username", &self.username.as_ref().map(|_| "<redacted>"))
+            .field("password_env", &self.password_env)
+            .field("token_env", &self.token_env)
+            .field("handshake", &self.handshake)
+            .field("tls_ca_file", &self.tls_ca_file)
+            .field("tls_domain", &self.tls_domain)
+            .field("catalog", &self.catalog)
+            .field("schema", &self.schema)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("follow_endpoint_locations", &self.follow_endpoint_locations)
             .finish()
     }
 }
@@ -3409,11 +3598,14 @@ fn predicate_to_expr(pred: &RowPredicateConfig) -> Result<datafusion::logical_ex
 /// 1. Walk the SQL via `sqlparser` to harvest every referenced
 ///    column name. We don't know the real types until query time,
 ///    so we synthesize a `DFSchema` where every harvested column
-///    is `Utf8` — just enough for `parse_sql_expr`'s identifier
-///    resolution to succeed.
+///    is `Null` ("type unknown") — just enough for
+///    `parse_sql_expr`'s identifier resolution to succeed. `Null`
+///    rather than a concrete type because `DataFusion` 55 type-checks
+///    some operators while planning (e.g. `NOT` requires a
+///    boolean-coercible operand), and `Null` coerces to every type.
 /// 2. Call `SessionContext::parse_sql_expr` against the synthetic
 ///    schema to convert the SQL to an `Expr`. Column references in
-///    the resulting `Expr` carry the synthetic `Utf8` type; at
+///    the resulting `Expr` carry the synthetic `Null` type; at
 ///    query time, `DataFusion`'s `TypeCoercion` analyzer rebinds
 ///    them to the real `TableScan` schema and inserts casts where
 ///    needed.
@@ -3438,7 +3630,7 @@ pub(crate) fn parse_sql_predicate(sql: &str) -> Result<datafusion::logical_expr:
     // Phase 2 — synthetic schema + parse_sql_expr.
     let fields: Vec<Field> = idents
         .into_iter()
-        .map(|name| Field::new(name, DataType::Utf8, true))
+        .map(|name| Field::new(name, DataType::Null, true))
         .collect();
     let arrow_schema = Schema::new(fields);
     let dfschema = DFSchema::try_from(arrow_schema)
@@ -3697,6 +3889,42 @@ pub(crate) fn build_grant_enforcer(
                     default_schema.to_string(),
                 ))),
         )),
+    }
+}
+
+///: in `open` mode nothing is enforced, but `GRANT` / `REVOKE` are
+/// still accepted from administrator sessions and **persisted** — dormant
+/// until the operator switches to `grant` mode, when every one of them goes
+/// live at once. Surface that at boot so persisted grants are never mistaken
+/// for active authorization. `None` when there is nothing to warn about.
+pub(crate) fn dormant_grants_warning(mode: AuthzMode, grant_count: usize) -> Option<String> {
+    match mode {
+        AuthzMode::Open if grant_count > 0 => Some(format!(
+            "[authz] mode = \"open\": authorization is NOT enforced, but {grant_count} persisted \
+             grant(s) exist in the control-plane store. They are dormant and take effect all \
+             at once the moment mode is switched to \"grant\" (docs/access-control.md)."
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod dormant_grants_tests {
+    use super::*;
+
+    #[test]
+    fn open_mode_with_persisted_grants_warns() {
+        let msg = dormant_grants_warning(AuthzMode::Open, 3).expect("warns");
+        assert!(msg.contains("3 persisted grant(s)"), "{msg}");
+        assert!(msg.contains("NOT enforced"), "{msg}");
+        assert!(msg.contains("switched to \"grant\""), "{msg}");
+    }
+
+    #[test]
+    fn silent_without_grants_or_in_grant_mode() {
+        assert_eq!(dormant_grants_warning(AuthzMode::Open, 0), None);
+        assert_eq!(dormant_grants_warning(AuthzMode::Grant, 3), None);
+        assert_eq!(dormant_grants_warning(AuthzMode::Grant, 0), None);
     }
 }
 
@@ -4043,7 +4271,7 @@ impl ServerConfig {
     /// If a derived product declares `backing = "materialized"` without a
     /// `materialization` block (an invalid shape that would otherwise fail
     /// later, at refresh time).
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         for p in &self.derived_products {
             if p.backing == MaterializationBacking::Materialized && p.materialization.is_none() {
                 anyhow::bail!(
@@ -4057,6 +4285,52 @@ impl ServerConfig {
         // launcher that must be told a concrete scheduler gRPC port up front,
         // so an ephemeral `0` would leave them unable to register. Reject the
         // combination before boot rather than hanging on registration.
+        // Reject a malformed Flight SQL endpoint here, at config time,
+        // rather than leaving it to `FlightSqlConfig::validate` in the
+        // federation crate. That check runs when the connector is built,
+        // which is after boot has already serialized the whole
+        // `CatalogConfig` into the catalog service's `source_config` store —
+        // so anything hiding in the endpoint was persisted verbatim before
+        // a single check ran, and with `tolerate_unreachable_catalogs` boot
+        // then carried on. Redacting `binding()` and `Debug` did not cover
+        // that third surface; refusing the config does.
+        //
+        // The rule mirrors `Transport::parse` exactly, and deliberately so:
+        // an endpoint is **a host and port and nothing else**. A first
+        // version of this guard rejected only userinfo, which left
+        // `grpc+tls://host:443?access_token=...` to be persisted and then
+        // refused by the connector — the same leak wearing a different
+        // shape. Each of userinfo, a path, a query and a fragment is
+        // somewhere a credential can hide, and none is meaningful to gRPC,
+        // which carries the method in the request. A bare trailing `/` is
+        // tolerated because that is what copy-paste produces.
+        //
+        // The error never echoes the endpoint: the offending part may be
+        // the secret.
+        for (name, cfg) in &self.catalogs {
+            let CatalogConfig::FlightSql(f) = cfg else {
+                continue;
+            };
+            let rest = f
+                .endpoint
+                .trim()
+                .split_once("://")
+                .map_or(f.endpoint.trim(), |(_, rest)| rest);
+            let authority = rest.strip_suffix('/').unwrap_or(rest);
+            if let Some(bad) = authority.find(['@', '/', '?', '#']) {
+                let part = match authority.as_bytes()[bad] {
+                    b'@' => "credentials",
+                    b'/' => "a path",
+                    b'?' => "a query string",
+                    _ => "a fragment",
+                };
+                anyhow::bail!(
+                    "catalog `{name}`: the flightsql `endpoint` carries {part}. An \
+                     endpoint is a host and port and nothing else — put credentials in \
+                     `auth` with `username`/`password_env` or `token_env`"
+                );
+            }
+        }
         if let Some(b) = &self.ballista {
             if b.external_executors > 0 && b.scheduler_grpc_port == 0 {
                 anyhow::bail!(
@@ -4064,6 +4338,38 @@ impl ServerConfig {
                      external_executors > 0 (external executors need a known port to \
                      register with); got 0"
                 );
+            }
+            // Flight SQL fragments cannot run on an externally-spawned
+            // executor: `dataglot-ballista` has no Flight SQL `CatalogEntry`
+            // and exposes no feature that enables
+            // `dataglot-federation/flightsql`, so a worker cannot build the
+            // connector its decoded plan asks for. The coordinator would
+            // happily encode the fragment and the query would fail on the
+            // executor with a registry/decode error — a runtime failure, in
+            // a distributed deployment, with a message pointing at the codec
+            // rather than at the configuration that caused it.
+            //
+            // Refuse the combination at boot instead. In-process executors
+            // (`external_executors == 0`) share this process's registry and
+            // are unaffected.
+            if b.external_executors > 0 {
+                let flightsql: Vec<&str> = self
+                    .catalogs
+                    .iter()
+                    .filter(|(_, c)| matches!(c, CatalogConfig::FlightSql(_)))
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                if !flightsql.is_empty() {
+                    anyhow::bail!(
+                        "flightsql catalogs ({}) cannot be used with \
+                         ballista.external_executors > 0: externally-spawned \
+                         executors cannot build Flight SQL connectors, so scheduled \
+                         fragments would fail at query time. Use \
+                         external_executors = 0 (in-process executors), or drop the \
+                         Flight SQL catalogs from this deployment.",
+                        flightsql.join(", ")
+                    );
+                }
             }
         }
         Ok(())
@@ -4655,6 +4961,7 @@ pub(crate) fn catalog_kind(cfg: &CatalogConfig) -> &'static str {
         CatalogConfig::SapS4hana(_) => "sap_s4hana",
         CatalogConfig::Adbc(_) => "adbc",
         CatalogConfig::Rest(_) => "rest",
+        CatalogConfig::FlightSql(_) => "flightsql",
     }
 }
 
@@ -4953,6 +5260,7 @@ pub async fn build_one_connector_with_health(
         CatalogConfig::SapS4hana(sap) => Ok((build_sap_catalog(name, sap).await?, None)),
         CatalogConfig::Adbc(a) => build_adbc_catalog(name, a).await,
         CatalogConfig::Rest(r) => Ok((build_rest_catalog(name, r).await?, None)),
+        CatalogConfig::FlightSql(f) => build_flightsql_catalog(name, f).await,
     }
 }
 
@@ -4998,6 +5306,100 @@ async fn build_adbc_catalog(
     // Reuse a pooled connection for liveness instead of reloading the
     // driver + reopening the pool on every poll tick.
     Ok((provider, Some(connector as ConnectorHealthHandle)))
+}
+
+/// Build a `kind = "flightsql"` catalog into a [`DfCatalogProvider`]
+///. Compiled only under `--features flightsql-source` —
+/// same reject-without-feature shape as `build_adbc_catalog`: the config
+/// surface always parses, the connector is opt-in.
+///
+/// Boot-time validation order (all errors name the catalog, none carry
+/// credentials — rule 12): dialect and auth-method whitelists first (pure
+/// capability checks, no I/O), then the connector's own `validate()` and
+/// env-var resolution inside `FlightSqlConnector::connect`.
+#[cfg(feature = "flightsql-source")]
+async fn build_flightsql_catalog(
+    name: &str,
+    f: &FlightSqlCatalogConfig,
+) -> Result<(Arc<dyn DfCatalogProvider>, Option<ConnectorHealthHandle>)> {
+    use dataglot_federation::flightsql::{
+        FlightSqlAuth, FlightSqlConfig, FlightSqlConnector, FlightSqlDialect,
+    };
+
+    let dialect: FlightSqlDialect = f
+        .dialect
+        .parse()
+        .with_context(|| format!("catalog '{name}': invalid flightsql dialect"))?;
+
+    // The auth method is a config-level choice, so its "you said basic but
+    // gave me no password_env" errors belong here rather than deep in the
+    // connector. Each arm names the field it wanted.
+    let auth = match f.auth.as_str() {
+        "none" => FlightSqlAuth::None,
+        "basic" => FlightSqlAuth::Basic {
+            username: f.username.clone().ok_or_else(|| {
+                anyhow::anyhow!("catalog '{name}': auth = \"basic\" requires `username`")
+            })?,
+            password_env: f.password_env.clone().ok_or_else(|| {
+                anyhow::anyhow!("catalog '{name}': auth = \"basic\" requires `password_env`")
+            })?,
+        },
+        "bearer" => FlightSqlAuth::Bearer {
+            token_env: f.token_env.clone().ok_or_else(|| {
+                anyhow::anyhow!("catalog '{name}': auth = \"bearer\" requires `token_env`")
+            })?,
+        },
+        other => anyhow::bail!(
+            "catalog '{name}': unknown auth method '{other}'; supported: none | basic | bearer"
+        ),
+    };
+
+    let mut config = FlightSqlConfig::new(name, f.endpoint.clone(), dialect);
+    config.auth = auth;
+    config.handshake = f.handshake;
+    config.tls_ca_file = f.tls_ca_file.as_ref().map(std::path::PathBuf::from);
+    config.tls_domain = f.tls_domain.clone();
+    config.catalog = f.catalog.clone();
+    config.schema = f.schema.clone();
+    config.connect_timeout_secs = f.connect_timeout_secs;
+    config.request_timeout_secs = f.request_timeout_secs;
+    config.follow_endpoint_locations = f.follow_endpoint_locations;
+
+    let connector = FlightSqlConnector::connect(config)
+        .await
+        .with_context(|| format!("catalog '{name}': flightsql connect failed"))?;
+    let connector = Arc::new(connector);
+    let provider = connector
+        .as_catalog_provider()
+        .await
+        .with_context(|| format!("catalog '{name}': failed to build flightsql catalog provider"))?;
+    // Reuse the authenticated channel for liveness: the poller
+    // plans `SELECT 1` on it instead of re-dialling and re-authenticating
+    // on every tick.
+    Ok((provider, Some(connector as ConnectorHealthHandle)))
+}
+
+/// Reject a `kind = "flightsql"` catalog when the server was built without
+/// the `flightsql-source` feature. The config deserializes fine, so boot
+/// fails fast with an actionable message instead of silently dropping the
+/// source (same pattern as the Oracle and ADBC stubs).
+///
+/// The message names the feature explicitly because the neighbouring
+/// `flight_sql` feature does the opposite thing — it serves Flight SQL to
+/// clients — and an operator who enabled that one will otherwise be sure
+/// they already did this.
+#[cfg(not(feature = "flightsql-source"))]
+#[allow(clippy::unused_async)] // signature parity with the feature-on variant
+async fn build_flightsql_catalog(
+    name: &str,
+    _f: &FlightSqlCatalogConfig,
+) -> Result<(Arc<dyn DfCatalogProvider>, Option<ConnectorHealthHandle>)> {
+    anyhow::bail!(
+        "catalog '{name}': kind = \"flightsql\" requires this server to be built with \
+         `--features flightsql-source` (reading from a remote Flight SQL server); this \
+         binary was built without it. Note this is not the `flight_sql` feature, which \
+         serves Flight SQL to clients"
+    )
 }
 
 /// Reject a `kind = "adbc"` catalog when the server was built without
@@ -6922,8 +7324,8 @@ mod tests {
         );
     }
 
-    /// The remaining committed demo configs (datahub, governance,
-    /// lakehouse-rustfs, tpch) must each deserialize from TOML into a
+    /// The remaining committed demo configs (datahub, governance, tpch)
+    /// must each deserialize from TOML into a
     /// `ServerConfig` and pass `validate()` — the  TOML switch
     /// converted them, so this pins that they stay loadable.
     #[test]
@@ -6936,10 +7338,6 @@ mod tests {
             (
                 "governance",
                 include_str!("../../../examples/demo/dataglot-with-governance.toml"),
-            ),
-            (
-                "lakehouse-rustfs",
-                include_str!("../../../examples/demo/dataglot-with-lakehouse-rustfs.toml"),
             ),
             (
                 "tpch",
@@ -7358,11 +7756,11 @@ mod tests {
         use datafusion::arrow::array::{ArrayRef, Int32Array, StringArray};
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::common::TableReference;
         use datafusion::datasource::MemTable;
         use datafusion::error::DataFusionError;
         use datafusion::optimizer::{OptimizerContext, OptimizerRule};
         use datafusion::prelude::SessionContext;
-        use datafusion::sql::TableReference;
         use dataglot_policy::{
             with_session_identity, AccessDenial, AccessDenyEnforcer, PolicyOptimizerRule,
         };
@@ -9534,6 +9932,351 @@ mod tests {
         let cfg = sample_snowflake_cfg();
         let pw = resolve_snowflake_password("sf_demo", &cfg).expect("literal resolves");
         assert_eq!(pw, "super-secret");
+    }
+
+    fn sample_flightsql_cfg() -> FlightSqlCatalogConfig {
+        FlightSqlCatalogConfig {
+            endpoint: "grpc+tls://dremio.internal:32010".to_string(),
+            dialect: "datafusion".to_string(),
+            auth: "basic".to_string(),
+            username: Some("svc_dataglot".to_string()),
+            password_env: Some("LAKEHOUSE_PASSWORD".to_string()),
+            token_env: None,
+            handshake: true,
+            tls_ca_file: None,
+            tls_domain: None,
+            catalog: None,
+            schema: Some("analytics".to_string()),
+            connect_timeout_secs: 10,
+            request_timeout_secs: None,
+            follow_endpoint_locations: false,
+        }
+    }
+
+    /// Pin the on-disk serde shape: a `kind = "flightsql"` object
+    /// deserializes into `CatalogConfig::FlightSql` with the documented
+    /// defaults applied, and round-trips unchanged.
+    ///
+    /// The tag is `flightsql`, **not** the `flight_sql` that
+    /// `rename_all = "snake_case"` would have produced — one spelling
+    /// across the config key, the catalog binding and the governance
+    /// platform. Renaming it is a breaking config change, which is what
+    /// this test exists to catch.
+    #[test]
+    fn catalog_config_flightsql_serde_roundtrip() {
+        let json = r#"{
+            "kind": "flightsql",
+            "endpoint": "grpc+tls://dremio.internal:32010",
+            "dialect": "datafusion",
+            "auth": "basic",
+            "username": "svc_dataglot",
+            "password_env": "LAKEHOUSE_PASSWORD",
+            "handshake": true,
+            "schema": "analytics"
+        }"#;
+        let cfg: CatalogConfig = serde_json::from_str(json).expect("kind=flightsql parses");
+        let CatalogConfig::FlightSql(f) = &cfg else {
+            panic!("expected CatalogConfig::FlightSql, got {cfg:?}");
+        };
+        assert_eq!(f.endpoint, "grpc+tls://dremio.internal:32010");
+        assert_eq!(f.dialect, "datafusion");
+        assert_eq!(f.auth, "basic");
+        assert_eq!(f.password_env.as_deref(), Some("LAKEHOUSE_PASSWORD"));
+        assert!(f.handshake);
+        assert_eq!(f.schema.as_deref(), Some("analytics"));
+        // Documented defaults for everything omitted.
+        assert_eq!(f.connect_timeout_secs, 10);
+        assert_eq!(f.request_timeout_secs, None);
+        assert_eq!(f.catalog, None);
+        assert!(
+            !f.follow_endpoint_locations,
+            "following remote-nominated hosts must never be the default"
+        );
+
+        let reser = serde_json::to_string(&cfg).expect("serializes");
+        assert!(
+            reser.contains(r#""kind":"flightsql""#),
+            "the tag must stay `flightsql`: {reser}"
+        );
+        let back: CatalogConfig = serde_json::from_str(&reser).expect("re-parses");
+        let CatalogConfig::FlightSql(f2) = &back else {
+            panic!("round-trip lost the FlightSql variant: {back:?}");
+        };
+        assert_eq!(f2.endpoint, f.endpoint);
+        assert_eq!(f2.auth, f.auth);
+        assert_eq!(f2.handshake, f.handshake);
+    }
+
+    /// `auth` defaults to `none`, so an endpoint that needs no credentials
+    /// is three lines of config.
+    #[test]
+    fn a_flightsql_catalog_needs_only_an_endpoint_and_a_dialect() {
+        let json = r#"{
+            "kind": "flightsql",
+            "endpoint": "grpc://localhost:32010",
+            "dialect": "datafusion"
+        }"#;
+        let cfg: CatalogConfig = serde_json::from_str(json).expect("parses");
+        let CatalogConfig::FlightSql(f) = &cfg else {
+            panic!("expected FlightSql, got {cfg:?}");
+        };
+        assert_eq!(f.auth, "none");
+        assert_eq!(f.username, None);
+        assert_eq!(f.password_env, None);
+    }
+
+    /// Rule 12: no credential-adjacent value in `Debug`. The env-var
+    /// *names* stay visible — they are what an operator needs to fix a
+    /// misconfiguration — and so does the endpoint's host:port.
+    #[test]
+    fn flightsql_debug_redacts_credentials_but_keeps_the_variable_names() {
+        let rendered = format!("{:?}", sample_flightsql_cfg());
+        assert!(rendered.contains("LAKEHOUSE_PASSWORD"), "{rendered}");
+        assert!(
+            rendered.contains("grpc+tls://dremio.internal:32010"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("svc_dataglot"),
+            "the username is auth-adjacent and redacted like Oracle's: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    /// Credentials hide in query strings too, not just userinfo.
+    ///
+    /// The authority used to be taken as "everything up to the first `/`",
+    /// which is the whole string when the endpoint has no path — so
+    /// `?access_token=...` survived into the persisted binding and into
+    /// `Debug`. Both of the callers that matter share this helper, so the
+    /// fix belongs here rather than at either call site.
+    #[test]
+    fn redacted_endpoint_hint_drops_query_and_fragment() {
+        for (raw, want) in [
+            // The reported leak: a token, and no path to stop at.
+            (
+                "grpc+tls://flight.example:443?access_token=hunter2",
+                "grpc+tls://flight.example:443",
+            ),
+            ("grpc://host:9000#token=hunter2", "grpc://host:9000"),
+            // A raw `?` inside userinfo puts the `@` past the cutoff. Cutting
+            // at `?` would publish `grpc+tls://svc:p` — half a password
+            // wearing a hostname. Refuse rather than guess.
+            ("grpc+tls://svc:p?ss@flight.example:443", "<host: redacted>"),
+            // Userinfo and a query together.
+            (
+                "grpc+tls://svc:pw@flight.example:443?access_token=hunter2",
+                "grpc+tls://flight.example:443",
+            ),
+            // Unchanged behaviour for the shapes that already worked.
+            (
+                "postgres://u:p@db.internal:5432/app",
+                "postgres://db.internal:5432",
+            ),
+            (
+                "grpc+tls://dremio.internal:32010",
+                "grpc+tls://dremio.internal:32010",
+            ),
+        ] {
+            assert_eq!(redacted_endpoint_hint(Some(raw), None), want, "raw: {raw}");
+        }
+    }
+
+    /// A malformed endpoint must be refused by `validate()`, not left to
+    /// the connector.
+    ///
+    /// Redacting `binding()` and `Debug` covered two surfaces and missed a
+    /// third: boot serializes the whole `CatalogConfig` into the catalog
+    /// service's `source_config` store, so the credentials were persisted
+    /// verbatim before `FlightSqlConfig::validate` ever ran — and with
+    /// `tolerate_unreachable_catalogs`, boot carried on afterwards.
+    /// Refusing the config is what actually closes that, because it
+    /// happens before anything is written.
+    #[test]
+    fn flightsql_endpoint_with_credentials_is_refused_by_validate() {
+        for endpoint in [
+            // Userinfo.
+            "grpc+tls://svc:hunter2@dremio.internal:32010",
+            "grpc://svc@dremio.internal:32010",
+            "grpc+tls://svc:p?ss@dremio.internal:32010",
+            // A query string, which the first version of this guard let
+            // through because it only looked for `@` — so the token was
+            // persisted to `source_config` and only then refused by the
+            // connector. Same leak, different shape.
+            "grpc+tls://dremio.internal:32010?access_token=hunter2",
+            // A fragment, and a path. Neither means anything to gRPC and
+            // both are somewhere a credential can hide.
+            "grpc+tls://dremio.internal:32010#token=hunter2",
+            "grpc+tls://dremio.internal:32010/some/path",
+        ] {
+            let mut f = sample_flightsql_cfg();
+            f.endpoint = endpoint.to_string();
+            let mut cfg = ServerConfig::default();
+            cfg.catalogs
+                .insert("lakehouse".to_string(), CatalogConfig::FlightSql(f));
+            let err = cfg
+                .validate()
+                .expect_err("endpoint carrying credentials must not boot")
+                .to_string();
+            assert!(err.contains("lakehouse"), "name the catalog: {err}");
+            assert!(
+                err.contains("credentials")
+                    || err.contains("query string")
+                    || err.contains("fragment")
+                    || err.contains("a path"),
+                "say what is wrong with it: {err}"
+            );
+            // The offending part may itself be the secret, so the message
+            // names the *kind* of problem and never echoes the endpoint.
+            assert!(
+                !err.contains("hunter2") && !err.contains(endpoint),
+                "the error echoed the endpoint: {err}"
+            );
+        }
+
+        // Ordinary endpoints still validate — including a bare trailing
+        // slash, which is what copy-paste produces and which
+        // `Transport::parse` also tolerates.
+        for endpoint in [
+            "grpc+tls://dremio.internal:32010",
+            "grpc+tls://dremio.internal:32010/",
+            "http://localhost:32010",
+        ] {
+            let mut f = sample_flightsql_cfg();
+            f.endpoint = endpoint.to_string();
+            let mut cfg = ServerConfig::default();
+            cfg.catalogs
+                .insert("lakehouse".to_string(), CatalogConfig::FlightSql(f));
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("`{endpoint}` should validate: {e}"));
+        }
+    }
+
+    /// Flight SQL + externally-spawned executors must be refused at boot.
+    ///
+    /// `dataglot-ballista` has no Flight SQL `CatalogEntry` and no feature
+    /// that enables `dataglot-federation/flightsql`, so a worker cannot
+    /// build the connector a decoded plan asks for. Without this guard the
+    /// coordinator encodes the fragment happily and the query dies on the
+    /// executor with a codec error that names nothing an operator can act
+    /// on. In-process executors share this process's registry, so
+    /// `external_executors = 0` stays allowed.
+    #[test]
+    fn flightsql_with_external_executors_is_refused_at_boot() {
+        let mut cfg = ServerConfig::default();
+        cfg.catalogs.insert(
+            "lakehouse".to_string(),
+            CatalogConfig::FlightSql(sample_flightsql_cfg()),
+        );
+        cfg.ballista = Some(BallistaServerConfig {
+            external_executors: 2,
+            scheduler_grpc_port: 50050,
+            ..BallistaServerConfig::default()
+        });
+        let err = cfg
+            .validate()
+            .expect_err("flightsql + external executors must not boot")
+            .to_string();
+        assert!(err.contains("lakehouse"), "name the catalog: {err}");
+        assert!(
+            err.contains("external_executors"),
+            "name the setting that conflicts: {err}"
+        );
+
+        // In-process executors are fine — they share this registry.
+        cfg.ballista = Some(BallistaServerConfig {
+            external_executors: 0,
+            ..BallistaServerConfig::default()
+        });
+        cfg.validate()
+            .expect("in-process executors can run flightsql fragments");
+    }
+
+    /// The case the two tests above never reached.
+    ///
+    /// Both use a credential-free endpoint, so they passed whether or not
+    /// anything was redacted — they encoded the same assumption the code
+    /// comments did: that boot refuses userinfo before either path runs.
+    /// It does not. That check is `FlightSqlConfig::validate` in the
+    /// federation crate and runs at *connect* time, while `binding()` is
+    /// called during the control-plane seed and `Debug` is reachable from
+    /// config parsing and error reporting — both strictly earlier. With
+    /// `tolerate_unreachable_catalogs`, boot can even publish the binding
+    /// for a catalog whose connector later rejects that very endpoint.
+    ///
+    /// So this feeds an endpoint that *does* carry userinfo and pins that
+    /// neither surface emits it.
+    #[test]
+    fn flightsql_userinfo_never_reaches_a_binding_or_a_log_line() {
+        let mut cfg = sample_flightsql_cfg();
+        cfg.endpoint = "grpc+tls://svc:hunter2@dremio.internal:32010".to_string();
+
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("hunter2") && !rendered.contains("svc:"),
+            "Debug leaked endpoint userinfo: {rendered}"
+        );
+        assert!(
+            rendered.contains("dremio.internal:32010"),
+            "the host:port is the useful part and must survive: {rendered}"
+        );
+
+        let binding = CatalogConfig::FlightSql(cfg).binding();
+        let CatalogBinding::LiveConnector(b) = binding else {
+            panic!("expected a LiveConnector binding, got {binding:?}");
+        };
+        assert_eq!(
+            b.endpoint_hint, "grpc+tls://dremio.internal:32010",
+            "the binding is persisted to the meta store and rendered in the \
+             UI — userinfo must never reach it"
+        );
+    }
+
+    /// A Flight SQL catalog is a `SQLExecutor` source, so it must be
+    /// classified as federated — otherwise its
+    /// `FederatedTableProviderAdaptor` is never rewritten and every scan
+    /// fails with "cannot scan" (the  slice 2 failure mode).
+    #[test]
+    fn flightsql_requires_federation() {
+        assert!(CatalogConfig::FlightSql(sample_flightsql_cfg()).requires_federation());
+        assert_eq!(
+            catalog_kind(&CatalogConfig::FlightSql(sample_flightsql_cfg())),
+            "flightsql"
+        );
+    }
+
+    /// The binding carries the endpoint's host:port as its hint, with any
+    /// userinfo stripped.
+    #[test]
+    fn flightsql_binds_to_a_live_connector_with_a_credential_free_hint() {
+        let binding = CatalogConfig::FlightSql(sample_flightsql_cfg()).binding();
+        let CatalogBinding::LiveConnector(b) = binding else {
+            panic!("expected a LiveConnector binding, got {binding:?}");
+        };
+        assert_eq!(b.kind, LiveConnectorKind::FlightSql);
+        assert_eq!(b.endpoint_hint, "grpc+tls://dremio.internal:32010");
+    }
+
+    /// Without the feature, a configured catalog must fail at boot rather
+    /// than vanish — and the error has to disambiguate the two
+    /// similarly-named features, because an operator who enabled
+    /// `flight_sql` will otherwise be certain they already did this.
+    #[tokio::test]
+    #[cfg(not(feature = "flightsql-source"))]
+    async fn flightsql_without_the_feature_is_rejected_at_boot() {
+        // `Result::expect_err` needs `Debug` on the Ok side, and
+        // `dyn ConnectorHealthCheck` has none.
+        let Err(err) = build_flightsql_catalog("lakehouse", &sample_flightsql_cfg()).await else {
+            panic!("must be rejected without the feature");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("lakehouse"), "names the catalog: {msg}");
+        assert!(msg.contains("flightsql-source"), "names the feature: {msg}");
+        assert!(
+            msg.contains("flight_sql"),
+            "and distinguishes it from the listener feature: {msg}"
+        );
+        assert!(!msg.contains("LAKEHOUSE_PASSWORD"), "rule 12: {msg}");
     }
 
     fn sample_adbc_cfg() -> AdbcCatalogConfig {

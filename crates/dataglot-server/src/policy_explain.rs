@@ -277,9 +277,9 @@ mod tests {
 
     use datafusion::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::TableReference;
     use datafusion::datasource::MemTable;
     use datafusion::logical_expr::lit;
-    use datafusion::sql::TableReference;
     use dataglot_policy::{
         AccessDenial, AccessDenyEnforcer, ColumnMask, ColumnMaskingEnforcer, CompositeEnforcer,
     };

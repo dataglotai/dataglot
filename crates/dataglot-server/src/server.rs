@@ -662,6 +662,16 @@ impl DataglotServer {
     // nature — one line over the lint after 's store registration.
     #[allow(clippy::too_many_lines)]
     pub async fn new(config: ServerConfig) -> Result<Self> {
+        // `ServerConfig::load` validates, but `new` is public and an
+        // embedding can build a `ServerConfig` by hand and come straight
+        // here — so every check in `validate()` was advisory for that
+        // caller. Notably the Flight SQL guards: an endpoint carrying
+        // credentials, or a Flight SQL catalog combined with external
+        // executors that cannot decode its plans, would both boot fine and
+        // fail later. Validating here makes the config contract the same
+        // whichever door you come in by.
+        config.validate()?;
+
         let session_factory = SessionContextFactory::new(config.to_session_config())
             .context("Failed to create session factory")?;
 
@@ -912,7 +922,29 @@ impl DataglotServer {
         // named binding so `StoreGrantAdmin` can republish the fresh set on a
         // runtime `GRANT` / `REVOKE`.
         let grant_enforcer = match config.authz.mode {
-            crate::config::AuthzMode::Open => None,
+            crate::config::AuthzMode::Open => {
+                //: grants persisted under `open` are dormant and go
+                // live the moment the mode is switched — say so at boot. A
+                // load failure must not stop an open-mode boot (nothing is
+                // enforced), so it is logged and skipped.
+                if let Some(store) = ddl_store.as_ref() {
+                    match load_all_grants(store.as_ref()).await {
+                        Ok(grants) => {
+                            if let Some(msg) = crate::config::dormant_grants_warning(
+                                config.authz.mode,
+                                grants.len(),
+                            ) {
+                                tracing::warn!("{msg}");
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            error = %format!("{e:#}"),
+                            "could not inspect persisted grants for the open-mode boot warning"
+                        ),
+                    }
+                }
+                None
+            }
             crate::config::AuthzMode::Grant => {
                 let grants = match ddl_store.as_ref() {
                     Some(store) => load_all_grants(store.as_ref())

@@ -32,7 +32,7 @@ rustls = { workspace = true }
 rustls-pemfile.workspace = true
 # Pre-plan validation of client SQL (reject pathological compound
 # identifiers that panic datafusion's planner — ). Same version
-# datafusion 53 resolves to; `visitor` enables the AST walk. Already in
+# datafusion 55 resolves to (keep in lockstep — do not bump alone); `visitor` enables the AST walk. Already in
 # the tree transitively via datafusion.
 sqlparser = { version = "0.62", features = ["visitor"] }
 thiserror.workspace = true

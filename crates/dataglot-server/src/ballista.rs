@@ -137,6 +137,185 @@ mod enabled {
     /// its own `Arc`. A future polish could share the underlying
     /// connector across both surfaces (saving one TCP handshake per
     /// Postgres catalog at boot); deferred for now.
+    /// Rebuild an ADBC connector on the executor side from its catalog
+    /// config. Split out so [`connect_registry_kind`]'s match stays a table
+    /// of one-liners rather than a page of per-connector translation.
+    #[cfg(feature = "adbc")]
+    async fn connect_adbc(
+        name: &str,
+        a: crate::config::AdbcCatalogConfig,
+    ) -> Result<Arc<dyn dataglot_federation::SQLExecutor>> {
+        use dataglot_federation::SQLExecutor;
+
+        use dataglot_federation::adbc::{AdbcConfig, AdbcConnector, SupportedDialect};
+        match a.dialect.parse::<SupportedDialect>() {
+            Err(_) => Err(anyhow::anyhow!(
+                "ballista codec registry: adbc '{name}' has an invalid dialect"
+            )),
+            Ok(dialect) => {
+                let mut cfg = AdbcConfig::new(name, a.driver_path, dialect);
+                cfg.driver_entrypoint = a.driver_entrypoint;
+                cfg.uri = a.uri;
+                cfg.username = a.username;
+                cfg.password_env = a.password_env;
+                cfg.driver_options = a.driver_options;
+                cfg.catalog = a.catalog;
+                cfg.schema = a.schema;
+                cfg.connection_pool_size = a.connection_pool_size;
+                cfg.connection_pool_min_idle = a.connection_pool_min_idle;
+                AdbcConnector::connect(cfg)
+                    .await
+                    .map(|c| Arc::new(c) as Arc<dyn SQLExecutor>)
+                    .with_context(|| {
+                        format!("ballista codec registry: adbc '{name}' connect failed")
+                    })
+            }
+        }
+    }
+
+    /// Rebuild a Flight SQL connector on the executor side from its catalog
+    /// config. Split out for the same reason as [`connect_adbc`].
+    #[cfg(feature = "flightsql-source")]
+    async fn connect_flightsql(
+        name: &str,
+        f: crate::config::FlightSqlCatalogConfig,
+    ) -> Result<Arc<dyn dataglot_federation::SQLExecutor>> {
+        use dataglot_federation::SQLExecutor;
+
+        use dataglot_federation::flightsql::{
+            FlightSqlAuth, FlightSqlConfig, FlightSqlConnector, FlightSqlDialect,
+        };
+        // These used to fall back to `FlightSqlAuth::None`, on the reasoning
+        // that `build_flightsql_catalog` had already validated the auth shape
+        // at boot. It has not necessarily run: under
+        // `tolerate_unreachable_catalogs` the catalog builder skips a failing
+        // catalog and boot continues, and this registry is still built from
+        // the file config afterwards.
+        //
+        // Falling back is the wrong direction to fail in. A server that
+        // requires auth rejects the first query with an error that points
+        // nowhere near the missing `password_env`; worse, a server that
+        // permits anonymous access accepts the connection with
+        // authentication silently switched off. Both are harder to diagnose
+        // than a startup error naming the field.
+        let auth = match f.auth.as_str() {
+            "none" => FlightSqlAuth::None,
+            "basic" => {
+                let (Some(username), Some(password_env)) = (f.username, f.password_env) else {
+                    return Err(anyhow::anyhow!(
+                        "ballista codec registry: flightsql '{name}' has auth = \"basic\" \
+                         but is missing `username` and/or `password_env`"
+                    ));
+                };
+                FlightSqlAuth::Basic {
+                    username,
+                    password_env,
+                }
+            }
+            "bearer" => {
+                let Some(token_env) = f.token_env else {
+                    return Err(anyhow::anyhow!(
+                        "ballista codec registry: flightsql '{name}' has auth = \"bearer\" \
+                         but is missing `token_env`"
+                    ));
+                };
+                FlightSqlAuth::Bearer { token_env }
+            }
+            other => {
+                return Err(anyhow::anyhow!(
+                    "ballista codec registry: flightsql '{name}' has an unknown auth \
+                     method `{other}` (expected `none`, `basic` or `bearer`)"
+                ));
+            }
+        };
+        match f.dialect.parse::<FlightSqlDialect>() {
+            Err(_) => Err(anyhow::anyhow!(
+                "ballista codec registry: flightsql '{name}' has an invalid dialect"
+            )),
+            Ok(dialect) => {
+                let mut cfg = FlightSqlConfig::new(name, f.endpoint, dialect);
+                cfg.auth = auth;
+                cfg.handshake = f.handshake;
+                cfg.tls_ca_file = f.tls_ca_file.map(std::path::PathBuf::from);
+                cfg.tls_domain = f.tls_domain;
+                cfg.catalog = f.catalog;
+                cfg.schema = f.schema;
+                cfg.connect_timeout_secs = f.connect_timeout_secs;
+                cfg.request_timeout_secs = f.request_timeout_secs;
+                cfg.follow_endpoint_locations = f.follow_endpoint_locations;
+                FlightSqlConnector::connect(cfg)
+                    .await
+                    .map(|c| Arc::new(c) as Arc<dyn SQLExecutor>)
+                    .with_context(|| {
+                        format!(
+                            "ballista codec registry: flightsql '{name}' connect \
+                                         failed"
+                        )
+                    })
+            }
+        }
+    }
+
+    /// Connect one registry entry's connector.
+    ///
+    /// Split out of [`build_executor_registry`] so that loop stays readable
+    /// as connector kinds accumulate — each arm is a config-to-connector
+    /// translation of real size, and the loop around them is four lines of
+    /// bookkeeping.
+    async fn connect_registry_kind(
+        name: &str,
+        kind: RegistrySqlKind,
+    ) -> Result<Arc<dyn dataglot_federation::SQLExecutor>> {
+        use dataglot_federation::SQLExecutor;
+
+        match kind {
+            RegistrySqlKind::Postgres(dsn) => PostgresConnector::connect(&dsn)
+                .await
+                .map(|c| Arc::new(c.with_catalog(name)) as Arc<dyn SQLExecutor>)
+                .with_context(|| {
+                    format!("ballista codec registry: postgres '{name}' connect failed")
+                }),
+            RegistrySqlKind::Mysql(dsn) => MysqlConnector::connect(name, &dsn)
+                .await
+                .map(|c| Arc::new(c) as Arc<dyn SQLExecutor>)
+                .with_context(|| format!("ballista codec registry: mysql '{name}' connect failed")),
+            RegistrySqlKind::Snowflake(cfg) => {
+                // `connect` builds the REST client without a network
+                // round-trip (auth fires on the first query), so this is
+                // synchronous and cheap; each executor resolves its own
+                // credentials locally.
+                SnowflakeConnector::connect(name, cfg)
+                    .map(|c| Arc::new(c) as Arc<dyn SQLExecutor>)
+                    .with_context(|| {
+                        format!("ballista codec registry: snowflake '{name}' connect failed")
+                    })
+            }
+            #[cfg(any(feature = "oracle", feature = "oracle-pure"))]
+            RegistrySqlKind::Oracle {
+                dsn,
+                user,
+                password,
+                driver,
+            } => {
+                use dataglot_federation::oracle::{OracleConnector, OracleDriver};
+                let drv = driver.map(|d| match d {
+                    crate::config::OracleDriverConfig::Oci => OracleDriver::Oci,
+                    crate::config::OracleDriverConfig::Pure => OracleDriver::Pure,
+                });
+                OracleConnector::connect_with_driver(name, &dsn, &user, &password, drv)
+                    .await
+                    .map(|c| Arc::new(c) as Arc<dyn SQLExecutor>)
+                    .with_context(|| {
+                        format!("ballista codec registry: oracle '{name}' connect failed")
+                    })
+            }
+            #[cfg(feature = "adbc")]
+            RegistrySqlKind::Adbc(a) => connect_adbc(name, a).await,
+            #[cfg(feature = "flightsql-source")]
+            RegistrySqlKind::FlightSql(f) => connect_flightsql(name, f).await,
+        }
+    }
+
     async fn build_executor_registry(
         config: &ServerConfig,
         tolerate: bool,
@@ -149,77 +328,7 @@ mod enabled {
             let Some(kind) = registry_sql_kind(name, cfg)? else {
                 continue;
             };
-            let built: Result<Arc<dyn SQLExecutor>> = match kind {
-                RegistrySqlKind::Postgres(dsn) => PostgresConnector::connect(&dsn)
-                    .await
-                    .map(|c| Arc::new(c.with_catalog(name.clone())) as Arc<dyn SQLExecutor>)
-                    .with_context(|| {
-                        format!("ballista codec registry: postgres '{name}' connect failed")
-                    }),
-                RegistrySqlKind::Mysql(dsn) => MysqlConnector::connect(name.clone(), &dsn)
-                    .await
-                    .map(|c| Arc::new(c) as Arc<dyn SQLExecutor>)
-                    .with_context(|| {
-                        format!("ballista codec registry: mysql '{name}' connect failed")
-                    }),
-                RegistrySqlKind::Snowflake(cfg) => {
-                    // `connect` builds the REST client without a network
-                    // round-trip (auth fires on the first query), so this is
-                    // synchronous and cheap; each executor resolves its own
-                    // credentials locally.
-                    SnowflakeConnector::connect(name.clone(), cfg)
-                        .map(|c| Arc::new(c) as Arc<dyn SQLExecutor>)
-                        .with_context(|| {
-                            format!("ballista codec registry: snowflake '{name}' connect failed")
-                        })
-                }
-                #[cfg(any(feature = "oracle", feature = "oracle-pure"))]
-                RegistrySqlKind::Oracle {
-                    dsn,
-                    user,
-                    password,
-                    driver,
-                } => {
-                    use dataglot_federation::oracle::{OracleConnector, OracleDriver};
-                    let drv = driver.map(|d| match d {
-                        crate::config::OracleDriverConfig::Oci => OracleDriver::Oci,
-                        crate::config::OracleDriverConfig::Pure => OracleDriver::Pure,
-                    });
-                    OracleConnector::connect_with_driver(name.clone(), &dsn, &user, &password, drv)
-                        .await
-                        .map(|c| Arc::new(c) as Arc<dyn SQLExecutor>)
-                        .with_context(|| {
-                            format!("ballista codec registry: oracle '{name}' connect failed")
-                        })
-                }
-                #[cfg(feature = "adbc")]
-                RegistrySqlKind::Adbc(a) => {
-                    use dataglot_federation::adbc::{AdbcConfig, AdbcConnector, SupportedDialect};
-                    match a.dialect.parse::<SupportedDialect>() {
-                        Err(_) => Err(anyhow::anyhow!(
-                            "ballista codec registry: adbc '{name}' has an invalid dialect"
-                        )),
-                        Ok(dialect) => {
-                            let mut cfg = AdbcConfig::new(name.clone(), a.driver_path, dialect);
-                            cfg.driver_entrypoint = a.driver_entrypoint;
-                            cfg.uri = a.uri;
-                            cfg.username = a.username;
-                            cfg.password_env = a.password_env;
-                            cfg.driver_options = a.driver_options;
-                            cfg.catalog = a.catalog;
-                            cfg.schema = a.schema;
-                            cfg.connection_pool_size = a.connection_pool_size;
-                            cfg.connection_pool_min_idle = a.connection_pool_min_idle;
-                            AdbcConnector::connect(cfg)
-                                .await
-                                .map(|c| Arc::new(c) as Arc<dyn SQLExecutor>)
-                                .with_context(|| {
-                                    format!("ballista codec registry: adbc '{name}' connect failed")
-                                })
-                        }
-                    }
-                }
-            };
+            let built = connect_registry_kind(name, kind).await;
             match built {
                 Ok(connector) => {
                     executors.insert(name.clone(), connector);
@@ -355,6 +464,17 @@ mod enabled {
                     None
                 }
             }
+            CatalogConfig::FlightSql(f) => {
+                #[cfg(feature = "flightsql-source")]
+                {
+                    Some(RegistrySqlKind::FlightSql(f.clone()))
+                }
+                #[cfg(not(feature = "flightsql-source"))]
+                {
+                    let _ = f;
+                    None
+                }
+            }
             CatalogConfig::Warehouse(_)
             | CatalogConfig::ObjectStorage(_)
             | CatalogConfig::Odata(_)
@@ -396,6 +516,13 @@ mod enabled {
         /// custom `Debug` on `AdbcCatalogConfig` redacts secrets (rule 12).
         #[cfg(feature = "adbc")]
         Adbc(crate::config::AdbcCatalogConfig),
+        /// Arrow Flight SQL source. Present only when the server
+        /// is built with `flightsql-source`; otherwise single-node. Carries
+        /// the whole catalog config (the executor rebuilds
+        /// `FlightSqlConfig` from it); the custom `Debug` on
+        /// `FlightSqlCatalogConfig` redacts secrets (rule 12).
+        #[cfg(feature = "flightsql-source")]
+        FlightSql(crate::config::FlightSqlCatalogConfig),
     }
 
     fn build_factory(
@@ -557,6 +684,49 @@ mod enabled {
             // (OData / SAP / REST are direct-`TableProvider` sources and are
             // likewise never in the distributed SQL registry — covered by
             // the exhaustive match in `registry_sql_kind`.)
+        }
+
+        /// Flight SQL classifies by feature exactly like Oracle and ADBC
+        ///: built with `flightsql-source` it enters the
+        /// distributed registry, without it the catalog stays single-node
+        /// and hits the  friendly error at query time.
+        ///
+        /// Worth pinning separately because the feature name is one
+        /// underscore away from `flight_sql`, which does the opposite
+        /// thing — a mix-up here would silently drop a catalog out of
+        /// distributed execution.
+        #[test]
+        fn flightsql_classifies_by_feature() {
+            let cfg = crate::config::FlightSqlCatalogConfig {
+                endpoint: "grpc://dremio.internal:32010".to_string(),
+                dialect: "datafusion".to_string(),
+                auth: "none".to_string(),
+                username: None,
+                password_env: None,
+                token_env: None,
+                handshake: false,
+                tls_ca_file: None,
+                tls_domain: None,
+                catalog: None,
+                schema: None,
+                connect_timeout_secs: 10,
+                request_timeout_secs: None,
+                follow_endpoint_locations: false,
+            };
+            let catalog = CatalogConfig::FlightSql(cfg.clone());
+            #[cfg(feature = "flightsql-source")]
+            assert_eq!(
+                registry_sql_kind("lakehouse", &catalog).unwrap(),
+                Some(RegistrySqlKind::FlightSql(cfg)),
+                "flightsql must enter the registry when built with --features flightsql-source"
+            );
+            #[cfg(not(feature = "flightsql-source"))]
+            assert_eq!(
+                registry_sql_kind("lakehouse", &catalog).unwrap(),
+                None,
+                "flightsql stays single-node without --features flightsql-source — \
+                 distributed queries must hit the friendly error"
+            );
         }
 
         /// Oracle + ADBC: classification is **feature-dependent**.

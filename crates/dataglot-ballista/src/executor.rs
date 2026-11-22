@@ -332,7 +332,7 @@ pub fn build_executor_process_config(
         ..ExecutorProcessConfig::default()
     };
     if let Some(slots) = args.concurrent_tasks {
-        config.concurrent_tasks = slots;
+        config.vcores = slots; // Ballista 55 renamed task slots to vcores
     }
 
     // Logical codec — registry-aware variant so a `FederatedPlanNode`
@@ -686,7 +686,7 @@ mod tests {
         assert_eq!(cfg.bind_host, "127.0.0.1");
         assert_eq!(cfg.port, 8001);
         assert_eq!(cfg.grpc_port, 8002);
-        assert_eq!(cfg.concurrent_tasks, 2);
+        assert_eq!(cfg.vcores, 2);
 
         // Codec slot is filled — the federation logical codec
         // wrapping Ballista's stock codec.

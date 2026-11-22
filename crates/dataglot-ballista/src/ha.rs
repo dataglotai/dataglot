@@ -616,7 +616,6 @@ mod tests {
             Ok(PutResult {
                 e_tag: self.etag.clone(),
                 version: None,
-                extensions: object_store::Extensions::default(),
             })
         }
         async fn put_multipart_opts(
@@ -746,7 +745,6 @@ mod tests {
                 meta,
                 range: 0..0,
                 attributes: Attributes::default(),
-                extensions: object_store::Extensions::default(),
             })
         }
         fn delete_stream(

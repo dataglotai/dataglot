@@ -31,7 +31,6 @@ use async_trait::async_trait;
 use ballista::datafusion::common::Result as DfResult;
 use ballista::datafusion::error::DataFusionError;
 use ballista::datafusion::execution::context::QueryPlanner;
-use ballista::datafusion::execution::session_state::SessionState;
 use ballista::datafusion::logical_expr::LogicalPlan;
 use ballista::datafusion::physical_plan::ExecutionPlan;
 use datafusion_federation::FederatedPlanNode;
@@ -134,7 +133,7 @@ impl QueryPlanner for SerializationGuardQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &SessionState,
+        session_state: &dyn ballista::datafusion::catalog::Session,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         validate_with_cap(logical_plan, self.max_nodes)?;
         self.inner
@@ -479,7 +478,7 @@ impl QueryPlanner for LocalMetadataQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &SessionState,
+        session_state: &dyn ballista::datafusion::catalog::Session,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         if should_plan_locally(logical_plan) {
             use ballista::datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
@@ -552,7 +551,7 @@ mod planner_dispatch_tests {
         async fn create_physical_plan(
             &self,
             logical_plan: &LogicalPlan,
-            _session_state: &SessionState,
+            _session_state: &dyn ballista::datafusion::catalog::Session,
         ) -> DfResult<Arc<dyn ExecutionPlan>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let schema = Arc::new(logical_plan.schema().as_arrow().clone());

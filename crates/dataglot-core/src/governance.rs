@@ -150,7 +150,7 @@ pub fn placeholder_column(name: String, arrow_type: String, nullable: bool) -> C
 /// independent on purpose — the platform here is the
 /// *governance-facing* descriptor, not the connector-side
 /// implementation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum ProductPlatform {
     /// Live federated Postgres source.
@@ -173,11 +173,46 @@ pub enum ProductPlatform {
     /// Live federated generic REST/JSON source — Salesforce,
     /// Athena Health, and similar `SaaS` APIs.
     Rest,
+    /// Live federated Arrow Flight SQL source. Like [`Self::Adbc`]
+    /// the platform name is deliberately generic: what sits behind a Flight
+    /// SQL endpoint — Dremio, `InfluxDB` 3, another Dataglot, a driver
+    /// wrapped in a sidecar — is not something the engine can classify from
+    /// the wire.
+    ///
+    /// Spelled `flightsql` for the same reason as
+    /// [`crate::catalog::LiveConnectorKind::FlightSql`]: one spelling
+    /// everywhere it is written down.
+    #[serde(rename = "flightsql")]
+    FlightSql,
     /// Iceberg-cached warehouse table (hard rule 7:
     /// the *governance* platform name is `iceberg` because
     /// that's what `DataHub` / `OpenMetadata` expect; the
     /// user-facing surface stays Iceberg-free).
     Iceberg,
+}
+
+impl ProductPlatform {
+    /// Every variant, for adapters that need to enumerate them.
+    ///
+    /// A backend adapter maps each platform to its own vocabulary, and those
+    /// tables end in a catch-all so that adding a platform here does not
+    /// break another crate (rule 5). The cost is that an unmapped platform
+    /// falls through silently. Iterating this is how an adapter's tests
+    /// notice: a platform with no entry in the adapter's expected mapping
+    /// fails there, which is the prompt to decide what it should publish as.
+    ///
+    /// The iterator is *derived from the enum definition*, so a new variant
+    /// is included without anyone remembering to list it. Two hand-written
+    /// versions of this were tried first — an array, then an array plus a
+    /// count assertion — and review found a hole in each: the array simply
+    /// omits the new variant, and the count can be satisfied by a stale
+    /// list. A guard that has to be maintained by hand is not a guard.
+    ///
+    /// Wrapped rather than exposing `strum::IntoEnumIterator` directly, so
+    /// callers need no trait import and no `strum` dependency of their own.
+    pub fn all() -> impl Iterator<Item = Self> {
+        <Self as strum::IntoEnumIterator>::iter()
+    }
 }
 
 /// Three-part `(catalog, schema, table)` identifier the
@@ -370,6 +405,43 @@ mod tests {
             serde_json::from_value(steward_json).expect("Phase 1 must accept Steward payloads");
     }
 
+    /// [`ProductPlatform::all`] yields every variant.
+    ///
+    /// The list comes from the derive, so this cannot drift the way a
+    /// hand-written one does; what it pins is that `all()` is wired to the
+    /// enum at all, and the exhaustive `match` means a new variant fails to
+    /// compile here until it is acknowledged — in this crate, in the same
+    /// change that adds it.
+    #[test]
+    fn all_yields_every_product_platform() {
+        let seen: Vec<ProductPlatform> = ProductPlatform::all().collect();
+        for platform in &seen {
+            // Exhaustive on purpose: adding a variant breaks this line.
+            match platform {
+                ProductPlatform::Postgres
+                | ProductPlatform::Mysql
+                | ProductPlatform::Snowflake
+                | ProductPlatform::Oracle
+                | ProductPlatform::ObjectStorage
+                | ProductPlatform::Odata
+                | ProductPlatform::Adbc
+                | ProductPlatform::Rest
+                | ProductPlatform::FlightSql
+                | ProductPlatform::Iceberg => {}
+            }
+        }
+        assert!(
+            seen.contains(&ProductPlatform::FlightSql),
+            "the newest variant must be reachable through all()"
+        );
+        // A `HashSet`, not `Vec::dedup` — dedup only collapses *consecutive*
+        // duplicates, so on an unsorted list it would miss `[A, B, A]`
+        // entirely and the assertion would pass while the invariant was
+        // broken.
+        let unique: std::collections::HashSet<ProductPlatform> = seen.iter().copied().collect();
+        assert_eq!(unique.len(), seen.len(), "all() must not repeat a variant");
+    }
+
     #[test]
     fn product_platform_serde_lowercase() {
         // `kind: "iceberg"` on the wire is intentional — that's
@@ -383,6 +455,7 @@ mod tests {
             (ProductPlatform::Mysql, "\"mysql\""),
             (ProductPlatform::Snowflake, "\"snowflake\""),
             (ProductPlatform::Oracle, "\"oracle\""),
+            (ProductPlatform::FlightSql, "\"flightsql\""),
             (ProductPlatform::ObjectStorage, "\"object_storage\""),
             (ProductPlatform::Iceberg, "\"iceberg\""),
         ] {

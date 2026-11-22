@@ -407,13 +407,11 @@ impl WarehouseConnector {
             ))
         })?;
 
-        let provider = IcebergStaticTableProvider::try_new_from_table(loaded)
-            .await
-            .map_err(|e| {
-                DataglotError::catalog(format!(
-                    "failed to build provider for warehouse table {namespace}.{table}: {e}"
-                ))
-            })?;
+        let provider = IcebergStaticTableProvider::try_new_from_table(loaded).map_err(|e| {
+            DataglotError::catalog(format!(
+                "failed to build provider for warehouse table {namespace}.{table}: {e}"
+            ))
+        })?;
 
         Ok(Arc::new(provider) as Arc<dyn TableProvider>)
     }
@@ -1495,6 +1493,18 @@ impl datafusion::physical_plan::DisplayAs for WarehouseScanExec {
 }
 
 impl datafusion::physical_plan::ExecutionPlan for WarehouseScanExec {
+    // No physical expressions of its own (DataFusion 55 made this required).
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &std::sync::Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> datafusion::common::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     // The trait fixes the `&str` return; the literal is naturally 'static.
     #[allow(clippy::unnecessary_literal_bound)]
     fn name(&self) -> &str {

@@ -45,6 +45,8 @@
 #[cfg(feature = "adbc")]
 pub mod adbc;
 pub mod codec;
+#[cfg(feature = "flightsql")]
+pub mod flightsql;
 pub mod health;
 #[cfg(feature = "iceberg")]
 pub mod iceberg;
@@ -65,6 +67,9 @@ pub mod postgres;
 pub mod pushdown_metrics;
 pub mod pushdown_trace;
 pub mod registry;
+/// Shape helpers shared by the SQL-pushing connectors (`adbc`, `flightsql`).
+#[cfg(any(feature = "adbc", feature = "flightsql"))]
+pub(crate) mod remote_sql;
 #[cfg(feature = "rest")]
 pub mod rest;
 // Shared unparser fix-ups used by every SQL connector's ast_analyzer /
@@ -72,6 +77,7 @@ pub mod rest;
 // governance-filter isolation (/291).
 #[cfg(any(
     feature = "adbc",
+    feature = "flightsql",
     feature = "postgres",
     feature = "mysql",
     feature = "oracle",
@@ -81,6 +87,7 @@ pub mod rest;
 pub(crate) mod derived_requalify;
 #[cfg(any(
     feature = "adbc",
+    feature = "flightsql",
     feature = "postgres",
     feature = "mysql",
     feature = "oracle",

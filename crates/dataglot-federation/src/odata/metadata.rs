@@ -120,23 +120,23 @@ fn parse_document(edmx: &str) -> DataglotResult<ParsedEdmx> {
             .read_event()
             .map_err(|e| DataglotError::catalog(format!("malformed $metadata XML: {e}")))?
         {
-            Event::Start(e) if is_elem(&e, b"EntityType") => {
-                let name = required_attr(&e, b"Name", "EntityType")?;
+            Event::Start(e) if is_elem(&e, "EntityType") => {
+                let name = required_attr(&e, "Name", "EntityType")?;
                 entity_types.entry(name.clone()).or_default();
                 current_type = Some(name);
             }
-            Event::End(e) if e.local_name().into_inner() == b"EntityType" => {
+            Event::End(e) if e.local_name().into_inner() == "EntityType" => {
                 current_type = None;
             }
             // A self-closed `<EntityType Name="X"/>` (no properties) is valid
             // XML — register it with an empty field list so an EntitySet
             // referencing it resolves rather than erroring.
-            Event::Empty(e) if is_elem(&e, b"EntityType") => {
-                let name = required_attr(&e, b"Name", "EntityType")?;
+            Event::Empty(e) if is_elem(&e, "EntityType") => {
+                let name = required_attr(&e, "Name", "EntityType")?;
                 entity_types.entry(name).or_default();
             }
             // Properties are usually empty elements, but handle Start too.
-            Event::Empty(e) | Event::Start(e) if is_elem(&e, b"Property") => {
+            Event::Empty(e) | Event::Start(e) if is_elem(&e, "Property") => {
                 if let Some(type_name) = &current_type {
                     let field = property_to_field(&e)?;
                     entity_types
@@ -145,17 +145,17 @@ fn parse_document(edmx: &str) -> DataglotResult<ParsedEdmx> {
                         .push(field);
                 }
             }
-            Event::Empty(e) | Event::Start(e) if is_elem(&e, b"EntitySet") => {
-                let name = required_attr(&e, b"Name", "EntitySet")?;
-                let type_ref = required_attr(&e, b"EntityType", "EntitySet")?;
+            Event::Empty(e) | Event::Start(e) if is_elem(&e, "EntitySet") => {
+                let name = required_attr(&e, "Name", "EntitySet")?;
+                let type_ref = required_attr(&e, "EntityType", "EntitySet")?;
                 entity_sets.insert(name, strip_namespace(&type_ref).to_string());
             }
             // The container's `Name` becomes the catalog's single schema name.
             // First one wins (a well-formed OData v2 service declares one).
             Event::Start(e) | Event::Empty(e)
-                if is_elem(&e, b"EntityContainer") && entity_container.is_none() =>
+                if is_elem(&e, "EntityContainer") && entity_container.is_none() =>
             {
-                entity_container = attr(&e, b"Name")?;
+                entity_container = attr(&e, "Name")?;
             }
             Event::Eof => break,
             _ => {}
@@ -171,13 +171,13 @@ fn parse_document(edmx: &str) -> DataglotResult<ParsedEdmx> {
 
 /// Build an Arrow [`Field`] from a `<Property>` element.
 fn property_to_field(e: &BytesStart<'_>) -> DataglotResult<Field> {
-    let name = required_attr(e, b"Name", "Property")?;
-    let edm_type = required_attr(e, b"Type", "Property")?;
+    let name = required_attr(e, "Name", "Property")?;
+    let edm_type = required_attr(e, "Type", "Property")?;
     // OData `Nullable` defaults to true when absent; the value is
     // case-insensitive ("false"/"False"/"FALSE").
-    let nullable = attr(e, b"Nullable")?.is_none_or(|v| !v.eq_ignore_ascii_case("false"));
-    let precision = parse_u8_attr(e, b"Precision")?;
-    let scale = parse_u8_attr(e, b"Scale")?;
+    let nullable = attr(e, "Nullable")?.is_none_or(|v| !v.eq_ignore_ascii_case("false"));
+    let precision = parse_u8_attr(e, "Precision")?;
+    let scale = parse_u8_attr(e, "Scale")?;
 
     let data_type = edm_to_arrow(&edm_type, precision, scale).ok_or_else(|| {
         DataglotError::catalog(format!(
@@ -215,7 +215,7 @@ fn edm_to_arrow(edm_type: &str, precision: Option<u8>, scale: Option<u8>) -> Opt
 }
 
 /// Whether the element's local name (namespace prefix stripped) equals `name`.
-fn is_elem(e: &BytesStart<'_>, name: &[u8]) -> bool {
+fn is_elem(e: &BytesStart<'_>, name: &str) -> bool {
     e.local_name().into_inner() == name
 }
 
@@ -225,7 +225,7 @@ fn strip_namespace(qualified: &str) -> &str {
 }
 
 /// Read an attribute's value by local name, or `None` if absent.
-fn attr(e: &BytesStart<'_>, key: &[u8]) -> DataglotResult<Option<String>> {
+fn attr(e: &BytesStart<'_>, key: &str) -> DataglotResult<Option<String>> {
     for a in e.attributes() {
         let a = a.map_err(|err| DataglotError::catalog(format!("malformed attribute: {err}")))?;
         if a.key.local_name().into_inner() == key {
@@ -243,11 +243,10 @@ fn attr(e: &BytesStart<'_>, key: &[u8]) -> DataglotResult<Option<String>> {
 }
 
 /// Read a required attribute, erroring with context if absent.
-fn required_attr(e: &BytesStart<'_>, key: &[u8], element: &str) -> DataglotResult<String> {
+fn required_attr(e: &BytesStart<'_>, key: &str, element: &str) -> DataglotResult<String> {
     attr(e, key)?.ok_or_else(|| {
         DataglotError::catalog(format!(
-            "$metadata <{element}> is missing the required '{}' attribute",
-            String::from_utf8_lossy(key)
+            "$metadata <{element}> is missing the required '{key}' attribute"
         ))
     })
 }
@@ -257,18 +256,17 @@ fn required_attr(e: &BytesStart<'_>, key: &[u8], element: &str) -> DataglotResul
 /// SAP frequently emits `Scale="Variable"` (or `"floating"`) on `Edm.Decimal`
 /// properties; those are treated as absent (⇒ default scale) rather than a
 /// parse error that would crash schema discovery.
-fn parse_u8_attr(e: &BytesStart<'_>, key: &[u8]) -> DataglotResult<Option<u8>> {
+fn parse_u8_attr(e: &BytesStart<'_>, key: &str) -> DataglotResult<Option<u8>> {
     match attr(e, key)? {
         Some(v) => {
-            if key == b"Scale"
+            if key == "Scale"
                 && (v.eq_ignore_ascii_case("variable") || v.eq_ignore_ascii_case("floating"))
             {
                 return Ok(None);
             }
             v.parse::<u8>().map(Some).map_err(|_| {
                 DataglotError::catalog(format!(
-                    "$metadata attribute '{}' is not a valid number: '{v}'",
-                    String::from_utf8_lossy(key)
+                    "$metadata attribute '{key}' is not a valid number: '{v}'"
                 ))
             })
         }

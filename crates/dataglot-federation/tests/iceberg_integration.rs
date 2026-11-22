@@ -308,10 +308,10 @@ mod lakekeeper {
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::file::properties::WriterProperties;
     use serde_json::json;
+    use testcontainers::core::wait::HttpWaitStrategy;
     use testcontainers::core::{IntoContainerPort, WaitFor};
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-    use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
 
     /// Lakekeeper image. Pinned to a specific tag — `latest` and
@@ -334,17 +334,45 @@ mod lakekeeper {
     const LAKEKEEPER_IMAGE: &str = "quay.io/lakekeeper/catalog";
     const LAKEKEEPER_TAG: &str = "v0.12.3";
 
-    /// Image tag used for the bucket-creation sidecar. `mc` (the `MinIO`
-    /// client) is small (~30 MB) and its `mb` subcommand is the
-    /// least-friction way to create a bucket on a freshly-booted `MinIO`
-    /// instance. Pinned for reproducibility.
-    const MC_IMAGE: &str = "minio/mc";
-    const MC_TAG: &str = "RELEASE.2025-02-21T16-00-46Z";
+    /// Object store for the warehouse. `RustFS` since: `MinIO`
+    /// withdrew `minio/minio` and `minio/mc` from Docker Hub on 2026-09-13
+    ///, and the `quay.io/minio` fallback we moved to then has
+    /// since been closed to unauthenticated pulls, leaving no public
+    /// registry that serves it.
+    ///
+    /// Pinned rather than `:latest` — the moving tag flaked on pull in the
+    /// nightly e2e. `1.0.0` is the GA release (2026-09-16);
+    /// upstream ships preview tags on top of it several times a week, so
+    /// bump this deliberately.
+    const RUSTFS_IMAGE: &str = "rustfs/rustfs";
+    const RUSTFS_TAG: &str = "1.0.0";
 
-    /// `MinIO` default credentials. These are not secrets — they're the
-    /// vendor-default sentinel values for a fresh `MinIO` container.
-    const MINIO_ACCESS_KEY: &str = "minioadmin";
-    const MINIO_SECRET_KEY: &str = "minioadmin";
+    /// Whether the object-store image is unpullable.
+    ///
+    /// One image to probe now that bucket creation is an in-process S3 call
+    /// rather than an `mc` sidecar container. Probed at its **pinned tag**,
+    /// which is what the fixture launches — the bare repository would ask
+    /// about `:latest`, a different reference whose availability need not
+    /// match.
+    ///
+    /// The probe is synchronous and can block for its full timeout, so it
+    /// runs on a blocking thread rather than a Tokio worker (rule 9). A
+    /// probe that cannot complete counts as available, so the test proceeds
+    /// and fails for real.
+    async fn object_store_images_unavailable() -> bool {
+        tokio::task::spawn_blocking(|| {
+            dataglot_test_support::image_unavailable(&format!("{RUSTFS_IMAGE}:{RUSTFS_TAG}"))
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// `RustFS` refuses to start on a non-loopback listener with its
+    /// built-in default credentials, so the fixture supplies its own.
+    /// These are not secrets — they are fixture constants for a throwaway
+    /// container that exists for the duration of one test.
+    const OBJECT_STORE_ACCESS_KEY: &str = "dataglot-test-access";
+    const OBJECT_STORE_SECRET_KEY: &str = "dataglot-test-secret-key";
 
     /// The S3 bucket that backs the Lakekeeper warehouse. Created
     /// during stack setup. Lakekeeper itself does not auto-create
@@ -371,7 +399,7 @@ mod lakekeeper {
     /// the field merely has to exist for the duration of the test.
     pub(super) struct LakekeeperStack {
         _postgres: ContainerAsync<Postgres>,
-        _minio: ContainerAsync<MinIO>,
+        _object_store: ContainerAsync<GenericImage>,
         _lakekeeper: ContainerAsync<GenericImage>,
         /// Base URL for Lakekeeper's Iceberg REST catalog API
         /// (`/catalog`). This is what `WarehouseConnector::connect`
@@ -435,7 +463,7 @@ mod lakekeeper {
         let suffix = format!("{pid}-{instance}-{nanos}");
         let network_name = format!("lakekeeper-it-{suffix}");
         let pg_hostname = format!("lakekeeper-pg-{suffix}");
-        let minio_hostname = format!("lakekeeper-minio-{suffix}");
+        let object_store_hostname = format!("lakekeeper-objectstore-{suffix}");
         let lakekeeper_hostname = format!("lakekeeper-{suffix}");
 
         // 1. Postgres — Lakekeeper's metadata backend. We use the
@@ -463,27 +491,50 @@ mod lakekeeper {
         //    9000 to the host so the test process (running outside
         //    Docker) can also read parquet files committed by
         //    Lakekeeper.
-        let minio = MinIO::default()
+        // Readiness is an HTTP poll of `/health/ready`, not a sleep, and
+        // deliberately not a stdout marker: the `1.0.0` image's entrypoint
+        // wrapper swallows the server's own startup line, so a
+        // `message_on_stdout` wait hangs until timeout against this tag.
+        // `/data` is a required positional argument — without it the binary
+        // exits immediately and the port mapping never appears.
+        let object_store = GenericImage::new(RUSTFS_IMAGE, RUSTFS_TAG)
+            .with_exposed_port(9000.tcp())
+            .with_wait_for(WaitFor::http(
+                HttpWaitStrategy::new("/health/ready")
+                    .with_port(9000.tcp())
+                    .with_expected_status_code(200_u16),
+            ))
+            .with_cmd(["/data"])
             .with_network(&network_name)
-            .with_container_name(minio_hostname.clone())
-            .with_hostname(minio_hostname.clone())
+            .with_container_name(object_store_hostname.clone())
+            .with_hostname(object_store_hostname.clone())
+            .with_env_var("RUSTFS_ACCESS_KEY", OBJECT_STORE_ACCESS_KEY)
+            .with_env_var("RUSTFS_SECRET_KEY", OBJECT_STORE_SECRET_KEY)
             .start()
             .await
-            .expect("minio container starts");
-        let minio_host = minio.get_host().await.expect("minio host resolves");
-        let minio_host_port = minio
+            .expect("object store container starts");
+        let object_store_host = object_store
+            .get_host()
+            .await
+            .expect("object store host resolves");
+        let object_store_host_port = object_store
             .get_host_port_ipv4(9000)
             .await
-            .expect("minio port resolves");
-        let s3_endpoint_host = format!("http://{minio_host}:{minio_host_port}");
+            .expect("object store port resolves");
+        let s3_endpoint_host = format!("http://{object_store_host}:{object_store_host_port}");
 
         // 3. Pre-create the bucket. Lakekeeper does NOT auto-create
         //    buckets — the warehouse-create call will fail with a
-        //    400 if the bucket isn't already there. We use a one-
-        //    shot `mc` (MinIO client) container on the same Docker
-        //    network: simpler and lighter than pulling in
-        //    aws-sdk-s3 just to issue one PutBucket request.
-        create_bucket_via_mc(&network_name, &minio_hostname).await;
+        //    400 if the bucket isn't already there. One signed PUT from
+        //    this process; this used to be a one-shot `mc` sidecar
+        //    container, which became unpullable along with MinIO itself
+        dataglot_test_support::s3::create_bucket(
+            &s3_endpoint_host,
+            WAREHOUSE_BUCKET,
+            OBJECT_STORE_ACCESS_KEY,
+            OBJECT_STORE_SECRET_KEY,
+        )
+        .await;
 
         // 4a. Run Lakekeeper PG migrations as a one-shot.
         //     v0.5.2 does NOT auto-migrate on `serve` (we tried
@@ -613,17 +664,21 @@ mod lakekeeper {
                 "type": "s3",
                 "bucket": WAREHOUSE_BUCKET,
                 "key-prefix": "warehouse",
-                "endpoint": format!("http://{minio_hostname}:9000"),
+                "endpoint": format!("http://{object_store_hostname}:9000"),
                 "region": "us-east-1",
                 "path-style-access": true,
-                "flavor": "minio",
+                // `s3-compat`, not `minio`: Lakekeeper's `minio` flavor
+                // selects a vendor-specific code path for a server that is
+                // not MinIO. Must stay in lock-step with the e2e copy of
+                // this fixture (`dataglot-tests/tests/e2e/lakekeeper.rs`).
+                "flavor": "s3-compat",
                 "sts-enabled": false,
             },
             "storage-credential": {
                 "type": "s3",
                 "credential-type": "access-key",
-                "aws-access-key-id": MINIO_ACCESS_KEY,
-                "aws-secret-access-key": MINIO_SECRET_KEY,
+                "aws-access-key-id": OBJECT_STORE_ACCESS_KEY,
+                "aws-secret-access-key": OBJECT_STORE_SECRET_KEY,
             },
         });
         let warehouse_resp = http
@@ -646,14 +701,14 @@ mod lakekeeper {
 
         LakekeeperStack {
             _postgres: postgres,
-            _minio: minio,
+            _object_store: object_store,
             _lakekeeper: lakekeeper,
             catalog_url,
             warehouse_name: WAREHOUSE_NAME.to_string(),
             s3_endpoint_host,
             s3_credentials: WarehouseCredentials::Static {
-                access_key_id: MINIO_ACCESS_KEY.to_string(),
-                secret_access_key: MINIO_SECRET_KEY.to_string(),
+                access_key_id: OBJECT_STORE_ACCESS_KEY.to_string(),
+                secret_access_key: OBJECT_STORE_SECRET_KEY.to_string(),
             },
             network_name,
         }
@@ -722,30 +777,6 @@ mod lakekeeper {
              ----- stdout -----\n{stdout}\n\
              ----- stderr -----\n{stderr}"
         );
-    }
-
-    async fn create_bucket_via_mc(network: &str, minio_hostname: &str) {
-        let mc_cmd = format!(
-            "mc alias set local http://{minio_hostname}:9000 \
-             {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} && \
-             mc mb --ignore-existing local/{WAREHOUSE_BUCKET}"
-        );
-        let mc = GenericImage::new(MC_IMAGE, MC_TAG)
-            .with_wait_for(WaitFor::message_on_stdout("Bucket created successfully"))
-            .with_entrypoint("/bin/sh")
-            .with_cmd(["-c", &mc_cmd])
-            .with_network(network)
-            .start()
-            .await;
-        // `mc` exits 0 on success, which testcontainers surfaces as a
-        // running-then-stopped container. If the wait condition fires
-        // before it terminates, we're done. If the bucket already
-        // exists, `--ignore-existing` makes that a noop and the
-        // command still prints the success line.
-        match mc {
-            Ok(_handle) => {}
-            Err(e) => panic!("mc bucket-create container failed: {e}"),
-        }
     }
 
     /// Poll an HTTP endpoint until it returns a 2xx response, with
@@ -820,6 +851,9 @@ mod lakekeeper {
     #[tokio::test]
     #[ignore = "requires Docker"]
     async fn lakekeeper_warehouse_connect_handshake() {
+        if object_store_images_unavailable().await {
+            return;
+        }
         let stack = setup_lakekeeper_stack().await;
         let connector = connect_against(&stack).await;
         assert_eq!(connector.name(), "warehouse");
@@ -839,6 +873,9 @@ mod lakekeeper {
     #[tokio::test]
     #[ignore = "requires Docker"]
     async fn lakekeeper_warehouse_namespace_listing() {
+        if object_store_images_unavailable().await {
+            return;
+        }
         let stack = setup_lakekeeper_stack().await;
 
         let catalog = build_rest_catalog(&stack).await;
@@ -872,6 +909,9 @@ mod lakekeeper {
     #[tokio::test]
     #[ignore = "requires Docker"]
     async fn lakekeeper_warehouse_table_select() {
+        if object_store_images_unavailable().await {
+            return;
+        }
         let stack = setup_lakekeeper_stack().await;
         let connector = connect_against(&stack).await;
 
@@ -1005,6 +1045,9 @@ mod lakekeeper {
     #[tokio::test]
     #[ignore = "requires Docker"]
     async fn lakekeeper_warehouse_catalog_provider_three_part_name() {
+        if object_store_images_unavailable().await {
+            return;
+        }
         let stack = setup_lakekeeper_stack().await;
         let catalog = build_rest_catalog(&stack).await;
 
@@ -1084,11 +1127,11 @@ mod lakekeeper {
         );
         props.insert(
             iceberg::io::S3_ACCESS_KEY_ID.to_string(),
-            MINIO_ACCESS_KEY.to_string(),
+            OBJECT_STORE_ACCESS_KEY.to_string(),
         );
         props.insert(
             iceberg::io::S3_SECRET_ACCESS_KEY.to_string(),
-            MINIO_SECRET_KEY.to_string(),
+            OBJECT_STORE_SECRET_KEY.to_string(),
         );
         props.insert(
             iceberg::io::S3_ENDPOINT.to_string(),

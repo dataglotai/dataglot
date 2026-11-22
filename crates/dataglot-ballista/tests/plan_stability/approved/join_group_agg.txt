@@ -11,8 +11,8 @@ Sort: r.region ASC NULLS LAST
 
 -- Physical plan --
 SortPreservingMergeExec: [region@0 ASC NULLS LAST]
-  SortExec: expr=[region@0 ASC NULLS LAST], preserve_partitioning=[true]
-    ProjectionExec: expr=[region@0 as region, sum(i.price)@1 as t]
+  ProjectionExec: expr=[region@0 as region, sum(i.price)@1 as t]
+    SortExec: expr=[region@0 ASC NULLS LAST], preserve_partitioning=[true]
       AggregateExec: mode=FinalPartitioned, gby=[region@0 as region], aggr=[sum(i.price)]
         RepartitionExec: partitioning=Hash([region@0], 4), input_partitions=4
           AggregateExec: mode=Partial, gby=[region@1 as region], aggr=[sum(i.price)]

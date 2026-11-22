@@ -6,8 +6,8 @@ Sort: items.category ASC NULLS LAST
 
 -- Physical plan --
 SortPreservingMergeExec: [category@0 ASC NULLS LAST]
-  SortExec: expr=[category@0 ASC NULLS LAST], preserve_partitioning=[true]
-    ProjectionExec: expr=[category@0 as category, count(Int64(1))@1 as c, sum(items.qty)@2 as s]
+  ProjectionExec: expr=[category@0 as category, count(Int64(1))@1 as c, sum(items.qty)@2 as s]
+    SortExec: expr=[category@0 ASC NULLS LAST], preserve_partitioning=[true]
       AggregateExec: mode=FinalPartitioned, gby=[category@0 as category], aggr=[count(Int64(1)), sum(items.qty)]
         RepartitionExec: partitioning=Hash([category@0], 4), input_partitions=4
           AggregateExec: mode=Partial, gby=[category@0 as category], aggr=[count(Int64(1)), sum(items.qty)]

@@ -36,12 +36,12 @@ use crate::server::DataglotServer;
 ///
 /// Precedence: `--file` wins; then a positional argument that isn't `-`; then
 /// stdin (reached by `-`, by omitting the argument, or by piping).
-fn resolve_sql(q: &QueryArgs) -> Result<String> {
-    if let Some(path) = &q.file {
+fn resolve_sql(sql: Option<&str>, file: Option<&std::path::Path>) -> Result<String> {
+    if let Some(path) = file {
         return std::fs::read_to_string(path)
             .with_context(|| format!("reading SQL from {}", path.display()));
     }
-    match q.sql.as_deref() {
+    match sql {
         Some("-") | None => {
             let mut buf = String::new();
             std::io::stdin()
@@ -241,14 +241,19 @@ pub(crate) async fn build_session(args: &Args, user: &str) -> Result<EmbeddedSes
 /// in client mode, and exits 130.
 pub async fn run(args: &Args, q: &QueryArgs) -> Result<ExitCode> {
     // Before reading the SQL, so a bad profile doesn't wait on stdin first.
-    let endpoint = match Endpoint::from_args(q.server.as_deref(), q.profile.as_deref()) {
+    let endpoint = match Endpoint::resolve(q.server.as_deref(), q.profile.as_deref()).await {
         Ok(endpoint) => endpoint,
         Err(e) => {
             let _ = writeln!(std::io::stderr(), "error: {e}");
             return Ok(e.exit_code());
         }
     };
-    let sql = resolve_sql(q)?;
+    let sql_arg = q.sql.clone();
+    let sql_file = q.file.clone();
+    let sql =
+        tokio::task::spawn_blocking(move || resolve_sql(sql_arg.as_deref(), sql_file.as_deref()))
+            .await
+            .context("reading SQL input task failed")??;
     let sql = sql.trim();
     if sql.is_empty() {
         anyhow::bail!("no SQL provided (pass a statement, --file <path>, or pipe via stdin)");
@@ -331,7 +336,10 @@ mod tests {
     #[test]
     fn resolve_sql_uses_the_positional_argument() {
         let q = qargs(Some("SELECT 1"), None);
-        assert_eq!(resolve_sql(&q).expect("resolve"), "SELECT 1");
+        assert_eq!(
+            resolve_sql(q.sql.as_deref(), q.file.as_deref()).expect("resolve"),
+            "SELECT 1"
+        );
     }
 
     #[test]
@@ -341,7 +349,12 @@ mod tests {
         std::fs::write(&path, "SELECT 2\n").expect("write");
         // `--file` takes precedence even if a positional were also present.
         let q = qargs(Some("SELECT 1"), Some(path));
-        assert_eq!(resolve_sql(&q).expect("resolve").trim(), "SELECT 2");
+        assert_eq!(
+            resolve_sql(q.sql.as_deref(), q.file.as_deref())
+                .expect("resolve")
+                .trim(),
+            "SELECT 2"
+        );
     }
 
     /// End-to-end: a constant query must plan and execute through the same
@@ -675,7 +688,9 @@ mod tests {
 
     async fn default_session() -> EmbeddedSession {
         let args = Args::try_parse_from(["dataglot"]).expect("parse default args");
-        build_session(&args, "dataglot")
+        // Boxed: DataFusion 55 grew the session-build future past the
+        // workspace `future-size-threshold` (clippy::large_futures).
+        Box::pin(build_session(&args, "dataglot"))
             .await
             .expect("build session")
     }

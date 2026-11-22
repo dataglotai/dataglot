@@ -95,8 +95,8 @@
 //! `DataHub` GMS version drift.
 
 use anyhow::Context;
+use datafusion::common::TableReference;
 use datafusion::logical_expr::lit;
-use datafusion::sql::TableReference;
 use serde::Deserialize;
 use thiserror::Error;
 

@@ -47,7 +47,7 @@ const IN_COMMENT_PROMPT: &str = "dataglot*> ";
 /// In client mode a failed or lost connection is printed and returned as exit code 2.
 pub async fn run(args: &Args, s: &ShellArgs) -> Result<ExitCode> {
     let mut stderr = std::io::stderr();
-    let endpoint = match Endpoint::from_args(s.server.as_deref(), s.profile.as_deref()) {
+    let endpoint = match Endpoint::resolve(s.server.as_deref(), s.profile.as_deref()).await {
         Ok(endpoint) => endpoint,
         Err(e) => {
             let _ = writeln!(stderr, "error: {e}");

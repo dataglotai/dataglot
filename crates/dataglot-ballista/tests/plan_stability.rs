@@ -93,9 +93,12 @@ async fn plan_text(ctx: &SessionContext, sql: &str, data_dir: &str) -> String {
     // stripped (object-store style), so redact both forms. Replacing the
     // full temp-dir path (which includes the random `.tmpXXXX` segment)
     // also makes the golden machine-independent (macOS /var/folders vs
-    // Linux CI /tmp).
+    // Linux CI /tmp). On Windows the temp dir arrives with `\` separators
+    // but DataFusion renders `/`, so redact the forward-slash form too.
+    let forward = data_dir.replace('\\', "/");
     body.replace(data_dir, "<DATA>")
-        .replace(data_dir.trim_start_matches('/'), "<DATA>")
+        .replace(&forward, "<DATA>")
+        .replace(forward.trim_start_matches('/'), "<DATA>")
 }
 
 fn approved_dir() -> PathBuf {

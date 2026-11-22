@@ -87,6 +87,13 @@ enum Reveal {
 /// to `""`). Char-based `character_length` / `left` / `right` keep the
 /// count in code points, never splitting a multi-byte character.
 fn partial_mask(column: &str, n: usize, reveal: Reveal) -> Expr {
+    // The Int64 count is ALSO what makes the mask fail on a remote that
+    // declares these functions with `integer` parameters (PostgreSQL:
+    // `function repeat(unknown, bigint) does not exist`). That is a
+    // dialect concern and is handled where the SQL is produced — the
+    // Postgres connector's unparser dialect casts computed count
+    // arguments to INTEGER — never by narrowing the count here, which would
+    // break local execution (see the regression test below).
     let keep = i64::try_from(n).unwrap_or(i64::MAX);
     let s = as_text(column);
     // `character_length` returns Int32 for the Utf8 input `as_text`
@@ -408,5 +415,63 @@ mod tests {
                 "{kind:?} must return NULL for NULL input"
             );
         }
+    }
+
+    /// Codex P1 on #1118 / the  class, from the other side: the mask
+    /// is injected by `PolicyOptimizerRule` AFTER the `TypeCoercion` analyzer,
+    /// so whatever argument types the mask expression carries are the ones
+    /// the physical planner sees — nothing re-coerces them. DataFusion 54's
+    /// `repeat`/`left`/`right` require an **Int64** count at execution, so a
+    /// locally executed partial mask (an in-memory or lakehouse table, or a
+    /// federated plan that was not pushed down) must carry Int64 counts.
+    /// This runs the production path — the rule inside the optimizer
+    /// pipeline of a real session — not `execute_logical_plan`, which would
+    /// silently re-run the analyzer.
+    #[tokio::test]
+    async fn partial_mask_executes_locally_when_injected_after_type_coercion() {
+        use crate::{ColumnMask, ColumnMaskingEnforcer, PolicyOptimizerRule};
+        use datafusion::common::TableReference;
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::optimizer::Optimizer;
+
+        let enforcer = Arc::new(
+            ColumnMaskingEnforcer::new([ColumnMask {
+                table: TableReference::bare("users"),
+                column: "email".to_string(),
+                mask: MaskKind::PartialShowLast(4).to_expr("email"),
+                org: None,
+                groups: None,
+            }])
+            .unwrap(),
+        );
+        let mut rules = Optimizer::default().rules;
+        rules.insert(0, Arc::new(PolicyOptimizerRule::new(enforcer)));
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_optimizer_rules(rules)
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        let batch = RecordBatch::try_from_iter(vec![(
+            "email",
+            Arc::new(StringArray::from(vec!["alice@example.com"])) as ArrayRef,
+        )])
+        .unwrap();
+        ctx.register_batch("users", batch).unwrap();
+
+        let batches = ctx
+            .sql("SELECT email FROM users")
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect("a locally executed show_last mask must run without analyzer coercion");
+        let col = datafusion::arrow::compute::cast(batches[0].column(0), &DataType::Utf8).unwrap();
+        let s = col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string();
+        assert_eq!(s, "XXXXXXXXXXXXX.com");
     }
 }

@@ -17,12 +17,12 @@ use std::sync::Arc;
 use datafusion::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::util::display::array_value_to_string;
+use datafusion::common::TableReference;
 use datafusion::datasource::MemTable;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{col, lit};
 use datafusion::optimizer::{OptimizerContext, OptimizerRule};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
 
 use dataglot_policy::{
     AccessDenial, AccessDenyEnforcer, ColumnMask, ColumnMaskingEnforcer, CompositeEnforcer,
@@ -276,14 +276,14 @@ async fn explain_is_empty_when_no_policy_applies() {
     );
 }
 
-/// Mask-in-predicate: predicates are NOT masked (they may carry admin
-/// row-filter/RLS logic — masking those would break governance), so a `WHERE`
-/// on a masked column evaluates against the **real** value while the projected
-/// column comes back masked. Filtering by Alice's true email finds her row and
-/// returns `***`. (Option A for predicates;  fixed the aggregate/
-/// projection bypass, not predicates.)
+/// Mask-in-predicate: a `WHERE` on a masked column evaluates against
+/// the **masked** value, so probing Alice's real email matches nothing, while
+/// the mask value matches every masked row — the value oracle is closed.
+/// (Supersedes option A, under which predicates saw real data; admin row
+/// filters keep real data through the per-column exemption, pinned in
+/// `mask::tests::rls_referenced_columns_keep_real_values_in_predicates`.)
 #[tokio::test]
-async fn mask_matches_real_value_in_predicate_but_masks_projection() {
+async fn mask_in_predicate_evaluates_on_the_masked_value() {
     let ctx = ctx();
     let rows = run(
         &ctx,
@@ -292,10 +292,22 @@ async fn mask_matches_real_value_in_predicate_but_masks_projection() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        rows,
-        vec![vec!["***".to_string()]],
-        "predicate matched the real value; projection is masked",
+    assert!(
+        rows.is_empty(),
+        "the real value is not visible to the predicate; got {rows:?}"
+    );
+
+    let rows = run(
+        &ctx,
+        analyst(),
+        "SELECT email FROM users WHERE email = '***'",
+    )
+    .await
+    .unwrap();
+    assert!(!rows.is_empty(), "the mask value matches");
+    assert!(
+        rows.iter().all(|r| r == &vec!["***".to_string()]),
+        "every projected email is masked; got {rows:?}"
     );
 }
 

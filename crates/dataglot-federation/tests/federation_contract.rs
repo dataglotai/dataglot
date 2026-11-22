@@ -154,6 +154,18 @@ async fn contract_context_with(
         .build();
     let ctx = datafusion::prelude::SessionContext::new_with_state(fed_state);
 
+    // Also expose the connector the way production does — as its own
+    // 3-part catalog (`duck_contract.main.<table>`), via
+    // `as_catalog_provider` + `register_catalog`. The bare registrations
+    // below keep every existing pin unchanged; the catalog form is what
+    // the qualifier pins (/) need, since the catalog strip
+    // for pushdown only bites on a 3-part reference.
+    let catalog = connector
+        .as_catalog_provider()
+        .await
+        .expect("adbc connector exposes a catalog provider");
+    ctx.register_catalog("duck_contract", catalog);
+
     for table in ["customers", "orders", "regions"] {
         let provider = connector
             .table_provider("main", table)
@@ -329,18 +341,16 @@ async fn aliased_case_and_having_push_down() {
     assert_fully_pushed(&ctx, sql, &["CASE", "GROUP BY"]).await;
 }
 
-/// **Known-wart pin.** Grouping directly on an ANONYMOUS `CASE`
-/// expression (`GROUP BY 1`, no alias) currently fails at execution
-/// with a schema `FieldNotFound`: the expression's derived field name
-/// keeps the table qualifier on the plan side
-/// (`CASE WHEN main.orders.amount …`) but loses it through the
-/// unparse → remote → re-read round-trip (`CASE WHEN orders.amount …`),
-/// so the two names never match. Found by 's first run. This pin
-/// documents the wart; when a datafusion-federation bump fixes the
-/// round-trip naming, this test fails and should be flipped into a
-/// full-pushdown assertion.
+/// Grouping directly on an ANONYMOUS `CASE` expression (`GROUP BY 1`, no
+/// alias) — formerly a known-wart pin: `simplify_expressions`
+/// aliased the folded group key back to its pre-coercion derived name
+/// (`… AS CASE WHEN orders.amount >= Int64(50) …`), and the pushdown's
+/// flat-name rewrite updated the reference but not the alias, so the two
+/// names never matched (`FieldNotFound`). The core
+/// `federated_aggregate_alias_normalizer` now drops that alias
+/// before federation, and the shape pushes down whole.
 #[tokio::test]
-async fn anonymous_case_group_by_is_a_known_schema_wart() {
+async fn anonymous_case_group_by_pushes_down() {
     let Some(driver) = driver_path() else { return };
     let dir = tempfile::tempdir().expect("tempdir");
     let db_file = dir.path().join("contract.duckdb");
@@ -354,22 +364,23 @@ async fn anonymous_case_group_by_is_a_known_schema_wart() {
                GROUP BY 1
                ORDER BY bucket";
 
-    let err = ctx
+    let batches = ctx
         .sql(sql)
         .await
         .expect("plans")
         .collect()
         .await
-        .expect_err(
-            "anonymous-CASE grouping currently fails through federation — if this \
-             now SUCCEEDS, a dependency bump fixed the qualified-name round-trip: \
-             flip this pin into a full-pushdown assertion",
-        );
-    let msg = err.to_string();
+        .expect("anonymous-CASE grouping executes through federation");
+    let rendered = pretty_format_batches(&batches).unwrap().to_string();
+    // amounts >= 50: 100, 60 → big=2; the other five → small=5.
     assert!(
-        msg.contains("FieldNotFound") || msg.contains("field") || msg.contains("Schema"),
-        "expected the schema-name mismatch shape, got a different failure: {msg}"
+        rendered.contains("big") && rendered.contains("small"),
+        "{rendered}"
     );
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(rows, 2, "two buckets:\n{rendered}");
+
+    assert_fully_pushed(&ctx, sql, &["CASE", "GROUP BY"]).await;
 }
 
 /// ORDER BY on an expression (not a bare column) + LIMIT.
@@ -487,29 +498,24 @@ async fn explain_analyze_executes_over_a_federated_plan() {
     );
 }
 
-/// **Known-BUG pin (now fails safe under DF54)** — datafusion-federation
-/// #82: a JOIN against a subquery containing DISTINCT is mishandled through
-/// federation. alice has two orders ≥ 25, so the correct result lists her
-/// once (3 rows). On DataFusion 53 the dedup was silently DROPPED, returning
-/// WRONG results — alice TWICE, 4 rows. The DataFusion 54 /
-/// datafusion-federation 0.5.5 bump **mutated the bug into the
-/// safer failure mode**: the unparser now emits a subquery whose `orders`
-/// reference is out of scope, so the source (DuckDB) rejects it with a
-/// binder error rather than returning wrong data. The original pin noted
-/// "wrong results are strictly worse than the error upstream #82 reports" —
-/// this is now that error. The underlying dedup-through-federation bug is
-/// still unfixed (correct = 3 rows, no error); this pin tracks the current
-/// fail-safe shape so the eventual real fix (3 rows) fails loudly and gets
-/// reviewed — as does any regression back to df53's silent-wrong-results.
+/// **datafusion-federation #82 — now FIXED under DF54 + the
+/// unnamed-derived requalifier.** A JOIN against a `SELECT DISTINCT` subquery.
+/// On DataFusion 53 the dedup was silently DROPPED (alice twice, 4 rows — wrong);
+/// the DF54 bump mutated that into an unparse whose subquery reference was out of
+/// scope, so the source rejected it with a binder error (the previous pin). The
+///  requalifier repairs that unnamed-derived dangling reference, so the
+/// query now executes and returns the CORRECT three rows: alice/bob/carol each
+/// have an order ≥ 25 (100, 25, 60); dave's are 1.0/2.0. UNGUARDED context, so
+/// this exercises the raw unparse path (the  dedup guard would reject the
+/// DISTINCT-in-joined-subquery in the guarded context — a separate, df53-era
+/// safeguard). A regression to 4 rows (df53 silent-wrong) or an error fails loud.
 #[tokio::test]
-async fn distinct_subquery_join_currently_errors_at_source() {
+async fn distinct_subquery_join_executes_correctly() {
     let Some(driver) = driver_path() else { return };
     let dir = tempfile::tempdir().expect("tempdir");
     let db_file = dir.path().join("contract.duckdb");
     let db_file = db_file.to_str().expect("utf8 temp path");
     seed_join_fixture(&driver, db_file);
-    // Deliberately UNGUARDED: this pin documents the raw federation
-    // behavior the  guard exists to intercept.
     let ctx = unguarded_contract_context(&driver, db_file).await;
 
     let sql = "SELECT c.name
@@ -518,26 +524,28 @@ async fn distinct_subquery_join_currently_errors_at_source() {
                  ON o.customer_id = c.id
                ORDER BY c.name";
 
-    // DF54/federation 0.5.5: the pushed subquery's `orders` reference is out
-    // of scope, so execution fails at the source binder rather than returning
-    // df53's wrong-but-succeeding 4-row result.
-    let err = ctx
+    let batches = ctx
         .sql(sql)
         .await
         .expect("distinct-subquery join plans")
         .collect()
         .await
-        .expect_err(
-            "KNOWN BUG (datafusion-federation #82): under DF54 the DISTINCT-subquery \
-             join errors at the source instead of returning wrong rows. If this now \
-             SUCCEEDS the behavior moved — 3 rows means the bug is FIXED (flip this \
-             pin into the correct assertion); 4 rows is a regression to df53's \
-             silent-wrong-results shape.",
+        .expect("distinct-subquery join now executes (derived requalifier)");
+    let rendered = pretty_format_batches(&batches).unwrap().to_string();
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(
+        rows, 3,
+        "each of alice/bob/carol appears once — no dropped dedup (would be 4):\n{rendered}"
+    );
+    for name in ["alice", "bob", "carol"] {
+        assert!(
+            rendered.contains(name),
+            "{name} must appear once:\n{rendered}"
         );
-    let msg = err.to_string();
+    }
     assert!(
-        msg.contains("not found") || msg.to_lowercase().contains("binder"),
-        "expected a source-side binder error (subquery table out of scope), got: {msg}"
+        !rendered.contains("dave"),
+        "dave has no order >= 25:\n{rendered}"
     );
 }
 
@@ -612,6 +620,102 @@ async fn or_in_subquery_mark_join_is_rejected_by_guard() {
     assert!(
         !rendered.contains("dave"),
         "dave must not appear:\n{rendered}"
+    );
+}
+
+/// Execute `sql` on the guarded federated context and return the rendered
+/// batches plus the total row count.
+async fn run(ctx: &datafusion::prelude::SessionContext, sql: &str) -> (String, usize) {
+    let batches = ctx
+        .sql(sql)
+        .await
+        .unwrap_or_else(|e| panic!("plans `{sql}`: {e}"))
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("executes `{sql}`: {e}"));
+    let rows = batches.iter().map(RecordBatch::num_rows).sum();
+    (pretty_format_batches(&batches).unwrap().to_string(), rows)
+}
+
+/// ** unnamed-derived-table fix.** A federated `EXCEPT` unparses to
+/// `SELECT customers.id FROM (SELECT customers.id FROM main.customers) WHERE NOT
+/// EXISTS (…) GROUP BY customers.id` — an UNNAMED derived table whose outer (and
+/// correlated) `customers.id` references dangled, so the source rejected it with
+/// *missing FROM-clause entry*. The requalifier now unwraps the trivial wrapper,
+/// so it executes. Paired with [`intersect_over_federation_executes`] on the
+/// SAME inputs: every customer id has a matching order (`customer_ids` {1,2,3,4}),
+/// so `customers.id EXCEPT orders.customer_id` removes them all → 0 rows, while
+/// the INTERSECT keeps all 4. Same inputs, opposite op — the pair proves the set
+/// operation is actually evaluated, not that rows merely pass through.
+#[tokio::test]
+async fn except_over_federation_executes() {
+    let Some(driver) = driver_path() else { return };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_file = dir.path().join("contract.duckdb");
+    let db_file = db_file.to_str().expect("utf8 temp path");
+    seed_join_fixture(&driver, db_file);
+    let ctx = contract_context(&driver, db_file).await;
+
+    let (rendered, rows) = run(
+        &ctx,
+        "SELECT id FROM customers EXCEPT SELECT customer_id FROM orders",
+    )
+    .await;
+    assert_eq!(
+        rows, 0,
+        "every customer has an order, so EXCEPT removes them all:\n{rendered}"
+    );
+}
+
+/// Companion to [`except_over_federation_executes`] on the same inputs:
+/// `INTERSECT` unparses to the same unnamed-derived shape with `EXISTS`. All
+/// four customers have a matching order, so {1,2,3,4} ∩ {1,2,3,4} = {1,2,3,4}.
+#[tokio::test]
+async fn intersect_over_federation_executes() {
+    let Some(driver) = driver_path() else { return };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_file = dir.path().join("contract.duckdb");
+    let db_file = db_file.to_str().expect("utf8 temp path");
+    seed_join_fixture(&driver, db_file);
+    let ctx = contract_context(&driver, db_file).await;
+
+    let (rendered, rows) = run(
+        &ctx,
+        "SELECT id FROM customers INTERSECT SELECT customer_id FROM orders ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows, 4, "all four customers have an order:\n{rendered}");
+    for id in ['1', '2', '3', '4'] {
+        assert!(rendered.contains(id), "id {id} must appear:\n{rendered}");
+    }
+}
+
+/// A correlated scalar subquery in `WHERE` unparses to an unnamed derived table
+/// wrapping a decorrelated LEFT JOIN, whose outer `c.name` dangled the same way.
+/// customers 1, 3 and 4 each have >1 order; bob (2) has exactly one, so he is
+/// excluded — proving the predicate is evaluated, not that everyone survives.
+#[tokio::test]
+async fn correlated_scalar_where_over_federation_executes() {
+    let Some(driver) = driver_path() else { return };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_file = dir.path().join("contract.duckdb");
+    let db_file = db_file.to_str().expect("utf8 temp path");
+    seed_join_fixture(&driver, db_file);
+    let ctx = contract_context(&driver, db_file).await;
+
+    let (rendered, rows) = run(
+        &ctx,
+        "SELECT name FROM customers c \
+         WHERE (SELECT count(*) FROM orders o WHERE o.customer_id = c.id) > 1",
+    )
+    .await;
+    assert_eq!(rows, 3, "alice/carol/dave have >1 order:\n{rendered}");
+    for name in ["alice", "carol", "dave"] {
+        assert!(rendered.contains(name), "{name} must appear:\n{rendered}");
+    }
+    assert!(
+        !rendered.contains("bob"),
+        "bob has exactly one order and must be excluded:\n{rendered}"
     );
 }
 
@@ -782,6 +886,79 @@ async fn aggregate_diversity_including_count_distinct_pushes_down() {
     assert!(rendered.contains("100"), "max 100:\n{rendered}");
 
     assert_fully_pushed(&ctx, sql, &["DISTINCT", "MIN", "MAX", "AVG"]).await;
+}
+
+///  /  (Urgent) — an aggregate whose argument mixes a column
+/// with an **integer literal**, over a **3-part-qualified** federated table,
+/// must plan and execute single-node. Pre-fix the literal's type coercion
+/// re-derived the aggregate's output field name at the 2-part remote
+/// qualifier (`sum(main.orders.amount * Int64(2))`) while the plan schema
+/// kept the 3-part Dataglot catalog (`sum(duck_contract.main.orders...)`) —
+/// `Schema error: No field named...`. Same class  (#1067) closed for
+/// distributed mode only. The mask rewrite hits it the same way:
+/// `count(email)` becomes `count('***')`, a literal inside the aggregate.
+#[tokio::test]
+async fn integer_literal_in_aggregate_over_qualified_table_executes() {
+    let Some(driver) = driver_path() else { return };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_file = dir.path().join("contract.duckdb");
+    let db_file = db_file.to_str().expect("utf8 temp path");
+    seed_join_fixture(&driver, db_file);
+    let ctx = contract_context(&driver, db_file).await;
+
+    // Burak's isolation table: decimal literal works, integer
+    // literal fails — and the TPC-H Q1 shape combines both. The last case is
+    // `ORDER BY` the anonymous rewritten aggregate itself
+    // (Sort -> Projection -> Aggregate), the shape Codex flagged on #1116.
+    for (label, sql) in [
+        (
+            "control: decimal literal",
+            "SELECT sum(amount * 1.2) FROM duck_contract.main.orders",
+        ),
+        (
+            "integer literal",
+            "SELECT sum(amount * 2) FROM duck_contract.main.orders",
+        ),
+        (
+            "literal minus column",
+            "SELECT sum(1 - amount) FROM duck_contract.main.orders",
+        ),
+        (
+            "tpch q1 shape",
+            "SELECT sum(amount * (1 - 0.1)) FROM duck_contract.main.orders",
+        ),
+        (
+            "grouped q1 shape",
+            "SELECT region, sum(amount * (1 - 0.1)) AS disc \
+             FROM duck_contract.main.orders GROUP BY region ORDER BY region",
+        ),
+        (
+            "order by rewritten aggregate",
+            "SELECT region, sum(amount * 2) \
+             FROM duck_contract.main.orders GROUP BY region ORDER BY 2 DESC",
+        ),
+        // Composite, un-aliased root expression over the rewritten aggregate,
+        // under a Sort (Codex P1): its label must survive too.
+        (
+            "negated aggregate under order by",
+            "SELECT region, -sum(amount * 2) \
+             FROM duck_contract.main.orders GROUP BY region ORDER BY region",
+        ),
+    ] {
+        let batches = ctx
+            .sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] plans: {e}"))
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] executes: {e}"));
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert!(rows >= 1, "[{label}] returns rows");
+        // Executing is not enough for this suite: the aggregate must ride the
+        // single pushed query, not fall back to a remote scan + local
+        // AggregateExec (which would also "return rows").
+        assert_fully_pushed(&ctx, sql, &["SUM"]).await;
+    }
 }
 
 /// Scalar-expression surface: BETWEEN, LIKE, IS NULL, and a string

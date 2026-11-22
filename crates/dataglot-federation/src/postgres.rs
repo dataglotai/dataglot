@@ -41,6 +41,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{
     CatalogProvider as DfCatalogProvider, SchemaProvider as DfSchemaProvider,
 };
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::SendableRecordBatchStream;
@@ -50,7 +51,6 @@ use datafusion::physical_plan::PhysicalExpr;
 use datafusion::sql::sqlparser::ast;
 use datafusion::sql::unparser::dialect::{Dialect, IntervalStyle, PostgreSqlDialect};
 use datafusion::sql::unparser::Unparser;
-use datafusion::sql::TableReference;
 use datafusion_federation::sql::{
     AstAnalyzer, LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider,
     SQLTableSource,

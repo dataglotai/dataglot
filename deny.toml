@@ -42,6 +42,35 @@ ignore = [
   # iceberg bump to quick-xml >= 0.41.
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
+  # Upstream maintenance notices, not vulnerabilities. These crates remain in
+  # the DataFusion/Arrow, Tokio/futures, and testcontainers dependency trees;
+  # there are no maintained releases within those upstream constraints.
+  # Remove each exception when the corresponding upstream dependency migrates.
+  "RUSTSEC-2026-0440", # astral-tokio-tar (testcontainers)
+  "RUSTSEC-2026-0543", # chrono (Arrow/DataFusion and tokio-postgres)
+  "RUSTSEC-2026-0555", # chrono-tz (Arrow/DataFusion)
+  "RUSTSEC-2026-0542", # humantime (DataFusion and dev tooling)
+  "RUSTSEC-2026-0441", # pin-utils (futures and upstream async dependencies)
+  # crypto-bigint 0.5 is fixed only on the incompatible 0.7 release line.
+  # jsonwebtoken's rust_crypto backend reaches it through p256/p384. Production
+  # JWT handling only verifies signatures with public keys; private-key signing
+  # is confined to tests. No secret integer arithmetic is exposed on this path.
+  # Remove when jsonwebtoken's elliptic-curve stack accepts crypto-bigint >=0.7.6;
+  # reassess before adding production signing or private-key operations.
+  "RUSTSEC-2026-0387",
+  # zip 6 is a build dependency of the optional DuckDB testbench comparator.
+  # That dependency always enables `bundled`; libduckdb-sys compiles its ZIP
+  # download/extraction module only under cfg(not(feature = "bundled")), so
+  # these APIs are absent from our build. zip is not a production dependency.
+  # Remove when libduckdb-sys upgrades zip; reassess before enabling linked
+  # DuckDB builds or DUCKDB_DOWNLOAD_LIB.
+  "RUSTSEC-2026-0367",
+  "RUSTSEC-2026-0368",
+  "RUSTSEC-2026-0369",
+  "RUSTSEC-2026-0429",
+  "RUSTSEC-2026-0545",
+  "RUSTSEC-2026-0547",
+  "RUSTSEC-2026-0548",
 ]
 
 [licenses]
@@ -77,19 +106,17 @@ wildcards = "allow"        # Allow path dependencies in workspace
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-git = [
-  # Apache Iceberg Rust SDK — pinned by rev in dataglot-federation/Cargo.toml.
-  # Released versions still target datafusion 52; we follow main until a release
-  # with the datafusion 53.1 bump is published.
+  # Apache Iceberg Rust SDK — pinned by rev in the workspace Cargo.toml, in
+  # lockstep with the rev apache/datafusion-iceberg pins. The crates.io 0.11.0
+  # release of `iceberg-datafusion` still targets DataFusion 54.
   "https://github.com/apache/iceberg-rust",
-  # Peaka's fork of `andrusha/snowflake-rs` — pinned by branch in
-  # dataglot-federation/Cargo.toml. The fork carries a 3-line `arrow` 57→58
-  # bump so the crate aligns with our workspace; retires the moment upstream
-  # ships its own arrow-58 release. See
+  # `iceberg-datafusion` moved out of iceberg-rust into this repo (DataFusion
+  # 55). Pinned by rev in the workspace Cargo.toml.
+  "https://github.com/apache/datafusion-iceberg",
+  # Peaka's fork of `andrusha/snowflake-rs` — pinned by rev in
+  # dataglot-federation/Cargo.toml. The fork carries an `arrow` bump so the
+  # crate's Arrow types unify with the workspace's; retires the moment
+  # upstream ships a release on the workspace arrow major. See
   # the phase-1 `snowflake-connector` plan.
   "https://github.com/peakacom/snowflake-rs",
-  # tpchgen-rs (Phase 2 task 03 baseline harness). Crates.io's latest 2.0.2
-  # release (Dec 2025) targets arrow 57; upstream PR #246 bumped `main` to
-  # arrow 58 in March 2026 but no 2.1.x has shipped. Same shape as the
-  # Ballista / iceberg-rust / peakacom/snowflake-rs pins.
-  "https://github.com/clflushopt/tpchgen-rs",
 ]

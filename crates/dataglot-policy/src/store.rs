@@ -58,7 +58,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use thiserror::Error;
 
 use crate::filter::BuildError as RowFilterBuildError;
@@ -265,6 +265,8 @@ impl RuleStorage {
             }
             layers.push(Arc::new(enforcer));
         }
+        // Row filters keep real data under masking: `CompositeEnforcer::new`
+        // hands this layer to the masking layer.
         if !self.filters.is_empty() {
             layers.push(Arc::new(RowFilterEnforcer::new(self.filters.clone())?));
         }

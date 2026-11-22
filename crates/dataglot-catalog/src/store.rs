@@ -549,9 +549,11 @@ pub trait MetaStore: Send + Sync + std::fmt::Debug {
     ///
     /// A superset of "orgs with policies" is acceptable — the caller
     /// tolerates an org that turns out to have none (its policy list comes
-    /// back empty). The embedded backend returns every org it knows (the
-    /// orgs-map keys); the Postgres backend returns the distinct orgs
-    /// present in the policy table.
+    /// back empty). Every backend returns every org that owns any object
+    /// (the embedded backend's orgs-map keys; the redb backend's union over
+    /// its org-keyed tables; the Postgres backend's `org` table, the FK
+    /// target of every org-scoped table) — an org that owns only grants must
+    /// be replayed too.
     ///
     /// # Errors
     /// Backend IO / query failure, or a corrupt on-disk document.

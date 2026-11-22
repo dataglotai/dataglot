@@ -90,8 +90,8 @@ dsn_env = "SALES_MYSQL_DSN"
 kind = "object_storage"
 
 [catalogs.files.s3]
-endpoint = "http://minio:9000"
-access_key_id = "minioadmin"
+endpoint = "http://rustfs:9000"
+access_key_id = "dataglot-demo-access"
 secret_access_key_env = "S3_SECRET"
 
 [[catalogs.files.tables]]

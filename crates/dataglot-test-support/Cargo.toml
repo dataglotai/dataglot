@@ -11,6 +11,18 @@ description = "Shared test-only helpers for the Dataglot workspace (dev tooling,
 name = "dataglot_test_support"
 path = "src/lib.rs"
 
-# Intentionally dependency-free (std only) so it stays a leaf dev-dependency
-# any crate can pull in without risking a cycle or a version-graph split.
+# No `dataglot-*` dependencies, ever: this is a leaf every other crate pulls
+# in as a dev-dependency, so an internal edge here could create a cycle. The
+# third-party deps below are all already in `[workspace.dependencies]` and
+# pinned there, so they cannot split the version graph either.
 [dependencies]
+
+# Needed only by `s3::create_bucket`, which replaces the `minio/mc` sidecar
+# container the object-store fixtures used to shell out to for `mc mb`
+#. All three are already workspace dependencies used by
+# `dataglot-server` and `dataglot-tests`, so this adds nothing to the
+# dependency graph or the licence report — unlike `aws-sdk-s3`, which would
+# pull ~40 crates to issue one `CreateBucket`.
+hmac.workspace = true
+reqwest = { workspace = true }
+sha2.workspace = true

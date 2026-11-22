@@ -213,6 +213,31 @@ async fn verifying_modes_reject_an_untrusted_certificate() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn system_roots_reject_an_untrusted_certificate() {
+    let server = boot_tls_only(SERVER_NAMES).await;
+    let url = format!("{}?sslrootcert=system", server.url);
+    // Clear only the child's settings: an inherited mode must not hide the
+    // default-mode regression, and parallel tests must keep their own env.
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_dataglot"))
+            .args(["query", "--server", &url, "SELECT 1 AS n"])
+            .env_remove("PGSSLMODE")
+            .env_remove("PGSSLROOTCERT")
+            .env_remove("DATAGLOT_PROFILE")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("CLI finished")
+    .expect("run CLI");
+    let error = String::from_utf8(output.stderr).expect("UTF-8 error");
+    assert_eq!(output.status.code(), Some(2), "{error}");
+    assert!(output.stdout.is_empty());
+    assert!(error.contains("invalid peer certificate"), "{error}");
+}
+
 /// Unlike libpq, `verify-ca` checks the host name too (see
 /// `docs/quick-reference.md`), so both verifying modes refuse a certificate
 /// issued for another host.

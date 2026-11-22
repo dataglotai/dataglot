@@ -54,12 +54,12 @@ use adbc_driver_manager::{ManagedConnection, ManagedDatabase, ManagedDriver};
 use arrow::array::{
     Array, ListArray, RecordBatch, StringArray, StructArray, UInt32Array, UnionArray,
 };
-use arrow::compute::cast;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{
     CatalogProvider as DfCatalogProvider, SchemaProvider as DfSchemaProvider,
 };
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::SendableRecordBatchStream;
@@ -68,7 +68,6 @@ use datafusion::physical_plan::PhysicalExpr;
 use datafusion::sql::unparser::dialect::{
     BigQueryDialect, Dialect, DuckDBDialect, MySqlDialect, PostgreSqlDialect, SqliteDialect,
 };
-use datafusion::sql::TableReference;
 use datafusion_federation::sql::{
     AstAnalyzer, LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider,
     SQLTableSource,
@@ -536,44 +535,6 @@ fn run_with_reset<C: AdbcConnectionApi, T>(
         None => true,
     };
     (result, keep)
-}
-
-/// Align a driver-produced batch with the schema the federation plan
-/// expects. Drivers commonly agree on layout but differ in field
-/// nullability, names, or exact numeric width; identical schemas pass
-/// through untouched, same-arity schemas are cast column-by-column.
-fn align_batch(batch: &RecordBatch, target: &SchemaRef) -> DataglotResult<RecordBatch> {
-    if batch.schema().as_ref() == target.as_ref() {
-        return Ok(batch.clone());
-    }
-    if batch.num_columns() != target.fields().len() {
-        return Err(DataglotError::federation(format!(
-            "adbc result arity mismatch: driver returned {} columns, plan expects {}",
-            batch.num_columns(),
-            target.fields().len()
-        )));
-    }
-    let columns = batch
-        .columns()
-        .iter()
-        .zip(target.fields())
-        .map(|(column, field)| {
-            if column.data_type() == field.data_type() {
-                Ok(Arc::clone(column))
-            } else {
-                cast(column, field.data_type()).map_err(|e| {
-                    DataglotError::federation(format!(
-                        "adbc result column '{}' cast from {:?} to {:?} failed: {e}",
-                        field.name(),
-                        column.data_type(),
-                        field.data_type()
-                    ))
-                })
-            }
-        })
-        .collect::<DataglotResult<Vec<_>>>()?;
-    RecordBatch::try_new(Arc::clone(target), columns)
-        .map_err(|e| DataglotError::federation(format!("adbc result batch rebuild failed: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1202,25 +1163,6 @@ fn read_vendor_name(conn: &ManagedConnection) -> Option<String> {
     None
 }
 
-/// Split a `<schema>.<table>` reference (bare, double-quoted, or
-/// backtick-quoted per the active dialect) into its two parts. Input
-/// comes from `datafusion-federation`'s `RemoteTableRef` rendering of
-/// the reference we built in [`AdbcConnector::table_provider`], so the
-/// shape is well-known.
-fn split_qualified(s: &str) -> Option<(String, String)> {
-    let parts: Vec<&str> = s.splitn(2, '.').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let unquote = |p: &str| p.trim_matches('"').trim_matches('`').to_string();
-    let schema = unquote(parts[0]);
-    let table = unquote(parts[1]);
-    if schema.is_empty() || table.is_empty() {
-        return None;
-    }
-    Some((schema, table))
-}
-
 #[async_trait]
 impl SQLExecutor for AdbcConnector {
     fn name(&self) -> &str {
@@ -1278,7 +1220,7 @@ impl SQLExecutor for AdbcConnector {
                     let batches = run_user_query(conn, &sql)?;
                     batches
                         .iter()
-                        .map(|batch| align_batch(batch, &target))
+                        .map(|batch| crate::remote_sql::align_batch(batch, &target, "adbc"))
                         .collect::<DataglotResult<Vec<_>>>()
                 })
                 .await
@@ -1308,11 +1250,12 @@ impl SQLExecutor for AdbcConnector {
     }
 
     async fn get_table_schema(&self, table_name: &str) -> DfResult<SchemaRef> {
-        let (schema_part, table_part) = split_qualified(table_name).ok_or_else(|| {
-            DataFusionError::External(Box::new(DataglotError::catalog(format!(
-                "expected '<schema>.<table>' reference, got: {table_name}"
-            ))))
-        })?;
+        let (schema_part, table_part) =
+            crate::remote_sql::split_qualified(table_name).ok_or_else(|| {
+                DataFusionError::External(Box::new(DataglotError::catalog(format!(
+                    "expected '<schema>.<table>' reference, got: {table_name}"
+                ))))
+            })?;
         self.fetch_arrow_schema(&schema_part, &table_part)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))
@@ -1890,24 +1833,6 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn split_qualified_handles_all_quote_styles() {
-        assert_eq!(
-            split_qualified("main.orders"),
-            Some(("main".to_string(), "orders".to_string()))
-        );
-        assert_eq!(
-            split_qualified("\"main\".\"orders\""),
-            Some(("main".to_string(), "orders".to_string()))
-        );
-        assert_eq!(
-            split_qualified("`main`.`orders`"),
-            Some(("main".to_string(), "orders".to_string()))
-        );
-        assert_eq!(split_qualified("orders"), None);
-        assert_eq!(split_qualified(".orders"), None);
-    }
-
-    #[test]
     fn get_objects_parser_walks_the_nested_adbc_shape() {
         use arrow::array::ArrayRef;
         use arrow::buffer::OffsetBuffer;
@@ -2000,33 +1925,5 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("catalog_db_schemas"), "got: {msg}");
-    }
-
-    #[test]
-    fn align_batch_passes_identical_schemas_through_and_casts_widths() {
-        use arrow::array::Int32Array;
-        let source_schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&source_schema),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )
-        .unwrap();
-
-        // Identical schema: untouched.
-        let same = align_batch(&batch, &source_schema).unwrap();
-        assert_eq!(same.schema(), source_schema);
-
-        // Wider target type: cast column-by-column.
-        let target = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
-        let widened = align_batch(&batch, &target).unwrap();
-        assert_eq!(widened.schema(), target);
-        assert_eq!(widened.num_rows(), 3);
-
-        // Arity mismatch: error, not silence.
-        let two_cols = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int64, true),
-            Field::new("b", DataType::Int64, true),
-        ]));
-        assert!(align_batch(&batch, &two_cols).is_err());
     }
 }

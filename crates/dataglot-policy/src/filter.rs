@@ -50,9 +50,9 @@ use std::collections::HashMap;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::Column;
+use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, Filter, LogicalPlan};
-use datafusion::sql::TableReference;
 
 use crate::{Identity, PolicyEnforcer};
 
@@ -65,15 +65,67 @@ use crate::{Identity, PolicyEnforcer};
 /// predicates are AND-ed (see [`RowFilterEnforcer::resolve_predicate`]).
 type OrgTaggedFilters = Vec<(Option<String>, Option<Vec<crate::OrgGroupId>>, Expr)>;
 
-/// Re-qualify every column reference in `predicate` to `alias`.
-///
-/// A row-filter predicate is registered against a table and references only
-/// that table's columns, so when the filter is applied *above* a
-/// `SubqueryAlias`, every column belongs to the single aliased relation —
-/// qualifying them all to the alias is correct and makes the predicate
-/// resolve against (and unparse to) the aliased relation (`alias.col`).
-/// Without this, a predicate qualified to the base table name unparses to
-/// invalid SQL under the aliased `FROM` the federation layer emits
+/// Add to `out` the columns of `table` that `expr` reads. References resolve
+/// through `aliases`, the alias map of the scope that wrote `expr`; an
+/// unqualified reference means `owner`, the relation of that scope — the
+/// filtered table at the top level. Embedded subquery plans are visited scope
+/// by scope (`for_each_expr_scoped`: their own relations shadow the enclosing
+/// ones, UNION branches and derived tables are separate scopes) and an
+/// unqualified reference inside one belongs to its own relations, so it is
+/// never attributed to the filtered table.
+fn collect_refs_of(
+    expr: &Expr,
+    owner: &TableReference,
+    aliases: &HashMap<TableReference, TableReference>,
+    table: &TableReference,
+    out: &mut std::collections::HashSet<String>,
+) {
+    let owns = |c: &Column| match &c.relation {
+        Some(r) => aliases.get(r).unwrap_or(r).resolved_eq(table),
+        None => owner.resolved_eq(table),
+    };
+    let nobody = TableReference::bare("");
+    expr.apply(|e| {
+        if let Expr::Column(c) | Expr::OuterReferenceColumn(_, c) = e {
+            if owns(c) {
+                out.insert(c.name.clone());
+            }
+        } else if let Some(sub) = crate::embedded_subquery(e) {
+            crate::mask::for_each_expr_scoped(sub, aliases, &mut |x, scope| {
+                collect_column_refs(x, &nobody, scope, table, out);
+                Ok(())
+            })
+            .expect("infallible walk");
+        }
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    })
+    .expect("infallible walk");
+}
+
+/// The plain and outer-reference columns of `expr` (not of its embedded
+/// subqueries) that belong to `table`.
+fn collect_column_refs(
+    expr: &Expr,
+    owner: &TableReference,
+    aliases: &HashMap<TableReference, TableReference>,
+    table: &TableReference,
+    out: &mut std::collections::HashSet<String>,
+) {
+    let owns = |c: &Column| match &c.relation {
+        Some(r) => aliases.get(r).unwrap_or(r).resolved_eq(table),
+        None => owner.resolved_eq(table),
+    };
+    expr.apply(|e| {
+        if let Expr::Column(c) | Expr::OuterReferenceColumn(_, c) = e {
+            if owns(c) {
+                out.insert(c.name.clone());
+            }
+        }
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    })
+    .expect("infallible walk");
+}
+
 fn requalify_columns(predicate: Expr, alias: &TableReference) -> Expr {
     predicate
         .transform(|e| match e {
@@ -162,15 +214,18 @@ pub enum BuildError {
 /// nodes — `Projection`, `Join`, `Aggregate`, etc. flow through
 /// unchanged; the filter is applied as close to the source as the
 /// optimizer can move it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RowFilterEnforcer {
+    // Shared, not copied, on `clone()`: the tag-based path composes a fresh
+    // `CompositeEnforcer` per optimizer pass, which clones this enforcer to
+    // hand it to the masking layer.
     /// `table` → the org-tagged row-filter rules for that table. Multiple
     /// orgs can register a filter on the *same* table (e.g. each tenant
     /// scopes `orders` to its own rows), so the value is a list keyed by
     /// the rule's `org`; `rewrite`/`explain` pick the entry that applies
     /// to the session identity via [`crate::org_rule_applies`]. At most
     /// one rule per distinct org per table (enforced at construction).
-    filters: HashMap<TableReference, OrgTaggedFilters>,
+    filters: std::sync::Arc<HashMap<TableReference, OrgTaggedFilters>>,
 }
 
 impl RowFilterEnforcer {
@@ -214,7 +269,9 @@ impl RowFilterEnforcer {
                 }
             }
         }
-        Ok(Self { filters: map })
+        Ok(Self {
+            filters: std::sync::Arc::new(map),
+        })
     }
 
     /// Build a real-but-empty enforcer. Registers no rules; behaves
@@ -222,7 +279,7 @@ impl RowFilterEnforcer {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            filters: HashMap::new(),
+            filters: std::sync::Arc::new(HashMap::new()),
         }
     }
 
@@ -262,6 +319,37 @@ impl RowFilterEnforcer {
     ///
     /// Returns an owned `Expr` because the result may be a freshly-built
     /// conjunction of several matching predicates.
+    /// The columns of `table` that the row filters applying to `identity`
+    /// read — on ANY filtered table that the current plan scans (`scanned`,
+    /// alias-resolved): a filter on `users` whose predicate embeds `EXISTS
+    /// (SELECT 1 FROM entitlements WHERE entitlements.email <> …)` reads
+    /// `entitlements.email`, and masking that inner scan would rewrite the
+    /// administrative predicate. A filter whose table is NOT scanned is not
+    /// injected into this plan and exempts nothing (otherwise a rule on an
+    /// unrelated table could reopen the oracle). Exactly the predicates
+    /// [`Self::resolve_predicate`] would inject (same tenant/operator
+    /// precedence and group scoping) —.
+    pub(crate) fn referenced_columns(
+        &self,
+        table: &TableReference,
+        identity: &Identity,
+        scanned: &std::collections::HashSet<TableReference>,
+    ) -> std::collections::HashSet<String> {
+        let mut cols = std::collections::HashSet::new();
+        // Resolve per SCANNED table — exactly the predicate the enforcer
+        // injects at that scan (`resolve_predicate`, with its own candidate
+        // precedence). Resolving rule keys instead would let a more-qualified
+        // rule on a sibling catalog's `users` shadow the bare fallback that
+        // this catalog's scan actually receives.
+        for filtered in scanned {
+            let Some(predicate) = self.resolve_predicate(filtered, identity) else {
+                continue;
+            };
+            collect_refs_of(&predicate, filtered, &HashMap::new(), table, &mut cols);
+        }
+        cols
+    }
+
     fn resolve_predicate(&self, table: &TableReference, identity: &Identity) -> Option<Expr> {
         let mut tenant: Option<Expr> = None;
         let mut operator_wide: Option<Expr> = None;
@@ -303,6 +391,19 @@ impl RowFilterEnforcer {
 }
 
 impl PolicyEnforcer for RowFilterEnforcer {
+    fn provides_rls_exemptions(&self) -> bool {
+        true
+    }
+
+    fn rls_referenced_columns(
+        &self,
+        table: &TableReference,
+        identity: &Identity,
+        scanned: &std::collections::HashSet<TableReference>,
+    ) -> Option<std::collections::HashSet<String>> {
+        Some(self.referenced_columns(table, identity, scanned))
+    }
+
     fn explain(&self, plan: &LogicalPlan, identity: &Identity) -> Vec<crate::PolicyDecision> {
         use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 

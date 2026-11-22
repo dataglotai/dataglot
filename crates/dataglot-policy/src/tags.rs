@@ -60,8 +60,8 @@
 
 use std::collections::HashMap;
 
+use datafusion::common::TableReference;
 use datafusion::logical_expr::Expr;
-use datafusion::sql::TableReference;
 
 /// Stable identifier for a [`TagDefinition`]. Newtype around
 /// `String` so a tag id can never be confused with a column or

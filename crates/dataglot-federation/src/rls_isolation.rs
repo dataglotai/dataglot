@@ -31,9 +31,9 @@ use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Column;
+use datafusion::common::TableReference;
 use datafusion::error::Result as DfResult;
 use datafusion::logical_expr::{Expr, Extension, JoinType, LogicalPlan, LogicalPlanBuilder};
-use datafusion::sql::TableReference;
 use datafusion_federation::FederatedPlanNode;
 
 /// Entry point for a connector's `logical_optimizer`. See the module docs.

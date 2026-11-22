@@ -509,3 +509,29 @@ async fn grants_are_org_isolated_on_postgres() {
         .unwrap()
         .is_empty());
 }
+
+///: `list_orgs` must see an org that owns ONLY grants. The old query
+/// enumerated `db_policy`, so the first `GRANT` under `[authz] mode = "open"`
+/// (no policies yet) was invisible to boot replay — `load_all_grants` skipped
+/// the org, in every mode.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn list_orgs_includes_an_org_that_owns_only_grants() {
+    let (dsn, _container) = boot_postgres().await;
+    let svc = CatalogService::connect(&dsn, "default")
+        .await
+        .expect("connect");
+    let grant = GrantRecord::select(GranteeKind::User, "analyst", "pg", "public", "users");
+    svc.put_grant("grant-only", &grant)
+        .await
+        .expect("put_grant");
+
+    let orgs = svc.list_orgs().await.expect("list_orgs");
+    assert!(
+        orgs.iter().any(|o| o == "grant-only"),
+        "grant-only org must be enumerated: {orgs:?}"
+    );
+    assert!(orgs.iter().any(|o| o == "default"), "{orgs:?}");
+    let listed = svc.list_grants("grant-only").await.expect("list_grants");
+    assert_eq!(listed.len(), 1);
+}

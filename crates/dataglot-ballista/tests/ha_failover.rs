@@ -7,17 +7,17 @@
 //! promoting and serving a query.** That's the slice-5b HA promise end to
 //! end, and this is the test that pins it.
 //!
-//! Backend: a **`MinIO`** container as the S3-compatible lease store. The
+//! Backend: a **`RustFS`** container as the S3-compatible lease store. The
 //! `file://`/`memory://` object stores can't back the lease (no conditional
 //! `PutMode::Update` / not shared across processes — see the
 //! `reject_unsupported_ha_scheme` guard), so a real shared S3 endpoint is
 //! required. The schedulers reach it via the standard `AWS_*` environment
-//! (`AWS_ENDPOINT` → `MinIO`), which is exactly the on-prem S3 path
+//! (`AWS_ENDPOINT` → the object store), which is exactly the on-prem S3 path
 //! `run_scheduler_ha` builds the lease store from.
 //!
 //! Shape:
-//!   - `MinIO` up; a `dataglot` bucket created (via the `mc` bundled in the
-//!     image).
+//!   - object store up; a `dataglot` bucket created with a signed S3 PUT
+//!     from the test process.
 //!   - Two `dataglot-ballista-scheduler` processes share
 //!     `s3://dataglot/scheduler-lease.json`. Distinct bind ports.
 //!   - A wins the lease and binds; B blocks in the claim loop (standby — it
@@ -38,12 +38,22 @@ use std::time::Duration;
 use ballista::datafusion::prelude::{ParquetReadOptions, SessionContext};
 use ballista_core::extension::SessionStateExt;
 use dataglot_ballista::BallistaContextFactory;
-use testcontainers::core::ExecCommand;
+use testcontainers::core::wait::HttpWaitStrategy;
+use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::minio::MinIO;
+use testcontainers::{GenericImage, ImageExt};
 
-const MINIO_USER: &str = "minioadmin";
-const MINIO_PASSWORD: &str = "minioadmin";
+/// Object store for the S3-compatible lease backend. `RustFS` since
+///  — `MinIO` is unpullable from every public registry (Docker Hub
+/// withdrawn 2026-09-13, `quay.io/minio` since closed to unauthenticated
+/// pulls). Pinned rather than `:latest`, which flaked on pull.
+const RUSTFS_IMAGE: &str = "rustfs/rustfs";
+const RUSTFS_TAG: &str = "1.0.0";
+
+/// `RustFS` refuses to start on a non-loopback listener with its built-in
+/// default credentials, so the fixture supplies its own.
+const S3_USER: &str = "dataglot-test-access";
+const S3_PASSWORD: &str = "dataglot-test-secret-key";
 const LEASE_BUCKET: &str = "dataglot";
 
 /// Allocate `n` *distinct* free ports. Binds all `n` listeners at once (so the
@@ -113,8 +123,8 @@ fn spawn_ha_scheduler(port: u16, lease_uri: &str, s3_endpoint: &str) -> tokio::p
             "--insecure",
         ])
         .env("AWS_ENDPOINT", s3_endpoint)
-        .env("AWS_ACCESS_KEY_ID", MINIO_USER)
-        .env("AWS_SECRET_ACCESS_KEY", MINIO_PASSWORD)
+        .env("AWS_ACCESS_KEY_ID", S3_USER)
+        .env("AWS_SECRET_ACCESS_KEY", S3_PASSWORD)
         .env("AWS_ALLOW_HTTP", "true")
         .env("AWS_REGION", "us-east-1")
         .stdout(std::process::Stdio::piped())
@@ -229,38 +239,48 @@ async fn count_via_ready(port: u16, parquet: &std::path::Path, timeout: Duration
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker (MinIO) + scheduler/executor subprocesses + a failover window"]
+#[ignore = "requires Docker + scheduler/executor subprocesses + a failover window"]
 async fn standby_scheduler_promotes_on_leader_death_and_serves_queries() {
-    // ---- `MinIO` as the S3-compatible lease backend ----------------------------
-    let minio = MinIO::default().start().await.expect("start MinIO");
-    let s3_port = minio
+    // Synchronous probe, so it runs off the Tokio workers (rule 9). Probed
+    // at the pinned tag read off the image — the bare repository resolves to
+    // `:latest`, a reference this test never starts.
+    if tokio::task::spawn_blocking(|| {
+        dataglot_test_support::image_unavailable(&format!("{RUSTFS_IMAGE}:{RUSTFS_TAG}"))
+    })
+    .await
+    .unwrap_or(false)
+    {
+        return;
+    }
+    // ---- object store as the S3-compatible lease backend -----------------------
+    // Readiness is an HTTP poll of `/health/ready`, not a sleep, and
+    // deliberately not a stdout marker: the `1.0.0` image's entrypoint
+    // wrapper swallows the server's startup line, so a `message_on_stdout`
+    // wait hangs until timeout. `/data` is a required positional argument.
+    let object_store = GenericImage::new(RUSTFS_IMAGE, RUSTFS_TAG)
+        .with_exposed_port(9000.tcp())
+        .with_wait_for(WaitFor::http(
+            HttpWaitStrategy::new("/health/ready")
+                .with_port(9000.tcp())
+                .with_expected_status_code(200_u16),
+        ))
+        .with_cmd(["/data"])
+        .with_env_var("RUSTFS_ACCESS_KEY", S3_USER)
+        .with_env_var("RUSTFS_SECRET_KEY", S3_PASSWORD)
+        .start()
+        .await
+        .expect("start object store");
+    let s3_port = object_store
         .get_host_port_ipv4(9000)
         .await
-        .expect("minio host port");
+        .expect("object store host port");
     let s3_endpoint = format!("http://127.0.0.1:{s3_port}");
 
-    // Create the lease bucket with the `mc` bundled in the minio image
-    // (localhost:9000 inside the container).
-    let mc = format!(
-        "mc alias set local http://localhost:9000 {MINIO_USER} {MINIO_PASSWORD} && \
-         mc mb --ignore-existing local/{LEASE_BUCKET}"
-    );
-    let mut exec = minio
-        .exec(ExecCommand::new(["/bin/sh", "-c", &mc]))
-        .await
-        .expect("exec mc bucket create");
-    // Draining stdout/stderr also waits for the command to finish, so the
-    // exit code is available (it's `None` while the exec is still running).
-    let out = exec.stdout_to_vec().await.unwrap_or_default();
-    let err = exec.stderr_to_vec().await.unwrap_or_default();
-    let code = exec.exit_code().await.expect("mc exit code");
-    assert_eq!(
-        code,
-        Some(0),
-        "creating the lease bucket via mc failed (exit {code:?}):\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out),
-        String::from_utf8_lossy(&err),
-    );
+    // Create the lease bucket. This used to shell out to the `mc` binary
+    // bundled inside the MinIO image via `exec`; with MinIO gone there is no
+    // bundled client, and a bucket create is one signed request anyway.
+    dataglot_test_support::s3::create_bucket(&s3_endpoint, LEASE_BUCKET, S3_USER, S3_PASSWORD)
+        .await;
 
     let lease_uri = format!("s3://{LEASE_BUCKET}/scheduler-lease.json");
 

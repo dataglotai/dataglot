@@ -68,7 +68,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ballista::datafusion::arrow::array::RecordBatch;
-use ballista::datafusion::arrow::datatypes::SchemaRef;
 use ballista::datafusion::prelude::{ParquetReadOptions, SessionContext};
 use dataglot_ballista::BallistaContextFactory;
 use dataglot_core::SessionConfig;
@@ -81,8 +80,8 @@ use tpchgen::generators::{
     PartSuppGenerator, RegionGenerator, SupplierGenerator,
 };
 use tpchgen_arrow::{
-    CustomerArrow, LineItemArrow, NationArrow, OrderArrow, PartArrow, PartSuppArrow,
-    RecordBatchIterator as TpchRecordBatchIterator, RegionArrow, SupplierArrow,
+    CustomerArrow, LineItemArrow, NationArrow, OrderArrow, PartArrow, PartSuppArrow, RegionArrow,
+    SupplierArrow,
 };
 
 // ---------------------------------------------------------------------------
@@ -322,8 +321,8 @@ fn seed_warehouse(dir: &Path, scale_factor: f64) {
 
 fn write_parquet<I>(dir: &Path, table: &str, iter: I)
 where
-    I: Iterator<Item = RecordBatch>,
-    I: SchemaProvider,
+    // tpchgen-arrow 4 generators are standard Arrow `RecordBatchReader`s.
+    I: ballista::datafusion::arrow::record_batch::RecordBatchReader,
 {
     let path = dir.join(format!("{table}.parquet"));
     let file = fs::File::create(&path).unwrap_or_else(|e| {
@@ -332,9 +331,10 @@ where
             path.display()
         )
     });
-    let mut writer = ArrowWriter::try_new(file, iter.schema_ref(), None)
+    let mut writer = ArrowWriter::try_new(file, iter.schema(), None)
         .unwrap_or_else(|e| panic!("open parquet writer for `{table}`: {e}"));
     for batch in iter {
+        let batch = batch.unwrap_or_else(|e| panic!("generate batch for `{table}`: {e}"));
         writer
             .write(&batch)
             .unwrap_or_else(|e| panic!("write batch for `{table}`: {e}"));
@@ -342,16 +342,6 @@ where
     writer
         .close()
         .unwrap_or_else(|e| panic!("close parquet writer for `{table}`: {e}"));
-}
-
-trait SchemaProvider {
-    fn schema_ref(&self) -> SchemaRef;
-}
-
-impl<T: TpchRecordBatchIterator> SchemaProvider for T {
-    fn schema_ref(&self) -> SchemaRef {
-        TpchRecordBatchIterator::schema(self).clone()
-    }
 }
 
 // ---------------------------------------------------------------------------
