@@ -56,13 +56,22 @@ pub(crate) fn align_batch(
     // put through it — so a remote that declares a column non-nullable and
     // then sends nulls in it would otherwise pass straight through to
     // DataFusion operators that trust the flag.
+    //
+    // *Logical* nulls, not `null_count()`: that counts only the validity
+    // bitmap, so a dictionary whose valid key points at a null value, or a
+    // `Null`-typed column, reports zero while every such row is null.
+    // Counting logical nulls can build and scan a mask (dictionary,
+    // run-end, union), so it is done only for fields that must not hold any.
     for (column, field) in batch.columns().iter().zip(target.fields()) {
-        if !field.is_nullable() && column.null_count() > 0 {
+        if field.is_nullable() {
+            continue;
+        }
+        let nulls = column.logical_null_count();
+        if nulls > 0 {
             return Err(DataglotError::federation(format!(
-                "{kind} result column '{}' contains {} null(s) but the plan expects it to \
-                 be non-nullable",
+                "{kind} result column '{}' contains {nulls} null(s) but the plan expects it \
+                 to be non-nullable",
                 field.name(),
-                column.null_count()
             )));
         }
     }
@@ -321,5 +330,57 @@ mod tests {
 
         // A nullable target accepts them.
         align_batch(&batch, &nullable, "flightsql").expect("nulls are fine when declared");
+    }
+
+    /// `null_count()` counts only *physical* nulls. A dictionary array whose
+    /// keys are all valid can still point at a null value, and a `Null`-typed
+    /// column reports `null_count() == 0` for every row — both are logical
+    /// nulls a non-nullable column must not carry. `RecordBatch::try_new`
+    /// checks only physical nulls too, so the guard has to look at logical
+    /// ones itself.
+    #[test]
+    fn logical_nulls_in_a_column_the_plan_calls_non_nullable_are_refused() {
+        use arrow::array::{Array as _, DictionaryArray, NullArray, StringArray};
+        use arrow::datatypes::Int32Type;
+
+        // A valid key (0) pointing at a null dictionary value.
+        let dict = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0, 0]),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+        )
+        .unwrap();
+        assert_eq!(
+            dict.null_count(),
+            0,
+            "no physical nulls: the keys are valid"
+        );
+        let dict_type = dict.data_type().clone();
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("d", dict_type, false)]));
+        // Arrow itself accepts the batch — it checks physical nulls only.
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(dict)]).unwrap();
+        // Identical-schema fast path.
+        let err = align_batch(&batch, &schema, "flightsql")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-nullable"), "{err}");
+        assert!(err.contains("2 null"), "{err}");
+        // Casting path (dictionary → plain Utf8).
+        let plain: SchemaRef = Arc::new(Schema::new(vec![Field::new("d", DataType::Utf8, false)]));
+        assert!(align_batch(&batch, &plain, "flightsql")
+            .unwrap_err()
+            .to_string()
+            .contains("non-nullable"));
+
+        // A `Null`-typed column is all logical nulls with `null_count() == 0`.
+        let nulls = NullArray::new(3);
+        assert_eq!(nulls.null_count(), 0);
+        let source = Arc::new(Schema::new(vec![Field::new("z", DataType::Null, true)]));
+        let batch = RecordBatch::try_new(source, vec![Arc::new(nulls)]).unwrap();
+        let target: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("z", DataType::Int32, false)]));
+        assert!(align_batch(&batch, &target, "flightsql")
+            .unwrap_err()
+            .to_string()
+            .contains("non-nullable"));
     }
 }

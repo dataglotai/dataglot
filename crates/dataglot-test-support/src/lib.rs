@@ -147,16 +147,29 @@ fn present_locally(image: &str) -> bool {
 /// confuse that with a verdict from Docker.
 ///
 /// The child stays in this thread so it can still be killed on timeout; only
-/// the stderr pipe moves. Reading that pipe to EOF *is* the wait, because it
-/// closes when the process exits — a deadline with no `thread::sleep`
-/// (disallowed workspace-wide) and no async runtime in this leaf crate.
+/// the stderr pipe moves. Reading that pipe to EOF is *usually* the wait,
+/// because it closes when the process exits — but not always: a wrapper that
+/// redirects or closes stderr and then blocks reaches EOF while still
+/// running. So process exit is checked against the same deadline too
+/// ([`reap_by`]), and on expiry the child is killed and reaped.
 fn run_bounded(args: &[&str]) -> Option<(bool, String)> {
+    run_bounded_program("docker", args, std::time::Duration::from_secs(20))
+}
+
+/// [`run_bounded`] with the program and deadline as parameters, so the
+/// deadline handling can be tested without Docker.
+fn run_bounded_program(
+    program: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Option<(bool, String)> {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::Instant;
 
-    let mut child = Command::new("docker")
+    let deadline = Instant::now() + timeout;
+    let mut child = Command::new(program)
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -173,13 +186,51 @@ fn run_bounded(args: &[&str]) -> Option<(bool, String)> {
         let _ = tx.send(buf);
     });
 
-    let Ok(stderr) = rx.recv_timeout(Duration::from_secs(20)) else {
+    let Ok(stderr) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
         let _ = child.kill();
         let _ = child.wait();
         return None;
     };
-    let status = child.wait().ok()?;
+    let status = reap_by(&mut child, deadline)?;
     Some((status.success(), stderr))
+}
+
+/// Wait for `child` to exit, but no later than `deadline`; past it, kill and
+/// reap the child and return `None`.
+///
+/// `Child::wait` has no timeout, so this polls `try_wait`. The pause between
+/// polls is a `recv_timeout` on a channel that never receives — a bounded
+/// wait without `thread::sleep`, which is disallowed workspace-wide (this
+/// leaf crate has no async runtime to sleep on instead).
+fn reap_by(
+    child: &mut std::process::Child,
+    deadline: std::time::Instant,
+) -> Option<std::process::ExitStatus> {
+    use std::time::{Duration, Instant};
+
+    let (_never_sends, pause) = std::sync::mpsc::channel::<()>();
+    loop {
+        let exited = match child.try_wait() {
+            Ok(exited) => exited,
+            // Can't tell whether it exited: treat like a timeout and clean
+            // up, rather than leaving a child (and its stderr reader) behind.
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        };
+        if let Some(status) = exited {
+            return Some(status);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        let _ = pause.recv_timeout(left.min(Duration::from_millis(25)));
+    }
 }
 
 /// What `docker manifest inspect`'s failure actually means.
@@ -309,6 +360,54 @@ fn probe(image: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `true` when a POSIX `sh` can be started, which the deadline tests
+    /// below use as a stand-in for a misbehaving `docker`.
+    fn have_sh() -> bool {
+        std::process::Command::new("sh")
+            .args(["-c", "true"])
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// A child that closes stderr and keeps running reaches EOF on the pipe
+    /// long before it exits. The deadline must still bound the call: it
+    /// returns `None` (no answer) close to the timeout instead of blocking in
+    /// `wait()` until the child finishes on its own.
+    #[test]
+    fn a_child_that_closes_stderr_early_is_still_bounded_by_the_deadline() {
+        if !have_sh() {
+            return;
+        }
+        let start = std::time::Instant::now();
+        let got = run_bounded_program(
+            "sh",
+            &["-c", "exec 2>&-; sleep 30"],
+            std::time::Duration::from_secs(1),
+        );
+        let elapsed = start.elapsed();
+        assert_eq!(got, None, "an unanswered call is not a verdict");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the deadline must bound process exit too, took {elapsed:?}"
+        );
+    }
+
+    /// The ordinary path still reports the exit status and stderr.
+    #[test]
+    fn a_child_that_exits_reports_its_status_and_stderr() {
+        if !have_sh() {
+            return;
+        }
+        let got = run_bounded_program(
+            "sh",
+            &["-c", "echo refused >&2; exit 3"],
+            std::time::Duration::from_secs(20),
+        );
+        let (ok, stderr) = got.expect("the child answered");
+        assert!(!ok);
+        assert_eq!(stderr.trim(), "refused");
+    }
 
     /// Every reserved port is unique within the process — the core
     /// guarantee that removes the intra-binary collision flake.

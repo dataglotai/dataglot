@@ -220,8 +220,10 @@ impl ColumnWhitelistEnforcer {
             // scan here would not survive datafusion-federation's replanning and
             // would re-fire every analyzer pass, so it is deliberately avoided.)
             LogicalPlan::TableScan(scan) => {
+                // Filters are qualified by the scan's physical name.
+                let scan_aliases = crate::mask::scan_filter_aliases(&scan, alias_map);
                 for filter in &scan.filters {
-                    if self.expr_touches_hidden(filter, alias_map, identity) {
+                    if self.expr_touches_hidden(filter, &scan_aliases, identity) {
                         return Err(hidden_use_error(filter));
                     }
                 }
@@ -657,5 +659,28 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("denied by policy"), "{err}");
+    }
+
+    /// An aliased scan's physical name must not capture a visible alias of
+    /// the same name: in `FROM emp AS docs CROSS JOIN docs AS d`, `docs.salary`
+    /// is `emp.salary`, which the whitelist hides.
+    #[tokio::test]
+    async fn visible_alias_is_not_captured_by_another_scans_physical_name() {
+        let ctx = ctx();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "salary",
+            Arc::new(Int32Array::from(vec![1])) as datafusion::arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        ctx.register_batch("docs", batch).unwrap();
+        for sql in [
+            "SELECT docs.salary FROM emp AS docs CROSS JOIN docs AS d",
+            "SELECT docs.salary FROM docs AS d CROSS JOIN emp AS docs",
+        ] {
+            let err = rewrite(&ctx, sql, &ops_whitelist(), &ops_analyst())
+                .await
+                .expect_err(sql);
+            assert!(err.to_string().contains("denied by policy"), "{sql}: {err}");
+        }
     }
 }

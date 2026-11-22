@@ -177,7 +177,7 @@ Phase 0 (Foundations, closed 2026-04-30) + Phase 0.5 (hardening).
   queries match; the 4 divergences became Phase 1 input).
 
 [Unreleased]: https://github.com/dataglotai/dataglot/compare/v0.5.3...HEAD
-[0.5.3]: https://github.com/dataglotai/dataglot/compare/v0.5.2...v0.5.3
+[0.5.3]: https://github.com/dataglotai/dataglot/compare/v0.5.0...v0.5.3
 [0.5.0]: https://github.com/dataglotai/dataglot/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/dataglotai/dataglot/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/dataglotai/dataglot/compare/v0.1.0...v0.3.0

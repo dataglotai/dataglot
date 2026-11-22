@@ -369,7 +369,9 @@ impl ColumnMaskingEnforcer {
     /// `LIKE` / `JOIN` / `ORDER BY`. Columns an admin row filter
     /// references are exempt so RLS keeps evaluating on real data in every
     /// optimizer pass. `Ok(Err(node))` hands any other node back untouched.
-    #[allow(clippy::type_complexity)]
+    // The per-rewrite context (aliases, identity, exemption cache, active
+    // scans, subquery position) travels as plain arguments, as elsewhere here.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn mask_predicate_positions(
         &self,
         node: LogicalPlan,
@@ -378,6 +380,7 @@ impl ColumnMaskingEnforcer {
         sub_changed: bool,
         cache: &ExemptCache,
         scanned: &ScannedTables,
+        in_filter_subquery: bool,
     ) -> Result<Result<Transformed<LogicalPlan>, LogicalPlan>, DataFusionError> {
         match node {
             LogicalPlan::Filter(f) => {
@@ -435,8 +438,9 @@ impl ColumnMaskingEnforcer {
             LogicalPlan::TableScan(scan) => {
                 let mut changed = false;
                 let mut filters = Vec::with_capacity(scan.filters.len());
+                let scan_aliases = scan_filter_aliases(&scan, alias_map);
                 for e in scan.filters {
-                    let out = self.mask_predicate(e, alias_map, identity, cache, scanned)?;
+                    let out = self.mask_predicate(e, &scan_aliases, identity, cache, scanned)?;
                     changed |= out.transformed;
                     filters.push(out.data);
                 }
@@ -449,49 +453,92 @@ impl ColumnMaskingEnforcer {
                 self.mask_join(j, alias_map, identity, sub_changed, cache, scanned)
             }
             LogicalPlan::Sort(srt) => {
-                let mut changed = false;
-                let mut expr = Vec::with_capacity(srt.expr.len());
-                for se in srt.expr {
-                    let out = self.mask_predicate(se.expr, alias_map, identity, cache, scanned)?;
-                    changed |= out.transformed;
-                    // A key that became a literal (a literal mask) orders
-                    // nothing — and `ORDER BY '***'` is invalid SQL on
-                    // PostgreSQL ("non-integer constant in ORDER BY") once
-                    // pushed down — so it is dropped. Only literals: a
-                    // zero-column mask may still be volatile (`random()`) and
-                    // then orders per row.
-                    if out.transformed && matches!(out.data, Expr::Literal(_, _)) {
-                        continue;
-                    }
-                    expr.push(SortExpr {
-                        expr: out.data,
-                        asc: se.asc,
-                        nulls_first: se.nulls_first,
-                    });
-                }
-                if expr.is_empty() {
-                    // Every key was a masked literal: the Sort orders
-                    // nothing. Keep only its LIMIT, if any. The replacement
-                    // takes this node's slot, so `transform_down` would not
-                    // call us on it again — rewrite the subtree explicitly
-                    // and stop the walk here.
-                    let input = std::sync::Arc::unwrap_or_clone(srt.input);
-                    let input = self.rewrite_with(input, identity, alias_map, scanned)?.data;
-                    let plan = match srt.fetch {
-                        Some(fetch) => LogicalPlanBuilder::from(input)
-                            .limit(0, Some(fetch))?
-                            .build()?,
-                        None => input,
-                    };
-                    return Ok(Ok(Transformed::new(plan, true, TreeNodeRecursion::Jump)));
-                }
-                Ok(Ok(flag(
-                    LogicalPlan::Sort(Sort { expr, ..srt }),
-                    changed || sub_changed,
+                let out =
+                    self.mask_sort(srt, alias_map, identity, cache, scanned, in_filter_subquery)?;
+                Ok(Ok(Transformed::new(
+                    out.data,
+                    out.transformed || sub_changed,
+                    out.tnr,
                 )))
             }
             other => Ok(Err(other)),
         }
+    }
+
+    /// The `Sort` case of [`Self::mask_predicate_positions`]: mask the keys
+    /// in place, never re-masking a key the input already outputs masked, and
+    /// drop keys that became literals (a Sort left with none collapses to its
+    /// LIMIT).
+    fn mask_sort(
+        &self,
+        srt: Sort,
+        alias_map: &HashMap<TableReference, TableReference>,
+        identity: &Identity,
+        cache: &ExemptCache,
+        scanned: &ScannedTables,
+        in_filter_subquery: bool,
+    ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+        let mut changed = false;
+        let mut expr = Vec::with_capacity(srt.expr.len());
+        for se in srt.expr {
+            // A key column the Sort's input already outputs MASKED (a
+            // Projection/Aggregate beneath, masked by this same
+            // rewrite) orders by that value: substituting the mask
+            // again would order by mask(mask(x)). Such a key over a
+            // literal mask orders nothing and is dropped like one.
+            if let Expr::Column(c) = &se.expr {
+                if let Some(literal) =
+                    self.masked_output_is_literal(c, &srt.input, alias_map, identity)
+                {
+                    if literal {
+                        changed = true;
+                        continue;
+                    }
+                    expr.push(se);
+                    continue;
+                }
+            }
+            let bound = |c: &datafusion::common::Column| {
+                self.masked_output_is_literal(c, &srt.input, alias_map, identity)
+                    .is_some()
+            };
+            let out =
+                self.mask_predicate_except(se.expr, alias_map, identity, cache, scanned, &bound)?;
+            changed |= out.transformed;
+            // A key that became a literal (a literal mask) orders
+            // nothing — and `ORDER BY '***'` is invalid SQL on
+            // PostgreSQL ("non-integer constant in ORDER BY") once
+            // pushed down — so it is dropped. Only literals: a
+            // zero-column mask may still be volatile (`random()`) and
+            // then orders per row.
+            if out.transformed && matches!(out.data, Expr::Literal(_, _)) {
+                continue;
+            }
+            expr.push(SortExpr {
+                expr: out.data,
+                asc: se.asc,
+                nulls_first: se.nulls_first,
+            });
+        }
+        if expr.is_empty() {
+            // Every key was a masked literal: the Sort orders
+            // nothing. Keep only its LIMIT, if any. The replacement
+            // takes this node's slot, so `transform_down` would not
+            // call us on it again — rewrite the subtree explicitly
+            // and stop the walk here.
+            let input = std::sync::Arc::unwrap_or_clone(srt.input);
+            let input = self
+                .rewrite_with(input, identity, alias_map, scanned, in_filter_subquery)?
+                .data;
+            let plan = match srt.fetch {
+                Some(fetch) => LogicalPlanBuilder::from(input)
+                    .limit(0, Some(fetch))?
+                    .build()?,
+                None => input,
+            };
+            return Ok(Transformed::new(plan, true, TreeNodeRecursion::Jump));
+        }
+        Ok(flag(LogicalPlan::Sort(Sort { expr, ..srt }), changed))
     }
 
     fn mask_join(
@@ -549,7 +596,19 @@ impl ColumnMaskingEnforcer {
                 && l.data.column_refs().is_empty()
                 && r.data.column_refs().is_empty();
             if constant_pair {
-                let eq_expr = l.data.eq(r.data);
+                // Compare the way the join does: a NULL-safe key (`INTERSECT`,
+                // `IS NOT DISTINCT FROM`) matches two NULLs — TRUE, dropped —
+                // where ordinary equality yields NULL and rejects the pair.
+                let eq_expr = match j.null_equality {
+                    datafusion::common::NullEquality::NullEqualsNull => {
+                        datafusion::logical_expr::binary_expr(
+                            l.data,
+                            datafusion::logical_expr::Operator::IsNotDistinctFrom,
+                            r.data,
+                        )
+                    }
+                    datafusion::common::NullEquality::NullEqualsNothing => l.data.eq(r.data),
+                };
                 match fold_constant(&eq_expr, &j.schema) {
                     // TRUE restricts nothing: drop it, decide below.
                     Fold::True => continue,
@@ -721,9 +780,28 @@ impl ColumnMaskingEnforcer {
         cache: &ExemptCache,
         scanned: &ScannedTables,
     ) -> Result<Transformed<Expr>, DataFusionError> {
+        self.mask_predicate_except(expr, alias_map, identity, cache, scanned, &|_| false)
+    }
+
+    /// [`Self::mask_predicate`], leaving alone every plain column for which
+    /// `skip` holds (a column that already carries a masked value).
+    fn mask_predicate_except(
+        &self,
+        expr: Expr,
+        alias_map: &HashMap<TableReference, TableReference>,
+        identity: &Identity,
+        cache: &ExemptCache,
+        scanned: &ScannedTables,
+        skip: &dyn Fn(&datafusion::common::Column) -> bool,
+    ) -> Result<Transformed<Expr>, DataFusionError> {
         expr.transform_down(|e| {
             if self.is_substituted_mask(&e, alias_map, identity) {
                 return Ok(Transformed::new(e, false, TreeNodeRecursion::Jump));
+            }
+            if let Expr::Column(c) = &e {
+                if skip(c) {
+                    return Ok(Transformed::no(e));
+                }
             }
             if let Some((rel, name)) = referenced_column(&e) {
                 if self.is_rls_exempt(rel, name, alias_map, identity, cache, scanned) {
@@ -734,6 +812,56 @@ impl ColumnMaskingEnforcer {
                 Some(masked) => Ok(Transformed::new(masked, true, TreeNodeRecursion::Jump)),
                 None => Ok(Transformed::no(e)),
             }
+        })
+    }
+
+    /// Does column `c` of `input`'s output come from a `Projection` or
+    /// `Aggregate` expression of this scope — an output position this rewrite
+    /// masks (`mask_expr`, never RLS-exempt) — through pass-through wrappers?
+    /// `Some(is_literal)` if so, where `is_literal` says the masked value is a
+    /// literal; `None` when `c` still reads a raw input (a scan, a join, a
+    /// window's own expression, another scope) and must be masked in place.
+    fn masked_output_is_literal(
+        &self,
+        c: &datafusion::common::Column,
+        input: &LogicalPlan,
+        alias_map: &HashMap<TableReference, TableReference>,
+        identity: &Identity,
+    ) -> Option<bool> {
+        let defining = match input {
+            LogicalPlan::Projection(p) => p.expr.get(p.schema.index_of_column(c).ok()?)?,
+            LogicalPlan::Aggregate(a) => {
+                if a.group_expr
+                    .iter()
+                    .any(|e| matches!(e, Expr::GroupingSet(_)))
+                {
+                    // Output layout differs (expanded sets, grouping id):
+                    // leave it to the in-place substitution.
+                    return None;
+                }
+                let idx = a.schema.index_of_column(c).ok()?;
+                a.group_expr.iter().chain(a.aggr_expr.iter()).nth(idx)?
+            }
+            // Scope boundary: its columns are not this scope's projections.
+            LogicalPlan::SubqueryAlias(_) => return None,
+            other => {
+                return self.masked_output_is_literal(
+                    c,
+                    passthrough_input(other, c)?,
+                    alias_map,
+                    identity,
+                );
+            }
+        };
+        // What `mask_expr` makes (or, on a later pass, made) of it.
+        Some(match defining.clone().unalias() {
+            Expr::Literal(_, _) => true,
+            Expr::Column(col) => col
+                .relation
+                .as_ref()
+                .and_then(|rel| self.lookup_mask(rel, &col.name, alias_map, identity))
+                .is_some_and(|m| matches!(m, Expr::Literal(_, _))),
+            _ => false,
         })
     }
 
@@ -1056,8 +1184,14 @@ fn collect_scope_relations(plan: &LogicalPlan, out: &mut HashMap<TableReference,
         LogicalPlan::SubqueryAlias(sa) => {
             let alias = TableReference::bare(sa.alias.table().to_string());
             if let LogicalPlan::TableScan(ts) = sa.input.as_ref() {
+                // Only the alias is visible: `FROM emp AS docs` hides `emp`.
+                // Binding the physical name too let it capture a visible
+                // alias of the same name (`FROM emp AS docs, docs AS d`) or
+                // an enclosing one (a correlated `docs.x` under an inner
+                // `FROM docs AS x`). A scan's own pushed-down filters, which
+                // ARE qualified by the physical name, resolve through
+                // `scan_filter_aliases`.
                 out.insert(alias, ts.table_name.clone());
-                out.insert(ts.table_name.clone(), ts.table_name.clone());
             } else {
                 // Derived table: its own scope; only the alias is visible here.
                 out.insert(alias.clone(), alias);
@@ -1074,6 +1208,19 @@ fn collect_scope_relations(plan: &LogicalPlan, out: &mut HashMap<TableReference,
     for child in plan.inputs() {
         collect_scope_relations(child, out);
     }
+}
+
+/// The alias map for a `TableScan`'s own pushed-down `filters`: the scope's
+/// map with the scan's physical name bound to itself, since every column
+/// there is qualified by that name and means this scan — whatever an alias
+/// of the same name denotes elsewhere in the scope.
+pub(crate) fn scan_filter_aliases(
+    scan: &TableScan,
+    scope: &HashMap<TableReference, TableReference>,
+) -> HashMap<TableReference, TableReference> {
+    let mut out = scope.clone();
+    out.insert(scan.table_name.clone(), scan.table_name.clone());
+    out
 }
 
 /// The child scopes a node opens — each `UNION` branch, a derived table's
@@ -1116,8 +1263,14 @@ pub(crate) fn for_each_expr_scoped(
             nested.extend(children);
             return Ok(TreeNodeRecursion::Jump);
         }
+        let scan_aliases = match node {
+            LogicalPlan::TableScan(scan) if !scan.filters.is_empty() => {
+                Some(scan_filter_aliases(scan, &aliases))
+            }
+            _ => None,
+        };
         for e in node.expressions() {
-            on_expr(&e, &aliases)?;
+            on_expr(&e, scan_aliases.as_ref().unwrap_or(&aliases))?;
             e.apply(|x| {
                 if let Some(sub) = crate::embedded_subquery(x) {
                     nested.push(Arc::clone(sub));
@@ -1490,6 +1643,11 @@ impl ColumnMaskingEnforcer {
                     | LogicalPlan::Join(_)
                     | LogicalPlan::Sort(_)
             );
+            let scan_aliases = match node {
+                LogicalPlan::TableScan(scan) => Some(scan_filter_aliases(scan, &alias_map)),
+                _ => None,
+            };
+            let node_aliases = scan_aliases.as_ref().unwrap_or(&alias_map);
             for e in node.expressions() {
                 e.apply(|x| {
                     // `lookup_mask` is the SAME matcher the rewrite uses
@@ -1497,9 +1655,19 @@ impl ColumnMaskingEnforcer {
                     // filter), so explain reports exactly what rewrite masks.
                     if let Some((rel, name)) = referenced_column(x) {
                         let exempt = predicate_position
+                            && self.is_rls_exempt(
+                                rel,
+                                name,
+                                node_aliases,
+                                identity,
+                                &cache,
+                                &scanned,
+                            );
+                        if !exempt
                             && self
-                                .is_rls_exempt(rel, name, &alias_map, identity, &cache, &scanned);
-                        if !exempt && self.lookup_mask(rel, name, &alias_map, identity).is_some() {
+                                .lookup_mask(rel, name, node_aliases, identity)
+                                .is_some()
+                        {
                             let resource = format!("{rel}.{name}");
                             if !out.iter().any(|d| d.resource == resource) {
                                 out.push(PolicyDecision::new(
@@ -1534,6 +1702,7 @@ impl ColumnMaskingEnforcer {
         identity: &Identity,
         inherited: &HashMap<TableReference, TableReference>,
         enclosing_scans: &ScannedTables,
+        in_filter_subquery: bool,
     ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
         // Identity does not drive rule *dispatch* here — column-masking
         // rules are static `(table, column) → mask Expr` (identity-aware
@@ -1594,7 +1763,7 @@ impl ColumnMaskingEnforcer {
             // as its enclosing one) and skipped by this walk.
             if !scope_children(&node).is_empty() {
                 let out = node.map_children(|child| {
-                    self.rewrite_with(child, identity, &alias_map, &scanned)
+                    self.rewrite_with(child, identity, &alias_map, &scanned, in_filter_subquery)
                 })?;
                 return Ok(Transformed::new(
                     out.data,
@@ -1607,6 +1776,10 @@ impl ColumnMaskingEnforcer {
             // type). `map_expressions` preserves a `Projection`'s DFSchema — it
             // reuses the `schema` field rather than recomputing it — so the
             // careful qualifier preservation below is not disturbed.
+            // A subquery under a `Filter` (where row filters are injected) —
+            // or nested anywhere inside one — feeds only that predicate; see
+            // `refuse_masked_row_filter_input`.
+            let sub_in_filter = in_filter_subquery || matches!(node, LogicalPlan::Filter(_));
             let Transformed {
                 data: node,
                 transformed: sub_changed,
@@ -1623,6 +1796,7 @@ impl ColumnMaskingEnforcer {
                             identity,
                             &alias_map,
                             &scanned,
+                            sub_in_filter,
                         )?;
                         Ok(out.update_data(std::sync::Arc::new))
                     })
@@ -1638,6 +1812,7 @@ impl ColumnMaskingEnforcer {
                 sub_changed,
                 &cache,
                 &scanned,
+                in_filter_subquery,
             )? {
                 Ok(done) => return Ok(done),
                 Err(node) => node,
@@ -1648,6 +1823,9 @@ impl ColumnMaskingEnforcer {
             // derived field name so the node's output schema is unchanged
             // (avoids the `optimize_projections` invariant panic on an
             // un-aliased `UPPER(email)` — ).
+            if in_filter_subquery {
+                self.refuse_masked_row_filter_input(&node, &alias_map, identity, &cache, &scanned)?;
+            }
             let Transformed {
                 data: node,
                 transformed: masked,
@@ -1660,6 +1838,54 @@ impl ColumnMaskingEnforcer {
                 Transformed::no(node)
             })
         })
+    }
+}
+
+impl ColumnMaskingEnforcer {
+    /// Fail closed on an output position, inside a subquery of a `Filter`
+    /// predicate, that reads a masked column an active admin row filter also
+    /// reads (`id < (SELECT threshold FROM cfg)` with `cfg.threshold`
+    /// masked). Output positions are always masked, so the row filter would
+    /// compare against the MASK and could admit rows it rejects. Exempting
+    /// the projection instead is not sound: nothing marks the injected
+    /// predicate as trusted, so a user-written subquery would get the same
+    /// exemption, and once the optimizer decorrelates the subquery into a
+    /// join its projection becomes an ordinary derived table that the next
+    /// pass masks anyway. Refusing is the only enforcement that holds across
+    /// passes; it also refuses a user-written predicate subquery of the same
+    /// shape.
+    fn refuse_masked_row_filter_input(
+        &self,
+        node: &LogicalPlan,
+        alias_map: &HashMap<TableReference, TableReference>,
+        identity: &Identity,
+        cache: &ExemptCache,
+        scanned: &ScannedTables,
+    ) -> Result<(), DataFusionError> {
+        if self.rls.is_empty() {
+            return Ok(());
+        }
+        let mut refused: Option<String> = None;
+        node.apply_expressions(|e| {
+            e.apply(|x| {
+                if let Some((rel, name)) = referenced_column(x) {
+                    if self.lookup_mask(rel, name, alias_map, identity).is_some()
+                        && self.is_rls_exempt(rel, name, alias_map, identity, cache, scanned)
+                    {
+                        refused = Some(format!("{rel}.{name}"));
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })?;
+        match refused {
+            Some(column) => Err(DataFusionError::Plan(format!(
+                "a row filter in effect reads masked column {column} through a subquery's \
+                 output; it cannot be evaluated on the masked value, so the query is refused"
+            ))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1704,7 +1930,13 @@ impl PolicyEnforcer for ColumnMaskingEnforcer {
         plan: LogicalPlan,
         identity: &Identity,
     ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
-        self.rewrite_with(plan, identity, &HashMap::new(), &ScannedTables::new())
+        self.rewrite_with(
+            plan,
+            identity,
+            &HashMap::new(),
+            &ScannedTables::new(),
+            false,
+        )
     }
 }
 
@@ -4333,5 +4565,454 @@ mod tests {
             3,
             "the inner filter restricts the pairing; got {rows:?}"
         );
+    }
+
+    /// Register `docs(email)` — a physical table whose name collides with an
+    /// alias the queries below give `users`.
+    fn register_docs(ctx: &SessionContext) {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "email",
+            Arc::new(StringArray::from(vec!["docs-real"])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        ctx.register_batch("docs", batch).unwrap();
+    }
+
+    /// An aliased scan's PHYSICAL name is not visible in its scope, so it must
+    /// never capture a visible alias of the same name: in `FROM users AS docs
+    /// CROSS JOIN docs AS d`, `docs.email` is `users.email` (masked), in either
+    /// relation order.
+    #[tokio::test]
+    async fn visible_alias_keeps_its_table_when_another_scan_has_that_name() {
+        let (ctx, users) = ctx_with_users();
+        register_docs(&ctx);
+        let enforcer = ColumnMaskingEnforcer::new([mask_email_literal(&users)]).expect("build");
+        for sql in [
+            "SELECT docs.email FROM users AS docs CROSS JOIN docs AS d",
+            "SELECT docs.email FROM docs AS d CROSS JOIN users AS docs",
+        ] {
+            let plan = rewrite_sql(&ctx, &enforcer, sql).await;
+            let rows = execute_plan(&ctx, plan).await;
+            assert_eq!(rows.len(), 3, "{sql}: {rows:?}");
+            for r in &rows {
+                assert_eq!(r[0], "***@example.com", "{sql}: leaked {rows:?}");
+            }
+        }
+    }
+
+    /// The same hiding across scopes: inside `EXISTS (SELECT … FROM docs AS
+    /// x …)` the name `docs` is the OUTER alias of `users` (a correlated outer
+    /// reference), not the inner aliased physical table — so `docs.email` is
+    /// masked there and the real-value probe matches nothing. The inner alias
+    /// `x` still resolves to the physical `docs` (unmasked).
+    #[tokio::test]
+    async fn aliased_inner_scan_does_not_shadow_the_enclosing_alias() {
+        let (ctx, users) = ctx_with_users();
+        register_docs(&ctx);
+        let enforcer = ColumnMaskingEnforcer::new([mask_email_literal(&users)]).expect("build");
+        let plan = rewrite_sql(
+            &ctx,
+            &enforcer,
+            "SELECT docs.id FROM users AS docs WHERE EXISTS \
+             (SELECT 1 FROM docs AS x WHERE docs.email = 'alice@example.com')",
+        )
+        .await;
+        let rows = execute_plan(&ctx, plan).await;
+        assert!(rows.is_empty(), "outer-reference oracle open: {rows:?}");
+        let plan = rewrite_sql(
+            &ctx,
+            &enforcer,
+            "SELECT docs.id FROM users AS docs WHERE EXISTS \
+             (SELECT 1 FROM docs AS x WHERE x.email = 'docs-real')",
+        )
+        .await;
+        let rows = execute_plan(&ctx, plan).await;
+        assert_eq!(rows.len(), 3, "inner x is the unmasked docs: {rows:?}");
+    }
+
+    /// A scan's pushed-down filters are qualified by its physical name and
+    /// mean that scan, even where the scope binds the same name to an alias of
+    /// another table.
+    #[tokio::test]
+    async fn scan_filter_aliases_bind_the_physical_name_to_the_scan() {
+        let (ctx, _users) = ctx_with_users();
+        register_docs(&ctx);
+        let plan = ctx.table("docs").await.unwrap().logical_plan().clone();
+        let LogicalPlan::TableScan(scan) = &plan else {
+            panic!("expected a scan: {plan}");
+        };
+        let scope = HashMap::from([(TableReference::bare("docs"), TableReference::bare("users"))]);
+        let local = scan_filter_aliases(scan, &scope);
+        assert_eq!(
+            local.get(&TableReference::bare("docs")),
+            Some(&TableReference::bare("docs"))
+        );
+        assert_eq!(
+            scope.get(&TableReference::bare("docs")),
+            Some(&TableReference::bare("users")),
+            "the scope map itself is untouched"
+        );
+    }
+
+    /// A non-literal integer mask on `users.id`: `(id % 3) + 1` maps 1,2,3 to
+    /// 2,3,1 — and applied twice to 3,1,2, so a double application is visible
+    /// in the order.
+    fn mask_id_mod3(users: &TableReference) -> ColumnMask {
+        use datafusion::logical_expr::{col, lit};
+        ColumnMask {
+            table: users.clone(),
+            column: "id".to_string(),
+            mask: (col("id") % lit(3_i32)) + lit(1_i32),
+            org: None,
+            groups: None,
+        }
+    }
+
+    /// A sort key bound to an output the Projection beneath already masks
+    /// orders by that masked value — the mask is not applied a second time.
+    #[tokio::test]
+    async fn sort_key_over_masked_projection_is_not_masked_twice() {
+        let (ctx, users) = ctx_with_users();
+        let enforcer = ColumnMaskingEnforcer::new([mask_id_mod3(&users)]).expect("build");
+        let plan = rewrite_sql(&ctx, &enforcer, "SELECT id FROM users ORDER BY id").await;
+        let rows = execute_plan(&ctx, plan).await;
+        assert_eq!(
+            rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
+            ["1", "2", "3"],
+            "sorted by the displayed (masked) value"
+        );
+        let plan = rewrite_sql(&ctx, &enforcer, "SELECT id FROM users ORDER BY id LIMIT 1").await;
+        let rows = execute_plan(&ctx, plan).await;
+        assert_eq!(rows, [["1"]], "top-1 is the smallest masked value");
+        // Key not projected: the planner adds it to the projection beneath the
+        // Sort, which masks it — still one application.
+        let plan = rewrite_sql(&ctx, &enforcer, "SELECT email FROM users ORDER BY id").await;
+        let rows = execute_plan(&ctx, plan).await;
+        assert_eq!(
+            rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
+            ["carol@example.com", "alice@example.com", "bob@example.com"],
+            "ordered by masked id 1,2,3"
+        );
+        // Grouped: the Aggregate's output is masked once as well.
+        let plan = rewrite_sql(
+            &ctx,
+            &enforcer,
+            "SELECT id FROM users GROUP BY id ORDER BY id",
+        )
+        .await;
+        let rows = execute_plan(&ctx, plan).await;
+        assert_eq!(
+            rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
+            ["1", "2", "3"]
+        );
+    }
+
+    /// A sort key that still reads the raw scan (no masking projection
+    /// beneath) keeps the in-place substitution: ordering never sees the real
+    /// value.
+    #[tokio::test]
+    async fn sort_key_over_raw_input_is_still_masked() {
+        let (ctx, users) = ctx_with_users();
+        let enforcer = ColumnMaskingEnforcer::new([mask_id_mod3(&users)]).expect("build");
+        let plan = ctx
+            .table("users")
+            .await
+            .unwrap()
+            .sort(vec![datafusion::logical_expr::col("id").sort(true, false)])
+            .unwrap()
+            .logical_plan()
+            .clone();
+        let out = enforcer
+            .rewrite(plan, &crate::Identity::anonymous())
+            .expect("rewrite")
+            .data;
+        let LogicalPlan::Sort(s) = &out else {
+            panic!("expected a Sort at the root: {out}");
+        };
+        assert!(
+            matches!(s.expr[0].expr, Expr::BinaryExpr(_)),
+            "raw sort key is substituted by the mask: {:?}",
+            s.expr
+        );
+        let rows = execute_plan(&ctx, out).await;
+        // Masked ids: alice 2, bob 3, carol 1.
+        assert_eq!(
+            rows.iter().map(|r| r[1].as_str()).collect::<Vec<_>>(),
+            ["carol@example.com", "alice@example.com", "bob@example.com"]
+        );
+    }
+
+    /// `INTERSECT` plans as a semi join whose keys compare NULL-safely. Keys
+    /// that both mask to a typed NULL literal are TRUE under that comparison
+    /// (dropped), not a NULL filter that empties the result.
+    #[tokio::test]
+    async fn null_safe_join_keys_masked_to_null_still_match() {
+        let (ctx, users) = ctx_with_users();
+        let enforcer = ColumnMaskingEnforcer::new([ColumnMask {
+            table: users.clone(),
+            column: "email".to_string(),
+            mask: datafusion::prelude::lit(datafusion::common::ScalarValue::Utf8(None)),
+            org: None,
+            groups: None,
+        }])
+        .expect("build");
+        let plan = rewrite_sql(
+            &ctx,
+            &enforcer,
+            "SELECT u.id, u.email FROM users u INTERSECT SELECT v.id, v.email FROM users v",
+        )
+        .await;
+        let rows = execute_plan(&ctx, plan).await;
+        assert_eq!(rows.len(), 3, "NULL-safe keys match: {rows:?}");
+    }
+
+    /// Ordinary (NULL-rejecting) equality on keys that both mask to NULL still
+    /// rejects every pair: the term moves into the filter and the join is
+    /// empty.
+    #[tokio::test]
+    async fn ordinary_join_keys_masked_to_null_reject_every_pair() {
+        let (ctx, users) = ctx_with_users();
+        let enforcer = ColumnMaskingEnforcer::new([ColumnMask {
+            table: users.clone(),
+            column: "email".to_string(),
+            mask: datafusion::prelude::lit(datafusion::common::ScalarValue::Utf8(None)),
+            org: None,
+            groups: None,
+        }])
+        .expect("build");
+        let plan = ctx
+            .sql("SELECT u.id FROM users u JOIN users v ON u.email = v.email AND u.id = v.id")
+            .await
+            .unwrap()
+            .into_optimized_plan()
+            .unwrap();
+        let out = enforcer
+            .rewrite(plan, &crate::Identity::anonymous())
+            .expect("an id key still restricts the join")
+            .data;
+        let rows = execute_plan(&ctx, out).await;
+        assert!(rows.is_empty(), "NULL = NULL rejects every pair: {rows:?}");
+    }
+
+    /// `cfg(threshold)` with a single row, threshold = 2.
+    fn register_cfg(ctx: &SessionContext) {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "threshold",
+            Arc::new(Int32Array::from(vec![2])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        ctx.register_batch("cfg", batch).unwrap();
+    }
+
+    /// An admin row filter `id < (SELECT threshold FROM cfg)` on `users`, with
+    /// `cfg.threshold` masked to 100 for the session.
+    async fn threshold_row_filter_and_mask(
+        ctx: &SessionContext,
+    ) -> (Arc<dyn PolicyEnforcer>, Arc<dyn PolicyEnforcer>) {
+        let shape = ctx
+            .sql("SELECT id FROM users WHERE id < (SELECT threshold FROM cfg)")
+            .await
+            .expect("plan")
+            .logical_plan()
+            .clone();
+        let mut predicate = None;
+        shape
+            .apply(|n| {
+                if let LogicalPlan::Filter(f) = n {
+                    predicate = Some(f.predicate.clone());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("walk");
+        let rls: Arc<dyn PolicyEnforcer> = Arc::new(
+            RowFilterEnforcer::new([crate::RowFilter {
+                table: TableReference::bare("users"),
+                predicate: predicate.expect("filter predicate"),
+                org: None,
+                groups: None,
+            }])
+            .expect("build rls"),
+        );
+        let mask: Arc<dyn PolicyEnforcer> = Arc::new(
+            ColumnMaskingEnforcer::new([ColumnMask {
+                table: TableReference::bare("cfg"),
+                column: "threshold".to_string(),
+                mask: datafusion::prelude::lit(100_i32),
+                org: None,
+                groups: None,
+            }])
+            .expect("build mask"),
+        );
+        (rls, mask)
+    }
+
+    /// An admin row filter whose scalar subquery PROJECTS a masked column must
+    /// never be evaluated against the mask (that admits rows the filter
+    /// rejects): the plan is refused instead, in either layer order.
+    #[tokio::test]
+    async fn row_filter_scalar_subquery_over_masked_column_is_refused() {
+        let (ctx, _users) = ctx_with_users();
+        register_cfg(&ctx);
+        let (rls, mask) = threshold_row_filter_and_mask(&ctx).await;
+        for layers in [
+            vec![Arc::clone(&rls), Arc::clone(&mask)],
+            vec![Arc::clone(&mask), Arc::clone(&rls)],
+        ] {
+            let composite = crate::CompositeEnforcer::new(layers);
+            let plan = ctx
+                .sql("SELECT id FROM users")
+                .await
+                .expect("plan")
+                .logical_plan()
+                .clone();
+            // Mask-first, pass 1 injects the filter after masking ran (its
+            // subquery still reads the real value); the next pass — every
+            // optimizer runs more than one — must refuse.
+            let identity = crate::Identity::anonymous();
+            let err = composite
+                .rewrite(plan, &identity)
+                .and_then(|once| composite.rewrite(once.data, &identity))
+                .expect_err("evaluating the admin filter on the mask must be refused");
+            assert!(err.to_string().contains("row filter"), "{err}");
+        }
+        // Through the real optimizer pipeline (every pass incl. decorrelation),
+        // in BOTH layer orders (`[mask, rls]` is the production order, see
+        // `PolicyStore::enforcer`) and with the rule installed both first (as
+        // `dataglot-server`'s `create_session` does) and last: refused, never
+        // the rows a masked threshold would admit.
+        for layers in [
+            vec![Arc::clone(&mask), Arc::clone(&rls)],
+            vec![Arc::clone(&rls), Arc::clone(&mask)],
+        ] {
+            for first in [true, false] {
+                let composite: Arc<dyn PolicyEnforcer> =
+                    Arc::new(crate::CompositeEnforcer::new(layers.clone()));
+                let rule: Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync> =
+                    Arc::new(crate::PolicyOptimizerRule::new(composite));
+                let base = ctx.state();
+                let mut rules = base.optimizers().to_vec();
+                if first {
+                    rules.insert(0, rule);
+                } else {
+                    rules.push(rule);
+                }
+                let state = datafusion::execution::SessionStateBuilder::new_from_existing(base)
+                    .with_optimizer_rules(rules)
+                    .build();
+                let session = SessionContext::new_with_state(state);
+                let result = match session.sql("SELECT id FROM users").await {
+                    Ok(df) => df
+                        .collect()
+                        .await
+                        .map(|b| b.iter().map(RecordBatch::num_rows).sum::<usize>()),
+                    Err(e) => Err(e),
+                };
+                // Either the plan is refused, or the row filter ran on the REAL
+                // threshold (2): exactly one row (`id = 1`). Never the three
+                // rows the masked threshold (100) would admit.
+                match result {
+                    Err(err) => assert!(
+                        err.to_string().contains("row filter"),
+                        "first={first}: {err}"
+                    ),
+                    Ok(rows) => {
+                        assert_eq!(rows, 1, "first={first}: the row filter was bypassed");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The refusal fires only at a predicate subquery's OUTPUT positions. A
+    /// masked, row-filtered column that the subquery merely FILTERS on — its
+    /// output is an unmasked column — is not refused: `Filter` nodes never
+    /// reach the output-position check, and `SELECT id` reads nothing masked.
+    #[tokio::test]
+    async fn predicate_subquery_filtering_on_a_masked_column_is_not_refused() {
+        let (ctx, users) = ctx_with_users();
+        let shape = ctx
+            .sql("SELECT id FROM users WHERE email <> 'nobody@example.com'")
+            .await
+            .expect("plan")
+            .logical_plan()
+            .clone();
+        let mut predicate = None;
+        shape
+            .apply(|n| {
+                if let LogicalPlan::Filter(f) = n {
+                    predicate = Some(f.predicate.clone());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("walk");
+        // The row filter reads `users.email`, and `users.email` is masked:
+        // exactly the column pair the refusal guards.
+        let rls: Arc<dyn PolicyEnforcer> = Arc::new(
+            RowFilterEnforcer::new([crate::RowFilter {
+                table: users.clone(),
+                predicate: predicate.expect("filter predicate"),
+                org: None,
+                groups: None,
+            }])
+            .expect("build rls"),
+        );
+        let mask: Arc<dyn PolicyEnforcer> = Arc::new(
+            ColumnMaskingEnforcer::new([ColumnMask {
+                table: users,
+                column: "email".to_string(),
+                mask: datafusion::prelude::lit("***"),
+                org: None,
+                groups: None,
+            }])
+            .expect("build mask"),
+        );
+        let sql = "SELECT id FROM users \
+                   WHERE id IN (SELECT id FROM users WHERE email = 'alice@example.com')";
+        for layers in [
+            vec![Arc::clone(&rls), Arc::clone(&mask)],
+            vec![Arc::clone(&mask), Arc::clone(&rls)],
+        ] {
+            let composite: Arc<dyn PolicyEnforcer> =
+                Arc::new(crate::CompositeEnforcer::new(layers));
+            // Installed FIRST, as `dataglot-server` does (`create_session`):
+            // appended last, it would run after projection pruning dropped the
+            // row filter's column from the scan.
+            let base = ctx.state();
+            let mut rules = base.optimizers().to_vec();
+            rules.insert(0, Arc::new(crate::PolicyOptimizerRule::new(composite)));
+            let state = datafusion::execution::SessionStateBuilder::new_from_existing(base)
+                .with_optimizer_rules(rules)
+                .build();
+            let session = SessionContext::new_with_state(state);
+            let result = match session.sql(sql).await {
+                Ok(df) => df.collect().await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            result.expect("filtering on a masked column inside the subquery is not refused");
+        }
+    }
+
+    /// A user-authored scalar subquery in an OUTPUT position under the same
+    /// policies is unaffected: the projected threshold is masked as usual.
+    #[tokio::test]
+    async fn output_scalar_subquery_over_masked_column_stays_masked() {
+        let (ctx, _users) = ctx_with_users();
+        register_cfg(&ctx);
+        let (_rls, mask) = threshold_row_filter_and_mask(&ctx).await;
+        let plan = ctx
+            .sql("SELECT id, (SELECT threshold FROM cfg) AS t FROM users ORDER BY id")
+            .await
+            .expect("plan")
+            .logical_plan()
+            .clone();
+        let out = mask
+            .rewrite(plan, &crate::Identity::anonymous())
+            .expect("rewrite")
+            .data;
+        let rows = execute_plan(&ctx, out).await;
+        assert_eq!(rows.len(), 3);
+        for r in &rows {
+            assert_eq!(r[1], "100", "projected threshold masked: {rows:?}");
+        }
     }
 }

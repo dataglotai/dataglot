@@ -26,6 +26,7 @@
 
 #![cfg(feature = "flightsql")]
 
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 /// Serialises every test that writes to the process environment.
@@ -90,7 +91,9 @@ use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::{
     Any, CommandGetTables, CommandStatementQuery, SqlInfo, TicketStatementQuery,
 };
-use arrow_flight::{FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
+use arrow_flight::{
+    FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, Ticket,
+};
 use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::util::pretty::pretty_format_batches;
@@ -101,9 +104,9 @@ use datafusion::prelude::{SessionConfig as DfSessionConfig, SessionContext};
 use dataglot_federation::flightsql::{
     FlightSqlAuth, FlightSqlConfig, FlightSqlConnector, FlightSqlDialect,
 };
-use futures::TryStreamExt;
+use futures::{Stream, TryStreamExt};
 use prost::Message;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
 // ---------------------------------------------------------------------------
 // An in-process Flight SQL server over DataFusion
@@ -142,6 +145,15 @@ struct TestServer {
     /// separate RPCs and can land on different servers, which is exactly
     /// what the endpoint-location tests need to tell apart.
     served_tickets: Arc<std::sync::atomic::AtomicUsize>,
+    /// Implement the Basic → bearer handshake and accept only the token it
+    /// issued most recently — the Dremio shape. Off: no handshake, and
+    /// requests are not authenticated.
+    issue_tokens: bool,
+    /// How many tokens the handshake has issued (`tok-1`, `tok-2`, …).
+    issued_tokens: Arc<std::sync::atomic::AtomicUsize>,
+    /// The one bearer token currently accepted. A test sets it to `None` to
+    /// expire the token the connector holds.
+    valid_token: Arc<Mutex<Option<String>>>,
 }
 
 impl TestServer {
@@ -205,16 +217,32 @@ impl TestServer {
             seen_auth: Arc::new(Mutex::new(None)),
             seen_sql: Arc::new(Mutex::new(Vec::new())),
             served_tickets: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            issue_tokens: false,
+            issued_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            valid_token: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn record_auth<T>(&self, request: &Request<T>) {
+    /// Record the request's `authorization` header and, when this server
+    /// issues tokens, refuse anything but the currently valid one.
+    fn record_auth<T>(&self, request: &Request<T>) -> Result<(), Status> {
         let header = request
             .metadata()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        *self.seen_auth.lock().expect("auth lock") = header;
+        self.seen_auth
+            .lock()
+            .expect("auth lock")
+            .clone_from(&header);
+        if !self.issue_tokens {
+            return Ok(());
+        }
+        let valid = self.valid_token.lock().expect("token lock").clone();
+        match (header, valid) {
+            (Some(h), Some(v)) if h == format!("Bearer {v}") => Ok(()),
+            _ => Err(Status::unauthenticated("bearer token expired or invalid")),
+        }
     }
 
     fn endpoint(&self, ticket: Ticket) -> FlightEndpoint {
@@ -289,7 +317,7 @@ impl FlightSqlService for TestServer {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.record_auth(&request);
+        self.record_auth(&request)?;
         self.seen_sql
             .lock()
             .expect("sql lock")
@@ -302,7 +330,7 @@ impl FlightSqlService for TestServer {
         ticket: TicketStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        self.record_auth(&request);
+        self.record_auth(&request)?;
         self.served_tickets
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let sql = String::from_utf8(ticket.statement_handle.to_vec())
@@ -315,7 +343,7 @@ impl FlightSqlService for TestServer {
         _query: CommandGetTables,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.record_auth(&request);
+        self.record_auth(&request)?;
         if self.metadata == Metadata::Unimplemented {
             return Err(Status::unimplemented("GetTables"));
         }
@@ -329,6 +357,46 @@ impl FlightSqlService for TestServer {
             request.into_inner(),
         )
         .await
+    }
+
+    /// Basic → bearer exchange: issue `tok-N`, make it the only valid token,
+    /// and return it in the `authorization` response header (where the
+    /// arrow-flight client reads it).
+    async fn do_handshake(
+        &self,
+        request: Request<Streaming<HandshakeRequest>>,
+    ) -> Result<
+        Response<Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>>,
+        Status,
+    > {
+        if !self.issue_tokens {
+            return Err(Status::unimplemented("handshake"));
+        }
+        let basic = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if !basic.starts_with("Basic ") {
+            return Err(Status::unauthenticated("handshake needs Basic credentials"));
+        }
+        let n = self
+            .issued_tokens
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let token = format!("tok-{n}");
+        *self.valid_token.lock().expect("token lock") = Some(token.clone());
+        let output: Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>> =
+            Box::pin(futures::stream::iter(vec![Ok(HandshakeResponse {
+                protocol_version: 0,
+                payload: prost::bytes::Bytes::default(),
+            })]));
+        let mut response = Response::new(output);
+        response.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("ascii header"),
+        );
+        Ok(response)
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
@@ -1312,4 +1380,151 @@ async fn references_stay_two_part_until_a_catalog_is_configured() {
         "an unconfigured catalog stays out of the reference: {probe}"
     );
     assert!(probe.contains("users"), "{probe}");
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes: plaintext locations, token renewal, scrubbed schema probes
+// ---------------------------------------------------------------------------
+
+/// Opting into following result locations must not opt into sending this
+/// catalog's credential in cleartext. A plaintext location off the machine
+/// is refused *before* it is dialled — not attempted and failed.
+#[tokio::test]
+async fn an_opted_in_plaintext_location_is_refused_when_credentials_are_configured() {
+    const PASSWORD_VAR: &str = "DATAGLOT_TEST_FLIGHTSQL_PLAINTEXT_HOP";
+    let _env = env_write().await;
+    let _var = EnvVar::set(PASSWORD_VAR, "hunter2");
+
+    let fx = Fixture::start(|_| {
+        let mut fixture = TestServer::new(Metadata::GetTables);
+        fixture.advertise_location = Some("grpc://replica.invalid:32010".to_string());
+        fixture
+    })
+    .await;
+    let mut config = FlightSqlConfig::new("flight", &fx.uri, FlightSqlDialect::DataFusion);
+    config.follow_endpoint_locations = true;
+    config.auth = FlightSqlAuth::Basic {
+        username: "svc".to_string(),
+        password_env: PASSWORD_VAR.to_string(),
+    };
+    let connector = Arc::new(
+        FlightSqlConnector::connect(config)
+            .await
+            .expect("a loopback coordinator carries credentials"),
+    );
+    let ctx = federated_ctx(&connector).await;
+    let err = ctx
+        .sql("SELECT id FROM users")
+        .await
+        .expect("plans")
+        .collect()
+        .await
+        .expect_err("a plaintext remote location must not receive the credential")
+        .to_string();
+    assert!(err.contains("plaintext result location"), "{err}");
+    assert!(
+        !err.contains("connecting to"),
+        "refused by policy, not attempted and failed: {err}"
+    );
+    assert!(!err.contains("hunter2"), "{err}");
+}
+
+/// The bearer token the Basic handshake issues expires while the Basic
+/// credential stays valid. The connector repeats the handshake on
+/// `Unauthenticated` and retries, instead of failing every later query and
+/// probe until it is rebuilt.
+#[tokio::test]
+async fn an_expired_handshake_token_is_renewed_and_the_request_retried() {
+    use dataglot_federation::health::ConnectorHealthCheck;
+    const PASSWORD_VAR: &str = "DATAGLOT_TEST_FLIGHTSQL_REAUTH";
+    let _env = env_write().await;
+    let _var = EnvVar::set(PASSWORD_VAR, "hunter2");
+
+    let fx = Fixture::start(|_| {
+        let mut fixture = TestServer::new(Metadata::GetTables);
+        fixture.issue_tokens = true;
+        fixture
+    })
+    .await;
+    let mut config = FlightSqlConfig::new("flight", &fx.uri, FlightSqlDialect::DataFusion);
+    config.auth = FlightSqlAuth::Basic {
+        username: "svc".to_string(),
+        password_env: PASSWORD_VAR.to_string(),
+    };
+    config.handshake = true;
+    let connector = Arc::new(
+        FlightSqlConnector::connect(config)
+            .await
+            .expect("connector connects and handshakes"),
+    );
+    let issued = || {
+        fx.server
+            .issued_tokens
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+    let seen = || fx.server.seen_auth.lock().unwrap().clone();
+    let ctx = federated_ctx(&connector).await;
+    let run = || async {
+        ctx.sql("SELECT id FROM users")
+            .await
+            .expect("plans")
+            .collect()
+            .await
+    };
+    let rows = |b: &[RecordBatch]| b.iter().map(RecordBatch::num_rows).sum::<usize>();
+
+    assert_eq!(rows(&run().await.expect("the issued token works")), 4);
+    assert_eq!(issued(), 1);
+    assert_eq!(seen().as_deref(), Some("Bearer tok-1"));
+
+    // Expire it: the next query is answered `Unauthenticated` once, then
+    // served on the renewed token.
+    *fx.server.valid_token.lock().unwrap() = None;
+    assert_eq!(rows(&run().await.expect("renewed and retried")), 4);
+    assert_eq!(issued(), 2, "exactly one re-handshake");
+    assert_eq!(seen().as_deref(), Some("Bearer tok-2"));
+
+    // The health probe recovers the same way.
+    *fx.server.valid_token.lock().unwrap() = None;
+    connector
+        .health_check()
+        .await
+        .expect("the probe renews the token too");
+    assert_eq!(issued(), 3);
+}
+
+/// The schema probe's error names the table it was resolving. That name is
+/// remote-listed (or caller-supplied) text added *after* the RPC error was
+/// scrubbed, so the whole message is scrubbed again.
+#[tokio::test]
+async fn a_failed_schema_probe_does_not_echo_a_credential_in_the_table_name() {
+    const PASSWORD_VAR: &str = "DATAGLOT_TEST_FLIGHTSQL_PROBE";
+    let _env = env_write().await;
+    let _var = EnvVar::set(PASSWORD_VAR, "Hunter2Probe");
+
+    let fx = Fixture::with(Metadata::GetTables).await;
+    let mut config = FlightSqlConfig::new("flight", &fx.uri, FlightSqlDialect::DataFusion);
+    config.auth = FlightSqlAuth::Basic {
+        username: "svc".to_string(),
+        password_env: PASSWORD_VAR.to_string(),
+    };
+    let connector = Arc::new(
+        FlightSqlConnector::connect(config)
+            .await
+            .expect("connector connects"),
+    );
+    let err = connector
+        .table_provider("public", "Hunter2Probe")
+        .await
+        .expect_err("no such table")
+        .to_string();
+    assert!(
+        !err.to_ascii_lowercase().contains("hunter2probe"),
+        "the credential-shaped name must not reach the operator: {err}"
+    );
+    assert!(err.contains("[redacted]"), "{err}");
+    assert!(
+        err.contains("resolving the schema"),
+        "still actionable: {err}"
+    );
 }

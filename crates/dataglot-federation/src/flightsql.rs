@@ -32,7 +32,9 @@
 //! - **Credentials never appear in logs, errors, `Debug`, or plans**
 //!   (hard rule 12). The password/token is read from the environment at
 //!   connect time into a redacting wrapper, and errors leaving this module
-//!   are scrubbed of it.
+//!   are scrubbed of it. Nor do they cross the network in cleartext: a
+//!   credential is sent over plaintext only to a loopback host, both to the
+//!   configured endpoint and to any followed result location.
 //!
 //! # Threading
 //!
@@ -45,9 +47,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, StringArray};
@@ -268,7 +271,9 @@ pub struct FlightSqlConfig {
     pub name: String,
     /// Endpoint URI. `grpc://`, `grpc+tcp://` and `http://` are plaintext;
     /// `grpc+tls://` and `https://` enable TLS. Example:
-    /// `grpc://dremio.internal:32010`.
+    /// `grpc+tls://dremio.internal:32010`. A plaintext endpoint carries
+    /// credentials only when it is loopback; anywhere else it is for
+    /// `auth = None` sources.
     pub endpoint: String,
     /// Mandatory SQL dialect of the serving engine.
     pub dialect: FlightSqlDialect,
@@ -331,9 +336,10 @@ impl FlightSqlConfig {
     ///
     /// # Errors
     /// [`DataglotError::Configuration`] when the endpoint is empty or carries
-    /// an unknown scheme, when TLS-only options are set on a plaintext
-    /// endpoint, when `handshake` is set without Basic credentials, or when
-    /// the connect timeout is zero.
+    /// an unknown scheme, when credentials are configured on a plaintext
+    /// endpoint that is not loopback, when TLS-only options are set on a
+    /// plaintext endpoint, when `handshake` is set without Basic
+    /// credentials, or when the connect timeout is zero.
     pub fn validate(&self) -> DataglotResult<()> {
         let cfg_err = |msg: String| {
             DataglotError::configuration(format!("flightsql catalog '{}': {msg}", self.name))
@@ -348,8 +354,10 @@ impl FlightSqlConfig {
         // shape outright rather than trying to redact it everywhere.
         // One gate for every dialable URI — the configured endpoint here,
         // and any location a server advertises, in `Transport::parse`.
-        self.transport()?;
-        let tls = self.uses_tls()?;
+        let transport = self.transport()?;
+        refuse_plaintext_credentials(&transport, !matches!(self.auth, FlightSqlAuth::None))
+            .map_err(cfg_err)?;
+        let tls = transport.tls;
         if !tls {
             // `tls_ca_file` still has a job on a plaintext coordinator *if*
             // TLS result locations may be followed — `build_channel` applies
@@ -413,14 +421,6 @@ impl FlightSqlConfig {
             ));
         }
         Ok(())
-    }
-
-    /// Does the configured endpoint speak TLS?
-    ///
-    /// # Errors
-    /// [`DataglotError::Configuration`] for an unknown or missing scheme.
-    fn uses_tls(&self) -> DataglotResult<bool> {
-        Ok(self.transport()?.tls)
     }
 
     /// The configured endpoint's [`Transport`].
@@ -513,6 +513,42 @@ struct Transport {
     /// answers "is this the server we already hold a connection to".
     authority: String,
     tls: bool,
+    /// The host is a loopback address (`127.0.0.0/8`, `::1`) or
+    /// `localhost`, so traffic to it never leaves this machine. The one
+    /// place a credential may travel without TLS — see
+    /// [`refuse_plaintext_credentials`].
+    loopback: bool,
+}
+
+/// Refuse to send a credential over a plaintext connection to anything but
+/// loopback.
+///
+/// The Basic credential and the bearer token ride in the `authorization`
+/// header of every RPC (and of the handshake), so on a plaintext channel
+/// anyone who can observe the connection can read them. Loopback is exempt:
+/// that traffic never leaves the host, and a sidecar on loopback is the
+/// deployment unauthenticated plaintext exists for. An unauthenticated
+/// plaintext source is unaffected — there is nothing to leak.
+///
+/// One rule for every dialled transport: the configured endpoint (checked
+/// in `validate`) and any result location a server advertises (checked in
+/// `Inner::channel_for`), since opting into following locations must not
+/// opt into cleartext credentials.
+///
+/// # Errors
+/// A message naming the problem, for the caller to prefix. It does not echo
+/// the transport, which may be remote-supplied.
+fn refuse_plaintext_credentials(transport: &Transport, credentialed: bool) -> Result<(), String> {
+    if !credentialed || transport.tls || transport.loopback {
+        return Ok(());
+    }
+    Err(
+        "credentials are configured but the connection is plaintext and not loopback, \
+         so the `authorization` header would cross the network in cleartext; use a \
+         `grpc+tls://` or `https://` endpoint, or `auth = \"none\"` for an \
+         unauthenticated source"
+            .to_string(),
+    )
 }
 
 impl Transport {
@@ -588,10 +624,17 @@ impl Transport {
             .port_or_known_default()
             .ok_or_else(|| "endpoint has no port and the scheme implies none".to_string())?;
         let authority = format!("{}:{port}", host.to_ascii_lowercase());
+        let loopback = match parsed.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+            None => false,
+        };
         Ok(Self {
             uri: format!("{mapped}://{authority}"),
             authority,
             tls,
+            loopback,
         })
     }
 
@@ -786,16 +829,25 @@ struct Inner {
     auth_header: Option<Secret>,
     /// Bearer token, from `handshake` or from configuration. Takes
     /// precedence over `auth_header` — `set_token` overwrites the
-    /// `authorization` metadata the headers set.
-    token: Option<Secret>,
-    /// Every secret this connector holds, for scrubbing error text.
-    secrets: Vec<Secret>,
+    /// `authorization` metadata the headers set. Behind a lock because a
+    /// handshake-issued token is replaced when the server rejects it
+    /// ([`Inner::reauthenticate`]); never held across an `.await`.
+    token: RwLock<Option<Secret>>,
+    /// Every secret this connector holds, for scrubbing error text. Grows
+    /// when a re-authentication issues a new token; superseded tokens stay
+    /// listed, since an error can still quote one.
+    secrets: RwLock<Vec<Secret>>,
+    /// `(username, password)` for repeating the handshake once the token it
+    /// issued expires. `Some` only when `handshake` is on and the server
+    /// did issue a token. The password is already in `secrets`.
+    reauth: Option<(String, Secret)>,
+    /// Serialises re-authentication, so a burst of queries that all hit the
+    /// expired token runs one handshake rather than one each.
+    reauth_lock: tokio::sync::Mutex<()>,
     /// The configured endpoint's transport, for the ticket-routing policy —
     /// authority AND TLS posture, since both are part of "same server".
     transport: Transport,
 }
-
-impl Inner {}
 
 impl Inner {
     /// A client for one operation, with this connector's credentials
@@ -804,7 +856,7 @@ impl Inner {
     /// foreign endpoint location needs exactly that.
     fn client_on(&self, channel: Channel) -> FlightSqlServiceClient<Channel> {
         let mut client = FlightSqlServiceClient::new(channel);
-        if let Some(token) = &self.token {
+        if let Some(token) = self.current_token() {
             client.set_token(token.expose().to_string());
         } else if let Some(header) = &self.auth_header {
             client.set_header("authorization", header.expose());
@@ -817,19 +869,108 @@ impl Inner {
         self.client_on(self.channel.clone())
     }
 
+    /// The bearer token RPCs carry right now, if any.
+    fn current_token(&self) -> Option<Secret> {
+        self.token
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Does an RPC from this connector carry a credential?
+    fn credentialed(&self) -> bool {
+        self.auth_header.is_some() || self.current_token().is_some()
+    }
+
+    /// Run one RPC; if the server rejects the handshake-issued token as
+    /// `Unauthenticated`, repeat the handshake once and retry.
+    ///
+    /// A token issued by the handshake expires (Dremio's do), while the
+    /// Basic credential behind it stays valid — so without this every query
+    /// and health probe after expiry fails until the connector is rebuilt.
+    /// `rpc` builds its client on each call, so the retry carries the
+    /// renewed token. Only handshake mode retries: a configured bearer token
+    /// or a Basic header has nothing to renew it from.
+    async fn with_reauth<T, F, Fut>(&self, mut rpc: F) -> Result<T, FlightError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, FlightError>>,
+    {
+        let sent = self.current_token();
+        match rpc().await {
+            Err(e) if self.reauth.is_some() && sent.is_some() && is_unauthenticated(&e) => {
+                self.reauthenticate(sent.as_ref()).await?;
+                rpc().await
+            }
+            other => other,
+        }
+    }
+
+    /// Repeat the handshake with the retained Basic credential and replace
+    /// the token `rejected` — unless another request already did while this
+    /// one waited for the lock.
+    ///
+    /// # Errors
+    /// [`FlightError::ProtocolError`] when the handshake fails, scrubbed of
+    /// every credential this connector holds.
+    async fn reauthenticate(&self, rejected: Option<&Secret>) -> Result<(), FlightError> {
+        let Some((username, password)) = &self.reauth else {
+            return Ok(());
+        };
+        let _serialised = self.reauth_lock.lock().await;
+        if self.current_token().as_ref().map(Secret::expose) != rejected.map(Secret::expose) {
+            return Ok(());
+        }
+        // A fresh client: the rejected token must not ride along.
+        let mut client = FlightSqlServiceClient::new(self.channel.clone());
+        client
+            .handshake(username, password.expose())
+            .await
+            .map_err(|e| {
+                FlightError::ProtocolError(self.scrub(&format!(
+                    "the server rejected the bearer token and repeating the handshake \
+                     failed: {e}"
+                )))
+            })?;
+        let issued = client.token().map(|t| Secret(t.clone()));
+        if let Some(issued) = &issued {
+            let mut secrets = self.secrets.write().unwrap_or_else(PoisonError::into_inner);
+            secrets.push(issued.clone());
+            secrets.extend(normalised_host(issued.expose()));
+        } else {
+            warn!(
+                catalog = %self.config.name,
+                "flightsql: re-authentication returned no bearer token; falling back to the \
+                 Basic credential on every request"
+            );
+        }
+        *self.token.write().unwrap_or_else(PoisonError::into_inner) = issued;
+        debug!(
+            catalog = %self.config.name,
+            "flightsql: the bearer token was rejected; re-authenticated via handshake"
+        );
+        Ok(())
+    }
+
     /// Strip any credential this connector holds out of remote-produced
     /// text before it becomes a Dataglot error (rule 12). Servers echo
     /// request metadata into error messages more often than you would like.
     fn scrub(&self, msg: &str) -> String {
-        scrub_with(msg, &self.secrets)
+        scrub_with(
+            msg,
+            &self.secrets.read().unwrap_or_else(PoisonError::into_inner),
+        )
     }
 
     /// Rebuild an error with its message scrubbed, preserving its kind.
+    ///
+    /// The payload of a catalog / federation error is scrubbed directly, so
+    /// the rebuilt error does not repeat its kind prefix.
     fn scrub_err(&self, e: &DataglotError) -> DataglotError {
-        let scrubbed = self.scrub(&e.to_string());
         match e {
-            DataglotError::Catalog(_) => DataglotError::catalog(scrubbed),
-            _ => DataglotError::federation(scrubbed),
+            DataglotError::Catalog(msg) => DataglotError::catalog(self.scrub(msg)),
+            DataglotError::Federation(msg) => DataglotError::federation(self.scrub(msg)),
+            other => DataglotError::federation(self.scrub(&other.to_string())),
         }
     }
 
@@ -843,11 +984,13 @@ impl Inner {
     /// `GetFlightInfo` for a statement — plans it on the remote and returns
     /// the advertised schema plus the tickets, without fetching a row.
     async fn plan_statement(&self, sql: String) -> DataglotResult<arrow_flight::FlightInfo> {
-        let mut client = self.client();
-        client
-            .execute(sql, None)
-            .await
-            .map_err(|e| self.flight_err("statement planning failed", &e))
+        self.with_reauth(|| {
+            let mut client = self.client();
+            let sql = sql.clone();
+            async move { client.execute(sql, None).await }
+        })
+        .await
+        .map_err(|e| self.flight_err("statement planning failed", &e))
     }
 
     /// The channel to fetch one endpoint's ticket on — `None` meaning "the
@@ -857,7 +1000,10 @@ impl Inner {
     /// catalog's credentials to a host the *remote* nominated. When the
     /// operator opts in, the channel is built from the location's **own**
     /// parsed transport, so a `grpc+tls://` replica gets TLS even if this
-    /// catalog's endpoint is plaintext (and vice versa).
+    /// catalog's endpoint is plaintext (and vice versa). A plaintext
+    /// location is still refused when the catalog carries credentials and
+    /// the location is not loopback — the same rule `validate` applies to
+    /// the configured endpoint.
     async fn channel_for(&self, endpoint: &FlightEndpoint) -> DataglotResult<Option<Channel>> {
         let locations: Vec<String> = endpoint.location.iter().map(|l| l.uri.clone()).collect();
         // Routing errors are scrubbed too: they describe a *remote-supplied*
@@ -887,6 +1033,16 @@ impl Inner {
                 self.config.name
             )));
         }
+        // Opting into another destination is not opting into cleartext:
+        // TLS on the coordinator does not protect this hop, and `do_get`
+        // attaches this catalog's credential to it.
+        refuse_plaintext_credentials(&transport, self.credentialed()).map_err(|e| {
+            DataglotError::federation(format!(
+                "flightsql catalog '{}': the server returned a plaintext result location \
+                 ('{location}') and it is not followed: {e}",
+                self.config.name
+            ))
+        })?;
         debug!(
             catalog = %self.config.name,
             location = %location,
@@ -924,12 +1080,16 @@ impl Inner {
                 self.config.name
             )));
         };
-        let mut client = match self.channel_for(endpoint).await? {
-            Some(channel) => self.client_on(channel),
-            None => self.client(),
-        };
-        let stream = client
-            .do_get(ticket)
+        let channel = self.channel_for(endpoint).await?;
+        let stream = self
+            .with_reauth(|| {
+                let mut client = match &channel {
+                    Some(channel) => self.client_on(channel.clone()),
+                    None => self.client(),
+                };
+                let ticket = ticket.clone();
+                async move { client.do_get(ticket).await }
+            })
             .await
             .map_err(|e| self.flight_err("fetching a result stream failed", &e))?;
 
@@ -965,17 +1125,29 @@ impl Inner {
         let stream = self.do_get(&endpoint).await?;
         let me = Arc::clone(&self);
         Ok(stream
-            .map(move |batch| match batch {
-                Ok(batch) => crate::remote_sql::align_batch(&batch, &target, "flightsql")
-                    .map_err(|e| DataFusionError::External(Box::new(e))),
-                Err(e) => Err(DataFusionError::External(Box::new(
-                    DataglotError::federation(me.scrub(&format!(
-                        "flightsql catalog '{}': result stream failed: {e}",
-                        me.config.name
-                    ))),
-                ))),
-            })
+            .map(move |batch| me.align_streamed(batch, &target))
             .boxed())
+    }
+
+    /// Turn one streamed item into a batch aligned to `target`.
+    fn align_streamed(
+        &self,
+        batch: Result<RecordBatch, FlightError>,
+        target: &SchemaRef,
+    ) -> DfResult<RecordBatch> {
+        match batch {
+            // Scrubbed: the strict cast echoes the value it could not
+            // convert, and that value is remote-supplied — a source can
+            // reflect a credential into it.
+            Ok(batch) => crate::remote_sql::align_batch(&batch, target, "flightsql")
+                .map_err(|e| DataFusionError::External(Box::new(self.scrub_err(&e)))),
+            Err(e) => Err(DataFusionError::External(Box::new(
+                DataglotError::federation(self.scrub(&format!(
+                    "flightsql catalog '{}': result stream failed: {e}",
+                    self.config.name
+                ))),
+            ))),
+        }
     }
 
     /// Run a statement and drain it into memory — metadata-sized results
@@ -1125,6 +1297,7 @@ impl FlightSqlConnector {
         let mut secrets: Vec<Secret> = Vec::new();
         let mut auth_header: Option<Secret> = None;
         let mut token: Option<Secret> = bearer.clone();
+        let mut reauth: Option<(String, Secret)> = None;
         if let Some(token) = &bearer {
             secrets.push(token.clone());
         }
@@ -1154,6 +1327,9 @@ impl FlightSqlConnector {
                     let issued = Secret(issued.clone());
                     secrets.push(issued.clone());
                     token = Some(issued);
+                    // Kept to renew the token when it expires; a Basic
+                    // header never expires, so the fallback below needs none.
+                    reauth = Some((username.clone(), password.clone()));
                 } else {
                     warn!(
                         catalog = %config.name,
@@ -1179,8 +1355,10 @@ impl FlightSqlConnector {
                 config,
                 channel,
                 auth_header,
-                token,
-                secrets,
+                token: RwLock::new(token),
+                secrets: RwLock::new(secrets),
+                reauth,
+                reauth_lock: tokio::sync::Mutex::new(()),
                 transport,
             }),
         })
@@ -1244,15 +1422,19 @@ impl FlightSqlConnector {
             self.qualified_name(catalog, schema, table)
         );
 
+        // Each message is scrubbed *whole*, after the names are added: the
+        // schema and table names are remote-listed text (or caller input)
+        // and can carry a reflected credential that the scrub inside
+        // `plan_statement` never saw.
         let info = self.inner.plan_statement(sql).await.map_err(|e| {
-            DataglotError::catalog(format!(
+            DataglotError::catalog(self.inner.scrub(&format!(
                 "flightsql: resolving the schema of '{schema}.{table}' failed: {e}"
-            ))
+            )))
         })?;
         let arrow_schema = info.try_decode_schema().map_err(|e| {
-            DataglotError::catalog(format!(
+            DataglotError::catalog(self.inner.scrub(&format!(
                 "flightsql: the server advertised no readable schema for '{schema}.{table}': {e}"
-            ))
+            )))
         })?;
         Ok(Arc::new(arrow_schema))
     }
@@ -1626,25 +1808,30 @@ impl FlightSqlConnector {
 
     /// Primary listing path: the Flight SQL `GetTables` metadata RPC.
     async fn list_tables_via_metadata(&self) -> Result<Listing, FlightError> {
-        let mut client = self.inner.client();
-        let info = client
-            .get_tables(CommandGetTables {
-                catalog: self.inner.config.catalog.clone(),
-                // `db_schema_filter_pattern` is a SQL *wildcard* pattern, so
-                // a schema like `tenant_1` or `sales%` would also match
-                // `tenant-1` / `sales_eu` on a conforming server — a silent
-                // widening of the configured scope. A backslash is worse
-                // still: servers that treat it as the pattern escape read
-                // `tenant\\east` as `tenanteast`, so the real schema is
-                // never returned and the exact retain below cannot recover
-                // rows that never arrived. Send the hint only when the name
-                // contains none of the three; scoping itself is enforced
-                // exactly, below, so withholding it only costs a wider
-                // listing.
-                db_schema_filter_pattern: schema_filter_hint(self.inner.config.schema.as_deref()),
-                table_name_filter_pattern: None,
-                table_types: Vec::new(),
-                include_schema: false,
+        let command = CommandGetTables {
+            catalog: self.inner.config.catalog.clone(),
+            // `db_schema_filter_pattern` is a SQL *wildcard* pattern, so
+            // a schema like `tenant_1` or `sales%` would also match
+            // `tenant-1` / `sales_eu` on a conforming server — a silent
+            // widening of the configured scope. A backslash is worse
+            // still: servers that treat it as the pattern escape read
+            // `tenant\\east` as `tenanteast`, so the real schema is
+            // never returned and the exact retain below cannot recover
+            // rows that never arrived. Send the hint only when the name
+            // contains none of the three; scoping itself is enforced
+            // exactly, below, so withholding it only costs a wider
+            // listing.
+            db_schema_filter_pattern: schema_filter_hint(self.inner.config.schema.as_deref()),
+            table_name_filter_pattern: None,
+            table_types: Vec::new(),
+            include_schema: false,
+        };
+        let info = self
+            .inner
+            .with_reauth(|| {
+                let mut client = self.inner.client();
+                let command = command.clone();
+                async move { client.get_tables(command).await }
             })
             .await?;
 
@@ -1856,6 +2043,12 @@ fn collect_listing(
     }
 }
 
+/// Did the server answer this RPC with gRPC `Unauthenticated` — the shape of
+/// an expired bearer token?
+fn is_unauthenticated(e: &FlightError) -> bool {
+    matches!(e, FlightError::Tonic(status) if status.code() == tonic::Code::Unauthenticated)
+}
+
 /// Did the server answer this RPC with gRPC `Unimplemented`?
 fn is_unimplemented(e: &FlightError) -> bool {
     match e {
@@ -2043,9 +2236,11 @@ impl SQLExecutor for FlightSqlConnector {
         // a later listing to change the answer for a provider built earlier.
         let (catalog, schema_part, table_part) =
             Self::split_remote_ref(table_name).ok_or_else(|| {
-                DataFusionError::External(Box::new(DataglotError::catalog(format!(
-                    "expected a '<schema>.<table>' or '<catalog>.<schema>.<table>' \
-                     reference, got: {table_name}"
+                DataFusionError::External(Box::new(DataglotError::catalog(self.inner.scrub(
+                    &format!(
+                        "expected a '<schema>.<table>' or '<catalog>.<schema>.<table>' \
+                         reference, got: {table_name}"
+                    ),
                 ))))
             })?;
         self.fetch_arrow_schema(catalog.as_deref(), &schema_part, &table_part)
@@ -2261,7 +2456,7 @@ mod tests {
 
             let mut c = cfg();
             c.endpoint = endpoint.to_string();
-            assert_eq!(c.uses_tls().unwrap(), tls, "config tls for {endpoint}");
+            assert_eq!(c.transport().unwrap().tls, tls, "config tls for {endpoint}");
             c.validate().expect("scheme validates");
         }
     }
@@ -2370,6 +2565,9 @@ mod tests {
     #[test]
     fn handshake_requires_basic_credentials() {
         let mut c = cfg();
+        // TLS: credentials on a plaintext remote are refused for their own
+        // reason, which would mask the one under test.
+        c.endpoint = "grpc+tls://flight.internal:32010".to_string();
         c.handshake = true;
         assert!(c.validate().unwrap_err().to_string().contains("handshake"));
 
@@ -3347,6 +3545,7 @@ mod tests {
     #[test]
     fn a_basic_username_containing_a_colon_is_refused() {
         let mut c = cfg();
+        c.endpoint = "grpc+tls://flight.internal:32010".to_string();
         c.auth = FlightSqlAuth::Basic {
             username: "svc:role".to_string(),
             password_env: "WH_PASSWORD".to_string(),
@@ -3516,5 +3715,142 @@ mod tests {
         );
         assert_eq!(split("users"), None, "one part names no schema");
         assert_eq!(split("a.b.c.d"), None, "four parts is not a shape we emit");
+    }
+
+    // -----------------------------------------------------------------
+    // Plaintext credentials, alignment scrubbing
+    // -----------------------------------------------------------------
+
+    fn basic() -> FlightSqlAuth {
+        FlightSqlAuth::Basic {
+            username: "svc".to_string(),
+            password_env: "WH_PASSWORD".to_string(),
+        }
+    }
+
+    fn bearer() -> FlightSqlAuth {
+        FlightSqlAuth::Bearer {
+            token_env: "WH_TOKEN".to_string(),
+        }
+    }
+
+    /// An `Inner` on a lazily-connected channel (nothing is dialled), holding
+    /// `secrets` — enough to exercise the error paths that scrub.
+    fn inner_with(secrets: &[&str]) -> Inner {
+        let config = FlightSqlConfig::new("wh", "grpc://127.0.0.1:9", FlightSqlDialect::DataFusion);
+        let transport = config.transport().unwrap();
+        let channel = Endpoint::from_shared(transport.uri.clone())
+            .unwrap()
+            .connect_lazy();
+        Inner {
+            config,
+            channel,
+            auth_header: None,
+            token: RwLock::new(None),
+            secrets: RwLock::new(secrets.iter().map(|s| Secret((*s).to_string())).collect()),
+            reauth: None,
+            reauth_lock: tokio::sync::Mutex::new(()),
+            transport,
+        }
+    }
+
+    /// Basic and Bearer credentials ride in the `authorization` header, so
+    /// a plaintext endpoint off the machine would hand them to anyone on
+    /// the path. Refused at `validate`, before anything is dialled.
+    #[test]
+    fn credentials_on_a_plaintext_remote_endpoint_are_refused() {
+        for auth in [basic(), bearer()] {
+            for endpoint in [
+                "grpc://flight.internal:32010",
+                "grpc+tcp://10.0.0.5:32010",
+                "http://flight.internal:80",
+            ] {
+                let mut c = FlightSqlConfig::new("wh", endpoint, FlightSqlDialect::DataFusion);
+                c.auth = auth.clone();
+                let err = c
+                    .validate()
+                    .expect_err("credentials over remote plaintext must be refused")
+                    .to_string();
+                assert!(err.contains("plaintext"), "{endpoint}: {err}");
+                assert!(err.contains("grpc+tls://"), "the fix is named: {err}");
+            }
+        }
+    }
+
+    /// What stays allowed: TLS with credentials, loopback with credentials
+    /// (the documented sidecar shape — the traffic never leaves the host),
+    /// and plaintext anywhere for an unauthenticated source.
+    #[test]
+    fn tls_loopback_and_unauthenticated_plaintext_still_validate() {
+        for (endpoint, auth) in [
+            ("grpc+tls://flight.internal:32010", basic()),
+            ("https://flight.internal", bearer()),
+            ("grpc://127.0.0.1:32010", basic()),
+            ("grpc://127.8.9.10:32010", bearer()),
+            ("grpc://[::1]:32010", basic()),
+            ("grpc://LocalHost:32010", bearer()),
+            ("grpc://flight.internal:32010", FlightSqlAuth::None),
+        ] {
+            let mut c = FlightSqlConfig::new("wh", endpoint, FlightSqlDialect::DataFusion);
+            c.auth = auth;
+            c.validate()
+                .unwrap_or_else(|e| panic!("{endpoint} should validate: {e}"));
+        }
+        // Handshake mode sends Basic on the handshake itself: same rule.
+        let mut c = FlightSqlConfig::new(
+            "wh",
+            "grpc://flight.internal:32010",
+            FlightSqlDialect::DataFusion,
+        );
+        c.auth = basic();
+        c.handshake = true;
+        assert!(c.validate().is_err(), "handshake over plaintext is refused");
+    }
+
+    /// The same rule governs a server-advertised location, which is why it
+    /// is a function over a parsed transport rather than inline in
+    /// `validate`. Loopback detection is by parsed host, not by prefix.
+    #[test]
+    fn the_plaintext_credential_rule_judges_any_parsed_transport() {
+        let t = |uri: &str| Transport::parse(uri).unwrap();
+        assert!(refuse_plaintext_credentials(&t("grpc://replica.internal:1"), true).is_err());
+        assert!(refuse_plaintext_credentials(&t("grpc://127.0.0.1.nip.io:1"), true).is_err());
+        assert!(refuse_plaintext_credentials(&t("grpc://localhost.evil:1"), true).is_err());
+        refuse_plaintext_credentials(&t("grpc://replica.internal:1"), false)
+            .expect("nothing to leak without credentials");
+        refuse_plaintext_credentials(&t("grpc+tls://replica.internal:1"), true)
+            .expect("TLS carries credentials");
+        refuse_plaintext_credentials(&t("grpc://127.0.0.1:1"), true)
+            .expect("loopback never leaves the host");
+        refuse_plaintext_credentials(&t("grpc://[::1]:1"), true)
+            .expect("IPv6 loopback never leaves the host");
+    }
+
+    /// The strict alignment cast echoes the offending value (`Cannot cast
+    /// string '…'`). A source that reflects a credential into a column the
+    /// plan types as `Int32` would otherwise put it in the query error.
+    #[tokio::test]
+    async fn a_failed_result_alignment_cast_is_scrubbed() {
+        let inner = inner_with(&["t0ken-xyz"]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec![Some("t0ken-xyz")]))],
+        )
+        .unwrap();
+        let target: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let err = inner
+            .align_streamed(Ok(batch), &target)
+            .expect_err("a string that is not an integer cannot align")
+            .to_string();
+        assert!(
+            !err.contains("t0ken-xyz"),
+            "the reflected token leaked: {err}"
+        );
+        assert!(err.contains("[redacted]"), "redacted in place: {err}");
+        assert!(
+            err.contains("cast"),
+            "the cast failure stays visible: {err}"
+        );
     }
 }
