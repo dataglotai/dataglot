@@ -119,7 +119,7 @@ export function apiToken(): string | null {
   try {
     return sessionStorage.getItem(TOKEN_KEY);
   } catch {
-    return null; 
+    return null;
   }
 }
 
@@ -164,6 +164,7 @@ async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   if (!res.ok) throw new Error(`${url} → ${res.status}`);
   return (await res.json()) as T;
 }
+
 export const getQueries = (signal?: AbortSignal) =>
   getJson<ActiveQuery[]>("/api/queries", signal);
 
@@ -442,7 +443,7 @@ export const getMaintenance = (signal?: AbortSignal) =>
 /** On-demand liveness probe for one connector (POST). Rejects on transport
  *  failure; the caller renders the thrown message as "down". */
 export async function probeConnector(name: string): Promise<ProbeResult> {
-    const res = await apiFetch(`/api/connectors/${encodeURIComponent(name)}/probe`, {
+  const res = await apiFetch(`/api/connectors/${encodeURIComponent(name)}/probe`, {
     method: "POST",
   });
   if (!res.ok) throw new Error(`probe ${name} → ${await errorMessage(res)}`);
