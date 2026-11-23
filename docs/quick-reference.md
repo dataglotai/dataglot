@@ -10,7 +10,7 @@ governance (column masks, row filters). No JVM.
 
 ## Build
 
-Prereqs: stable Rust (workspace **MSRV 1.94**); `protoc` only if you build the
+Prereqs: stable Rust (workspace **MSRV 1.95**); `protoc` only if you build the
 `ballista` (distributed) feature. See [install.md](install.md) for the full
 toolchain list (prebuilt binaries need none of it).
 
@@ -168,7 +168,9 @@ statement being typed. `\q` or Ctrl-D quits.
 
 Connection settings follow psql. `sslmode` defaults to `prefer`: encrypted
 when the server offers TLS, without checking its certificate, same as
-`require`. `verify-ca` / `verify-full` check the certificate against the OS
+`require`. `sslrootcert=system` defaults to `verify-full` and rejects weaker
+explicit modes, requiring both certificate and hostname verification with no
+plaintext fallback. `verify-ca` / `verify-full` check the certificate against the OS
 trust store, or against `sslrootcert=<file>` (`require` with a root file
 checks it too). Unlike libpq, `verify-ca` also checks the host name.
 `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE` and

@@ -37,9 +37,9 @@
 //! follow-up precedence/RBAC slices tighten this.
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, LogicalPlan};
-use datafusion::sql::TableReference;
 
 use crate::{Identity, PolicyEnforcer};
 
@@ -115,52 +115,41 @@ fn table_matches(denial: &TableReference, reference: &TableReference) -> bool {
         .any(|cand| cand == denial)
 }
 
-/// Reject a qualified reference to a denied column anywhere in `plan`,
-/// **descending into subqueries embedded in expressions** — which
-/// [`LogicalPlan::apply`] / [`Expr::apply`] would otherwise skip, letting a
-/// denied column referenced only inside a subquery
-/// (`SELECT (SELECT ssn FROM t)`, `WHERE x IN (SELECT ssn FROM t)`, …) slip
-/// past enforcement. The matching itself (column-vs-table, group scoping) is
-/// unchanged from the top-level walk — only the traversal reaches deeper.
-///
-/// The first match returns `Err`, short-circuiting the whole walk.
-fn deny_columns_in(
+/// Visit every qualified reference to a denied column anywhere in `plan`,
+/// scope by scope (`for_each_expr_scoped`): references — plain columns and
+/// correlated outer references alike — resolve through the alias map of
+/// their own lexical scope, so `u.email` under `FROM users u` (in the outer
+/// query or inside an `EXISTS (…)`) is the denied `users.email`; embedded
+/// subqueries, UNION branches and derived tables are reached to any depth
+/// (, ). `on_hit(denial, column)` decides: the rewrite returns
+/// the deny error (short-circuiting the walk), explain records a decision.
+fn for_each_denied_column(
     plan: &LogicalPlan,
     applicable: &[&AccessDenial],
-    identity: &Identity,
+    on_hit: &mut dyn FnMut(&AccessDenial, &str) -> Result<(), DataFusionError>,
 ) -> Result<(), DataFusionError> {
-    plan.apply(|node| {
-        for expr in node.expressions() {
+    crate::mask::for_each_expr_scoped(
+        plan,
+        &std::collections::HashMap::new(),
+        &mut |expr, aliases| {
             expr.apply(|e| {
-                if let Expr::Column(c) = e {
+                if let Expr::Column(c) | Expr::OuterReferenceColumn(_, c) = e {
                     if let Some(relation) = &c.relation {
+                        let relation = aliases.get(relation).unwrap_or(relation);
                         for denial in applicable {
                             if let Some(col) = &denial.column {
                                 if col == &c.name && table_matches(&denial.table, relation) {
-                                    crate::audit::record_decision(
-                                        "deny",
-                                        identity,
-                                        &format!("{}.{col}", denial.table),
-                                    );
-                                    return Err(column_denied(&denial.table, col));
+                                    on_hit(denial, col)?;
                                 }
                             }
                         }
                     }
-                } else if let Some(subplan) = crate::embedded_subquery(e) {
-                    // `Expr::apply` treats the subquery-bearing variants as
-                    // leaves (or follows only the compare expr), so recurse into
-                    // the subquery plan by hand to reach columns nested inside
-                    // it, to any depth — over the same four variants the rewrite
-                    // and explain paths descend into.
-                    deny_columns_in(subplan, applicable, identity)?;
                 }
                 Ok(TreeNodeRecursion::Continue)
-            })?;
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })
-    .map(|_| ())
+            })
+            .map(|_| ())
+        },
+    )
 }
 
 impl PolicyEnforcer for AccessDenyEnforcer {
@@ -202,17 +191,13 @@ impl PolicyEnforcer for AccessDenyEnforcer {
                 "policy: plan traversal failed while explaining table denials; the decision list may be incomplete"
             );
         }
-        // Column-level denials: a qualified reference to a denied column.
-        for col in crate::collect_plan_columns(plan) {
-            let Some(rel) = &col.relation else { continue };
-            for denial in &applicable {
-                if let Some(denied_col) = &denial.column {
-                    if denied_col == &col.name && table_matches(&denial.table, rel) {
-                        add(format!("{}.{denied_col}", denial.table), &mut out);
-                    }
-                }
-            }
-        }
+        // Column-level denials: a qualified reference to a denied column, the
+        // same scoped walk the rewrite denies with.
+        for_each_denied_column(plan, &applicable, &mut |denial, col| {
+            add(format!("{}.{col}", denial.table), &mut out);
+            Ok(())
+        })
+        .expect("infallible walk");
         out
     }
 
@@ -258,7 +243,10 @@ impl PolicyEnforcer for AccessDenyEnforcer {
 
         // Column-level: deny a qualified reference to a denied column,
         // descending into subqueries as well.
-        deny_columns_in(&plan, &applicable, identity)?;
+        for_each_denied_column(&plan, &applicable, &mut |denial, col| {
+            crate::audit::record_decision("deny", identity, &format!("{}.{col}", denial.table));
+            Err(column_denied(&denial.table, col))
+        })?;
 
         Ok(Transformed::no(plan))
     }
@@ -522,6 +510,54 @@ mod tests {
         assert!(
             res.is_err(),
             "a denied column referenced inside a subquery must be rejected"
+        );
+    }
+
+    /// A denied column read only as a correlated outer reference inside a
+    /// subquery (`Expr::OuterReferenceColumn`, never `Expr::Column`) is
+    /// rejected too.
+    #[tokio::test]
+    async fn column_deny_caught_in_correlated_outer_reference() {
+        let ctx = ctx_with_users_and_docs();
+        let plan = plan_of(
+            &ctx,
+            "SELECT id FROM users WHERE EXISTS \
+             (SELECT 1 FROM docs WHERE docs.id = users.id AND users.email = 'x')",
+        )
+        .await;
+        let res = deny_column("users", "email", vec![]).rewrite(plan, &Identity::anonymous());
+        assert!(
+            res.is_err(),
+            "a denied column read as a correlated outer reference must be rejected"
+        );
+    }
+
+    /// The denied table aliased (`FROM users u`): a plain `u.email` and a
+    /// correlated `u.email` inside `EXISTS (…)` both resolve to `users.email`
+    /// through the alias map of their scope — denied, and explained.
+    #[tokio::test]
+    async fn aliasing_the_table_does_not_dodge_column_deny() {
+        let ctx = ctx_with_users_and_docs();
+        let deny = deny_column("users", "email", vec![]);
+        let plain = plan_of(&ctx, "SELECT u.email FROM users u").await;
+        assert!(
+            deny.rewrite(plain.clone(), &Identity::anonymous()).is_err(),
+            "u.email must resolve to the denied users.email"
+        );
+        let decisions = deny.explain(&plain, &Identity::anonymous());
+        assert!(
+            decisions.iter().any(|d| d.resource.contains("email")),
+            "explain must report the aliased denial; got {decisions:?}"
+        );
+        let correlated = plan_of(
+            &ctx,
+            "SELECT u.id FROM users u WHERE EXISTS \
+             (SELECT 1 FROM docs WHERE docs.id = u.id AND u.email = 'x')",
+        )
+        .await;
+        assert!(
+            deny.rewrite(correlated, &Identity::anonymous()).is_err(),
+            "a correlated u.email must resolve through the enclosing alias"
         );
     }
 

@@ -121,10 +121,20 @@ pub(super) fn resolve(
         }
     }
 
+    // libpq treats an explicit system trust store as an authenticated
+    // connection, not merely a different source of roots. Keep that choice
+    // until after resolving the mode so it cannot fall back to plaintext or
+    // accept an unverified certificate.
+    let root_cert = options.root_cert.or_else(|| env("PGSSLROOTCERT"));
+    let system_roots = root_cert.as_deref() == Some("system");
     let ssl_mode = match options.ssl_mode.or_else(|| env("PGSSLMODE")) {
         Some(value) => SslMode::parse(&value)?,
+        None if system_roots => SslMode::VerifyFull,
         None => SslMode::Prefer,
     };
+    if system_roots && ssl_mode != SslMode::VerifyFull {
+        return Err("sslrootcert=system requires sslmode=verify-full".to_string());
+    }
     config.ssl_mode(match ssl_mode {
         SslMode::Disable => tokio_postgres::config::SslMode::Disable,
         SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
@@ -133,12 +143,7 @@ pub(super) fn resolve(
         }
     });
 
-    // libpq's `sslrootcert=system` means the OS store, which is the default.
-    let root_cert = options
-        .root_cert
-        .or_else(|| env("PGSSLROOTCERT"))
-        .filter(|path| path != "system")
-        .map(PathBuf::from);
+    let root_cert = root_cert.filter(|path| path != "system").map(PathBuf::from);
 
     Ok(Settings {
         config,
@@ -473,5 +478,71 @@ mod tests {
         }
         let t = tls("postgres://h?sslmode=verify-full&sslrootcert=system").expect("tls");
         assert!(matches!(t.roots, TlsRoots::Native));
+    }
+
+    #[test]
+    fn system_roots_require_verified_tls_by_default() {
+        for (server, vars) in [
+            ("postgres://h?sslrootcert=system", vec![]),
+            ("host=h sslrootcert=system", vec![]),
+            ("postgres://h?sslrootcert=%73ystem", vec![]),
+            ("postgres://h", vec![("PGSSLROOTCERT", "system")]),
+            (
+                "host=h sslmode=verify-full",
+                vec![("PGSSLROOTCERT", "system"), ("PGSSLMODE", "disable")],
+            ),
+        ] {
+            let settings = resolve_with(server, &vars).expect("system roots");
+            assert_eq!(settings.ssl_mode, SslMode::VerifyFull, "{server}");
+            assert_eq!(
+                settings.config.get_ssl_mode(),
+                tokio_postgres::config::SslMode::Require,
+                "must never fall back to plaintext: {server}"
+            );
+            let tls = settings.tls().expect("TLS is required");
+            assert!(!tls.accept_invalid_certs, "{server}");
+            assert!(matches!(tls.roots, TlsRoots::Native));
+        }
+        // Each explicit connection-string option wins over its PG* variable.
+        let settings = resolve_with(
+            "host=h sslmode=require sslrootcert=/explicit/ca.pem",
+            &[("PGSSLROOTCERT", "system"), ("PGSSLMODE", "disable")],
+        )
+        .expect("explicit root overrides the environment");
+        assert_eq!(settings.ssl_mode, SslMode::Require);
+        assert!(matches!(
+            settings.tls().expect("TLS").roots,
+            TlsRoots::CaFile(path) if path == std::path::Path::new("/explicit/ca.pem")
+        ));
+    }
+
+    #[test]
+    fn system_roots_reject_weaker_explicit_modes() {
+        for mode in ["disable", "allow", "prefer", "require", "verify-ca"] {
+            for (server, vars) in [
+                (
+                    format!("postgres://h?sslrootcert=system&sslmode={mode}"),
+                    vec![],
+                ),
+                (format!("host=h sslrootcert=system sslmode={mode}"), vec![]),
+                (
+                    "postgres://h".to_string(),
+                    vec![("PGSSLROOTCERT", "system"), ("PGSSLMODE", mode)],
+                ),
+                (
+                    "postgres://h?sslrootcert=system".to_string(),
+                    vec![("PGSSLMODE", mode)],
+                ),
+                (
+                    format!("host=h sslmode={mode}"),
+                    vec![("PGSSLROOTCERT", "system")],
+                ),
+            ] {
+                assert_eq!(
+                    resolve_with(&server, &vars).expect_err("weaker mode refused"),
+                    "sslrootcert=system requires sslmode=verify-full"
+                );
+            }
+        }
     }
 }

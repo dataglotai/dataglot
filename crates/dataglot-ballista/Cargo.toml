@@ -47,13 +47,13 @@ async-trait = { workspace = true }
 # API churn touched our wrappers (`as_any` removed from `ExecutionPlan`
 # etc.; `partition_statistics` → `Result<Arc<Statistics>>`); the codec
 # and cancel-on-drop plan wrappers were updated accordingly.
-ballista = { version = "54.1.0", default-features = false, features = ["standalone"] }
+ballista = { version = "55.0.0", default-features = false, features = ["standalone"] }
 # Phase 2 slice 4a — `BallistaLogicalExtensionCodec` lives in
 # `ballista-core` but isn't re-exported by the `ballista` client
 # crate. Declaring it directly lets us construct the codec for the
 # `FederationLogicalCodec` wrapper. Same version as the `ballista`
 # dep above; Cargo unifies the two via the crates.io source.
-ballista-core = { version = "54.1.0", default-features = false }
+ballista-core = { version = "55.0.0", default-features = false }
 # Phase 2 slice 5a — the standalone executor binary
 # (`src/bin/dataglot-ballista-executor.rs`) wraps Ballista's own
 # executor library entry points: `ExecutorProcessConfig` configures
@@ -64,7 +64,7 @@ ballista-core = { version = "54.1.0", default-features = false }
 # stock fields); `mimalloc` stays on for production runtime
 # performance parity with Ballista's stock executor binary. Same
 # version as the umbrella `ballista` dep; Cargo unifies them.
-ballista-executor = { version = "54.1.0", default-features = false, features = [
+ballista-executor = { version = "55.0.0", default-features = false, features = [
   "arrow-ipc-optimizations",
   "mimalloc",
 ] }
@@ -87,7 +87,7 @@ clap = { workspace = true }
 # cluster view. `graphviz-rust` is pure Rust; its SVG endpoint shells
 # out to a `dot` binary at request time and degrades per-request when
 # absent (the DOT-text endpoint always works).
-ballista-scheduler = { version = "54.1.0", default-features = false, features = [
+ballista-scheduler = { version = "55.0.0", default-features = false, features = [
   "rest-api",
   "graphviz-support",
   # `/api/metrics` Prometheus exposition: without this the
@@ -125,7 +125,7 @@ tokio-stream = { workspace = true }
 # resolves via Ballista + DataFusion (Cargo unifies). `features =
 # ["aws"]` enables S3 — the canonical production backend per
 # Architecture §12's "no etcd / ZK / Redis" commitment.
-object_store = { version = "0.14", features = ["aws"] }
+object_store = { version = "0.13.2", features = ["aws"] }
 # Phase 2 slice 5b — the HA scheduler parses the `--ha-state-uri`
 # flag with `object_store::parse_url`, which takes a `url::Url`.
 # Already transitive via object_store; declaring direct so the
@@ -237,6 +237,8 @@ prost.workspace = true
 # ballista::datafusion as datafusion` aliases at every call site.
 
 [dev-dependencies]
+# Shared test-only helpers (the registry-refusal image probe).
+dataglot-test-support = { path = "../dataglot-test-support" }
 #  — the distributed-lakehouse e2e builds an in-memory Iceberg
 # catalog (temp-dir storage) and writes seed rows via the iceberg
 # writer, so the full codec path runs without Docker.

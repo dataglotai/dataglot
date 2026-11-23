@@ -54,7 +54,7 @@ dataglot shell -c dataglot.toml      # interactive REPL; \q to quit
 To build from source instead:
 
 ```bash
-# Prerequisites: Rust 1.94+ (workspace MSRV), nightly toolchain, cargo-deny + taplo
+# Prerequisites: Rust 1.95+ (workspace MSRV), nightly toolchain, cargo-deny + taplo
 rustup toolchain install nightly
 cargo install cargo-deny taplo-cli
 

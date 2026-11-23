@@ -136,7 +136,6 @@ mod tests {
 
     use datafusion::arrow::array::{Int32Array, RecordBatch};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::execution::session_state::SessionState;
     use datafusion::logical_expr::Extension;
     use datafusion::optimizer::OptimizerContext;
     use datafusion::physical_plan::ExecutionPlan;
@@ -156,7 +155,7 @@ mod tests {
         async fn plan_federation(
             &self,
             _node: &FederatedPlanNode,
-            _state: &SessionState,
+            _state: &dyn datafusion::catalog::Session,
         ) -> DfResult<Arc<dyn ExecutionPlan>> {
             unreachable!("the guard inspects fed.plan and never plans the federation")
         }

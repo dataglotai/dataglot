@@ -1138,7 +1138,7 @@ mod tests {
         let (state, store) = build_state_with_store(TEST_SECRET);
         store
             .apply(dataglot_policy::RuleChange::TagAssigned {
-                table: datafusion::sql::TableReference::partial("public", "users"),
+                table: datafusion::common::TableReference::partial("public", "users"),
                 column: "email".to_string(),
                 tag: dataglot_policy::TagId::new("pii"),
             })

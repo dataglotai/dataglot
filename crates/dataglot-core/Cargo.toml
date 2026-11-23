@@ -8,11 +8,16 @@ license.workspace = true
 description = "Shared types, traits, and DataFusion SessionContext setup"
 
 [dependencies]
+# Derived variant iteration for `ProductPlatform`: backend adapters
+# enumerate platforms to catch one that has no mapping of their own. Derived
+# rather than hand-listed because two hand-written versions both had holes.
+# Already in the lockfile transitively, so this adds no new crate.
 arrow.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 datafusion-federation = { workspace = true, features = ["sql"] }
+strum = { workspace = true, features = ["derive"] }
 # `setup_pg_catalog()` registers the `pg_catalog.*` tables every
 # psql client introspects on connect (`pg_settings`, `pg_class`,
 # `pg_namespace`, `pg_attribute`, `pg_type`, ...). Without this,

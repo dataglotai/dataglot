@@ -96,7 +96,9 @@ use datafusion_federation::sql::VirtualExecutionPlan;
 use datafusion_proto::logical_plan::{
     AsLogicalPlan, DefaultLogicalExtensionCodec, LogicalExtensionCodec,
 };
-use datafusion_proto::physical_plan::{DefaultPhysicalExtensionCodec, PhysicalExtensionCodec};
+use datafusion_proto::physical_plan::{
+    DefaultPhysicalExtensionCodec, PhysicalExtensionCodec, PhysicalProtoConverterExtension,
+};
 use datafusion_proto::protobuf::{self as df_proto_common, LogicalPlanNode};
 use prost::Message;
 
@@ -293,7 +295,12 @@ impl std::fmt::Debug for FederationPlanCodec {
 }
 
 impl PhysicalExtensionCodec for FederationPlanCodec {
-    fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> DfResult<()> {
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> DfResult<()> {
         // Build the payload in one of three shapes. Wrapper variants
         // (`SchemaCastScanExec`, `CooperativeExec`) carry no
         // connector identity — their inputs round-trip through
@@ -409,7 +416,7 @@ impl PhysicalExtensionCodec for FederationPlanCodec {
             // nodes); in tests it's
             // `DefaultPhysicalExtensionCodec`, which errors on
             // unknown nodes.
-            return self.inner_codec.try_encode(node, buf);
+            return self.inner_codec.try_encode(node, buf, proto_converter);
         };
 
         payload
@@ -423,6 +430,7 @@ impl PhysicalExtensionCodec for FederationPlanCodec {
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         ctx: &TaskContext,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Sniff whether the bytes are our envelope: try parsing,
         // and treat `version == 0` as not-ours (prost defaults
@@ -432,10 +440,14 @@ impl PhysicalExtensionCodec for FederationPlanCodec {
         // shuffle codec, in production. Same sniff strategy the
         // logical codec uses.
         let Ok(payload) = CodecPayload::decode(buf) else {
-            return self.inner_codec.try_decode(buf, inputs, ctx);
+            return self
+                .inner_codec
+                .try_decode(buf, inputs, ctx, proto_converter);
         };
         if payload.version == 0 {
-            return self.inner_codec.try_decode(buf, inputs, ctx);
+            return self
+                .inner_codec
+                .try_decode(buf, inputs, ctx, proto_converter);
         }
 
         if payload.version != CODEC_VERSION {
@@ -849,12 +861,21 @@ mod tests {
         let codec = FederationPlanCodec::new(registry_with("pg_demo"));
         let mut buf = Vec::new();
         codec
-            .try_encode(Arc::new(original.clone()), &mut buf)
+            .try_encode(
+                Arc::new(original.clone()),
+                &mut buf,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
             .expect("encode round-trip");
 
         let ctx = TaskContext::default();
         let decoded = codec
-            .try_decode(&buf, &[], &ctx)
+            .try_decode(
+                &buf,
+                &[],
+                &ctx,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
             .expect("decode round-trip");
 
         let decoded_virtual = decoded
@@ -894,12 +915,23 @@ mod tests {
 
         let codec = FederationPlanCodec::new(registry_with("pg_demo"));
         let mut buf = Vec::new();
-        codec.try_encode(wrapped, &mut buf).expect("encode");
+        codec
+            .try_encode(
+                wrapped,
+                &mut buf,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
+            .expect("encode");
 
         let ctx = TaskContext::default();
         // Ballista's recursive walk hands the already-decoded child as `inputs`.
         let decoded = codec
-            .try_decode(&buf, &[Arc::clone(&virtual_plan)], &ctx)
+            .try_decode(
+                &buf,
+                &[Arc::clone(&virtual_plan)],
+                &ctx,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
             .expect("decode");
 
         let pm = decoded
@@ -930,13 +962,24 @@ mod tests {
         let encode_codec = FederationPlanCodec::new(registry_with("pg_demo"));
         let mut buf = Vec::new();
         encode_codec
-            .try_encode(Arc::new(original), &mut buf)
+            .try_encode(
+                Arc::new(original),
+                &mut buf,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
             .unwrap();
 
         // ...decode with a worker-side registry that doesn't.
         let decode_codec = FederationPlanCodec::new(registry_with("mysql_demo"));
         let ctx = TaskContext::default();
-        let err = decode_codec.try_decode(&buf, &[], &ctx).unwrap_err();
+        let err = decode_codec
+            .try_decode(
+                &buf,
+                &[],
+                &ctx,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("no executor registered under name"),
@@ -972,7 +1015,14 @@ mod tests {
 
         let codec = FederationPlanCodec::new(registry_with("pg_demo"));
         let ctx = TaskContext::default();
-        let err = codec.try_decode(&buf, &[], &ctx).unwrap_err();
+        let err = codec
+            .try_decode(
+                &buf,
+                &[],
+                &ctx,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("version mismatch"),
@@ -998,7 +1048,13 @@ mod tests {
         // The default inner errors; the error should NOT mention
         // FederationPlanCodec's name — that would mean we never
         // delegated.
-        let err = codec.try_encode(other_plan, &mut buf).unwrap_err();
+        let err = codec
+            .try_encode(
+                other_plan,
+                &mut buf,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             !msg.contains("FederationPlanCodec only handles"),
@@ -1030,7 +1086,11 @@ mod tests {
         let codec = FederationPlanCodec::new(registry_with("pg_demo"));
         let mut buf = Vec::new();
         codec
-            .try_encode(Arc::new(cast), &mut buf)
+            .try_encode(
+                Arc::new(cast),
+                &mut buf,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
             .expect("schema-cast encode");
         assert!(!buf.is_empty(), "encoded payload should be non-empty");
 
@@ -1039,7 +1099,12 @@ mod tests {
         // passing the slice directly.
         let ctx = TaskContext::default();
         let decoded = codec
-            .try_decode(&buf, std::slice::from_ref(&inner), &ctx)
+            .try_decode(
+                &buf,
+                std::slice::from_ref(&inner),
+                &ctx,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
             .expect("schema-cast decode");
         let decoded_cast = decoded
             .downcast_ref::<SchemaCastScanExec>()
@@ -1069,7 +1134,12 @@ mod tests {
         }
 
         impl PhysicalExtensionCodec for RecordingInner {
-            fn try_encode(&self, _node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> DfResult<()> {
+            fn try_encode(
+                &self,
+                _node: Arc<dyn ExecutionPlan>,
+                buf: &mut Vec<u8>,
+                _proto_converter: &dyn PhysicalProtoConverterExtension,
+            ) -> DfResult<()> {
                 self.encode_calls.fetch_add(1, Ordering::SeqCst);
                 // Write a non-empty marker so the test can spot
                 // delegation succeeded.
@@ -1082,6 +1152,7 @@ mod tests {
                 _buf: &[u8],
                 _inputs: &[Arc<dyn ExecutionPlan>],
                 _ctx: &TaskContext,
+                _proto_converter: &dyn PhysicalProtoConverterExtension,
             ) -> DfResult<Arc<dyn ExecutionPlan>> {
                 self.decode_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
@@ -1103,7 +1174,11 @@ mod tests {
         );
         let mut buf = Vec::new();
         codec
-            .try_encode(other_plan, &mut buf)
+            .try_encode(
+                other_plan,
+                &mut buf,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
             .expect("encode delegates without error");
         assert_eq!(
             inner.encode_calls.load(Ordering::SeqCst),
@@ -1116,7 +1191,12 @@ mod tests {
         // (and bytes that parse with version=0) must reach the inner.
         let ctx = TaskContext::default();
         let _ = codec
-            .try_decode(&buf, &[], &ctx)
+            .try_decode(
+                &buf,
+                &[],
+                &ctx,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
             .expect("decode delegates without error");
         assert_eq!(
             inner.decode_calls.load(Ordering::SeqCst),
@@ -1142,13 +1222,22 @@ mod tests {
         let codec = FederationPlanCodec::new(registry_with("pg_demo"));
         let mut buf = Vec::new();
         codec
-            .try_encode(Arc::new(coop), &mut buf)
+            .try_encode(
+                Arc::new(coop),
+                &mut buf,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
             .expect("cooperative encode");
         assert!(!buf.is_empty(), "encoded payload should be non-empty");
 
         let ctx = TaskContext::default();
         let decoded = codec
-            .try_decode(&buf, std::slice::from_ref(&inner), &ctx)
+            .try_decode(
+                &buf,
+                std::slice::from_ref(&inner),
+                &ctx,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
             .expect("cooperative decode");
         assert!(
             decoded.downcast_ref::<CooperativeExec>().is_some(),
@@ -1207,7 +1296,13 @@ mod tests {
 
         let codec = FederationPlanCodec::new(registry_with("unused_sql"));
         let mut buf = Vec::new();
-        let err = codec.try_encode(plan, &mut buf).unwrap_err();
+        let err = codec
+            .try_encode(
+                plan,
+                &mut buf,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("REST/JSON") && msg.contains("distributed mode"),
@@ -1279,12 +1374,21 @@ mod tests {
 
         let mut buf = Vec::new();
         codec
-            .try_encode(Arc::new(scan), &mut buf)
+            .try_encode(
+                Arc::new(scan),
+                &mut buf,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
             .expect("warehouse scan encodes");
 
         let ctx = TaskContext::default();
         let decoded = codec
-            .try_decode(&buf, &[], &ctx)
+            .try_decode(
+                &buf,
+                &[],
+                &ctx,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
             .expect("warehouse scan decodes");
         let scan = decoded
             .downcast_ref::<WarehouseScanExec>()
@@ -1324,9 +1428,22 @@ mod tests {
         let codec = FederationPlanCodec::new(registry_with("unused_sql"))
             .with_warehouse_registry(warehouses);
         let mut buf = Vec::new();
-        codec.try_encode(Arc::new(scan), &mut buf).unwrap();
+        codec
+            .try_encode(
+                Arc::new(scan),
+                &mut buf,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
         let ctx = TaskContext::default();
-        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+        let decoded = codec
+            .try_decode(
+                &buf,
+                &[],
+                &ctx,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
         let scan = decoded.downcast_ref::<WarehouseScanExec>().unwrap();
 
         assert_eq!(scan.projection(), None);
@@ -1353,7 +1470,13 @@ mod tests {
         // is a wiring bug and must fail loudly.
         let codec = FederationPlanCodec::new(registry_with("unused_sql"));
         let mut buf = Vec::new();
-        let err = codec.try_encode(Arc::new(scan), &mut buf).unwrap_err();
+        let err = codec
+            .try_encode(
+                Arc::new(scan),
+                &mut buf,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
+            .unwrap_err();
         assert!(
             err.to_string().contains("warehouse registry"),
             "expected a missing-registry error, got: {err}"
@@ -1383,12 +1506,25 @@ mod tests {
         let encode_codec = FederationPlanCodec::new(registry_with("unused_sql"))
             .with_warehouse_registry(warehouses);
         let mut buf = Vec::new();
-        encode_codec.try_encode(Arc::new(scan), &mut buf).unwrap();
+        encode_codec
+            .try_encode(
+                Arc::new(scan),
+                &mut buf,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
 
         // ...decode on a worker that DOESN'T -> typed planner error.
         let decode_codec = FederationPlanCodec::new(registry_with("unused_sql"));
         let ctx = TaskContext::default();
-        let err = decode_codec.try_decode(&buf, &[], &ctx).unwrap_err();
+        let err = decode_codec
+            .try_decode(
+                &buf,
+                &[],
+                &ctx,
+                &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+            )
+            .unwrap_err();
         assert!(
             err.to_string().contains("warehouse registry"),
             "expected a missing-registry error, got: {err}"

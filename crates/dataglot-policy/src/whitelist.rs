@@ -159,7 +159,9 @@ impl ColumnWhitelistEnforcer {
         // `apply` visits every sub-expression, including columns inside
         // functions, casts, and operators.
         let _ = expr.apply(|e| {
-            if let Expr::Column(c) = e {
+            // A correlated outer reference reads the parent's column from
+            // inside the subquery: hidden there too.
+            if let Expr::Column(c) | Expr::OuterReferenceColumn(_, c) = e {
                 if self.is_hidden(c, alias_map, identity) {
                     touched = true;
                     return Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop);
@@ -218,8 +220,10 @@ impl ColumnWhitelistEnforcer {
             // scan here would not survive datafusion-federation's replanning and
             // would re-fire every analyzer pass, so it is deliberately avoided.)
             LogicalPlan::TableScan(scan) => {
+                // Filters are qualified by the scan's physical name.
+                let scan_aliases = crate::mask::scan_filter_aliases(&scan, alias_map);
                 for filter in &scan.filters {
-                    if self.expr_touches_hidden(filter, alias_map, identity) {
+                    if self.expr_touches_hidden(filter, &scan_aliases, identity) {
                         return Err(hidden_use_error(filter));
                     }
                 }
@@ -266,19 +270,21 @@ fn hidden_use_error(_expr: &Expr) -> DataFusionError {
     )
 }
 
-impl PolicyEnforcer for ColumnWhitelistEnforcer {
-    fn rewrite(
+impl ColumnWhitelistEnforcer {
+    /// [`PolicyEnforcer::rewrite`] for one lexical scope, `enclosing` being
+    /// the alias map of the scopes around it: a correlated outer reference
+    /// (`e.salary` inside `EXISTS (…)` under `FROM emp e`) resolves through
+    /// the enclosing alias; UNION branches and derived tables are rewritten as
+    /// their own scopes.
+    fn rewrite_with(
         &self,
         plan: LogicalPlan,
         identity: &Identity,
+        enclosing: &HashMap<TableReference, TableReference>,
     ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
-        if self.rules.is_empty() {
-            return Ok(Transformed::no(plan));
-        }
-        // Alias map for the whole `rewrite` call (an alias declared in a join
-        // leg is referenceable from any node above it).
-        let mut alias_map: HashMap<TableReference, TableReference> = HashMap::new();
-        collect_alias_targets(&plan, &mut alias_map);
+        use datafusion::common::tree_node::TreeNodeRecursion;
+
+        let alias_map = crate::mask::scope_aliases(&plan, enclosing);
 
         // `transform_down` walks the main plan tree (node *inputs*) but not
         // subqueries embedded in *expressions* (`InSubquery` / `Exists` /
@@ -289,6 +295,17 @@ impl PolicyEnforcer for ColumnWhitelistEnforcer {
         // (2) apply the local prune/deny to the node itself ( pattern,
         // mirroring mask/filter).
         plan.transform_down(|node| {
+            // (0) Scope boundaries: each child scope is rewritten with its
+            // own relations and skipped by this walk.
+            if !crate::mask::scope_children(&node).is_empty() {
+                let out =
+                    node.map_children(|child| self.rewrite_with(child, identity, &alias_map))?;
+                return Ok(Transformed::new(
+                    out.data,
+                    out.transformed,
+                    TreeNodeRecursion::Jump,
+                ));
+            }
             let Transformed {
                 data: node,
                 transformed: sub_changed,
@@ -296,8 +313,11 @@ impl PolicyEnforcer for ColumnWhitelistEnforcer {
             } = node.map_expressions(|expr| {
                 expr.transform_down(|e| {
                     crate::map_subquery_plans(e, &mut |subplan| {
-                        let out =
-                            self.rewrite(std::sync::Arc::unwrap_or_clone(subplan), identity)?;
+                        let out = self.rewrite_with(
+                            std::sync::Arc::unwrap_or_clone(subplan),
+                            identity,
+                            &alias_map,
+                        )?;
                         Ok(out.update_data(std::sync::Arc::new))
                     })
                 })
@@ -311,44 +331,47 @@ impl PolicyEnforcer for ColumnWhitelistEnforcer {
             })
         })
     }
+}
+
+impl PolicyEnforcer for ColumnWhitelistEnforcer {
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        identity: &Identity,
+    ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+        if self.rules.is_empty() {
+            return Ok(Transformed::no(plan));
+        }
+        self.rewrite_with(plan, identity, &HashMap::new())
+    }
 
     fn explain(&self, plan: &LogicalPlan, identity: &Identity) -> Vec<crate::PolicyDecision> {
         use crate::{PolicyAction, PolicyDecision};
         if self.rules.is_empty() {
             return Vec::new();
         }
-        let mut alias_map = HashMap::new();
-        collect_alias_targets(plan, &mut alias_map);
+        // The same scoped alias resolution the rewrite denies with.
         let mut out = Vec::new();
-        for col in crate::collect_plan_columns(plan) {
-            if self.is_hidden(&col, &alias_map, identity) {
-                out.push(PolicyDecision {
-                    action: PolicyAction::Deny,
-                    resource: qualified(&col),
-                    detail: "column not visible to this role (column whitelist)".to_string(),
-                });
-            }
-        }
+        crate::mask::for_each_expr_scoped(plan, &HashMap::new(), &mut |expr, aliases| {
+            expr.apply(|e| {
+                if let Expr::Column(c) | Expr::OuterReferenceColumn(_, c) = e {
+                    if self.is_hidden(c, aliases, identity) {
+                        out.push(PolicyDecision {
+                            action: PolicyAction::Deny,
+                            resource: qualified(c),
+                            detail: "column not visible to this role (column whitelist)"
+                                .to_string(),
+                        });
+                    }
+                }
+                Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+            })
+            .map(|_| ())
+        })
+        .expect("infallible walk");
         out.sort_by(|a, b| a.resource.cmp(&b.resource));
         out.dedup_by(|a, b| a.resource == b.resource);
         out
-    }
-}
-
-/// Collect direct `SubqueryAlias → TableScan` mappings (keyed by the bare
-/// alias). Mirrors the mask enforcer's alias resolution so `FROM users u`
-/// resolves back to `users`.
-fn collect_alias_targets(plan: &LogicalPlan, out: &mut HashMap<TableReference, TableReference>) {
-    if let LogicalPlan::SubqueryAlias(sa) = plan {
-        if let LogicalPlan::TableScan(ts) = sa.input.as_ref() {
-            out.insert(
-                TableReference::bare(sa.alias.table().to_string()),
-                ts.table_name.clone(),
-            );
-        }
-    }
-    for child in plan.inputs() {
-        collect_alias_targets(child, out);
     }
 }
 
@@ -601,5 +624,63 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("denied by policy"), "{err}");
+    }
+
+    /// A hidden column read only as a correlated outer reference inside a
+    /// subquery (`Expr::OuterReferenceColumn`) is denied too.
+    #[tokio::test]
+    async fn hidden_column_in_correlated_outer_reference_is_denied() {
+        let ctx = ctx();
+        let err = rewrite(
+            &ctx,
+            "SELECT id FROM emp WHERE EXISTS \
+             (SELECT 1 FROM emp e WHERE e.id = emp.id AND emp.salary > 100)",
+            &ops_whitelist(),
+            &ops_analyst(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("denied by policy"), "{err}");
+    }
+
+    /// The whitelisted table aliased (`FROM emp e`): a hidden column read only
+    /// as a correlated outer reference `e.salary` inside `EXISTS (…)` resolves
+    /// through the enclosing alias — denied.
+    #[tokio::test]
+    async fn hidden_column_in_correlated_outer_reference_through_alias_is_denied() {
+        let ctx = ctx();
+        let err = rewrite(
+            &ctx,
+            "SELECT e.id FROM emp e WHERE EXISTS \
+             (SELECT 1 FROM emp x WHERE x.id = e.id AND e.salary > 100)",
+            &ops_whitelist(),
+            &ops_analyst(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("denied by policy"), "{err}");
+    }
+
+    /// An aliased scan's physical name must not capture a visible alias of
+    /// the same name: in `FROM emp AS docs CROSS JOIN docs AS d`, `docs.salary`
+    /// is `emp.salary`, which the whitelist hides.
+    #[tokio::test]
+    async fn visible_alias_is_not_captured_by_another_scans_physical_name() {
+        let ctx = ctx();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "salary",
+            Arc::new(Int32Array::from(vec![1])) as datafusion::arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        ctx.register_batch("docs", batch).unwrap();
+        for sql in [
+            "SELECT docs.salary FROM emp AS docs CROSS JOIN docs AS d",
+            "SELECT docs.salary FROM docs AS d CROSS JOIN emp AS docs",
+        ] {
+            let err = rewrite(&ctx, sql, &ops_whitelist(), &ops_analyst())
+                .await
+                .expect_err(sql);
+            assert!(err.to_string().contains("denied by policy"), "{sql}: {err}");
+        }
     }
 }

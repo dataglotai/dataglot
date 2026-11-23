@@ -109,6 +109,20 @@ impl OptimizerRule for FederatedDedupUnparseGuard {
 #[must_use]
 pub fn federated_optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     let mut rules = datafusion_federation::default_optimizer_rules();
+    // Must run BEFORE the federation optimizer collapses subtrees (so it sees
+    // the plain plan, right after `simplify_expressions` has introduced the
+    // aliases it removes) — insert ahead of `federation_optimizer_rule`
+    // ( / ). Falls back to appending if the name ever changes,
+    // which the contract suite would then flag.
+    let normalizer: Arc<dyn OptimizerRule + Send + Sync> =
+        Arc::new(crate::federation_alias_normalizer::FederatedAggregateAliasNormalizer);
+    match rules
+        .iter()
+        .position(|r| r.name() == "federation_optimizer_rule")
+    {
+        Some(i) => rules.insert(i, normalizer),
+        None => rules.push(normalizer),
+    }
     rules.push(Arc::new(FederatedDedupUnparseGuard));
     rules.push(Arc::new(
         crate::federation_mark_join_guard::FederatedMarkJoinGuard,
@@ -216,9 +230,13 @@ mod tests {
     #[tokio::test]
     async fn flags_distinct_subquery_under_a_join() {
         let ctx = ctx();
+        // Project a column from the subquery: otherwise DataFusion 55's
+        // `eliminate_join` rewrites the join to a LeftSemi (the subquery is
+        // unique on the key and contributes no columns) and drops the dedup
+        // Aggregate entirely, so the vulnerable shape never forms.
         let plan = optimized(
             &ctx,
-            "SELECT c.id FROM customers c \
+            "SELECT c.id, o.customer_id FROM customers c \
              JOIN (SELECT DISTINCT customer_id FROM orders) o ON o.customer_id = c.id",
         )
         .await;
@@ -240,9 +258,13 @@ mod tests {
     #[tokio::test]
     async fn flags_group_by_without_aggregates_under_a_join() {
         let ctx = ctx();
+        // Project a column from the subquery: otherwise DataFusion 55's
+        // `eliminate_join` rewrites the join to a LeftSemi (the subquery is
+        // unique on the key and contributes no columns) and drops the dedup
+        // Aggregate entirely, so the vulnerable shape never forms.
         let plan = optimized(
             &ctx,
-            "SELECT c.id FROM customers c \
+            "SELECT c.id, o.customer_id FROM customers c \
              JOIN (SELECT customer_id FROM orders GROUP BY customer_id) o \
                ON o.customer_id = c.id",
         )

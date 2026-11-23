@@ -1,6 +1,6 @@
 //! Bearer-token check for the HTTP API (`/api/*`) on the metrics address.
 //!
-//! Every `/api/*` request goes through [`authorize`], so another scheme (the
+//! Every `/api/*` request goes through `authorize`, so another scheme (the
 //! engine's JWT auth, say) can be added there without touching the handlers.
 //! `/metrics`, `/health`, `/lineage` and `/ui` are not checked.
 //!
@@ -329,10 +329,21 @@ mod tests {
             "//api/queries",
             "/API/queries",
             "/%61pi/queries",
+            "/api%2fqueries",
+            "/api%2Fqueries",
             "/metrics/../api/queries",
         ] {
             let got = status(&r, "GET", path, None).await;
-            assert_ne!(got, StatusCode::OK, "{path} answered without a token");
+            assert_eq!(got, StatusCode::NOT_FOUND, "{path} matched an API handler");
+        }
+        // Axum matches static paths before decoding captured parameters.
+        // Encoding a static prefix does not select an API handler at all.
+        for path in [
+            "/%61pi/queries/q1/cancel",
+            "/api%2fqueries/q1/cancel",
+            "/api%2Fqueries/q1/cancel",
+        ] {
+            assert_eq!(status(&r, "POST", path, None).await, StatusCode::NOT_FOUND);
         }
     }
 

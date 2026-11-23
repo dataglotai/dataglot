@@ -169,7 +169,7 @@ pub async fn run_scheduler_tls(
     let metrics_collector = ballista_scheduler::metrics::default_metrics_collector()
         .map_err(|e| BallistaError::Internal(format!("metrics collector init failed: {e}")))?;
 
-    let scheduler_name = config.scheduler_name();
+    let scheduler_name = config.scheduler_endpoint();
     let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> = SchedulerServer::new(
         scheduler_name,
         cluster,
@@ -264,12 +264,13 @@ pub async fn run_executor_tls(
         grpc_port: 0,
         specification: Some(ExecutorSpecification {
             resources: vec![ExecutorResource {
-                resource: Some(Resource::TaskSlots(
+                resource: Some(Resource::Vcores(
                     u32::try_from(concurrent_tasks).unwrap_or(u32::MAX),
                 )),
             }],
         }),
         os_info: None,
+        ballista_protocol_version: ballista_core::BALLISTA_PROTOCOL_VERSION,
     };
 
     // Work dir for shuffle data. Slice 7b's MVP roots the work dir
@@ -399,8 +400,17 @@ pub async fn run_executor_tls(
         .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE_BYTES)
         .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE_BYTES);
 
-    let poll_handle =
-        tokio::spawn(async move { execution_loop::poll_loop(scheduler, executor, codec).await });
+    let poll_handle = tokio::spawn(async move {
+        execution_loop::poll_loop(
+            scheduler,
+            executor,
+            codec,
+            None, // poll_now_notify
+            None, // free_vcores: Ballista's internal semaphore, sized from the registered vcores
+            ballista_executor::health::ExecutorHealth::new(),
+        )
+        .await
+    });
 
     // Either task exiting means the executor is no longer functional —
     // surface the error and shut down.

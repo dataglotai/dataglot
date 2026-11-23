@@ -65,9 +65,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use datafusion::common::tree_node::Transformed;
+use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, LogicalPlan};
-use datafusion::sql::TableReference;
 
 use crate::filter::{RowFilter, RowFilterEnforcer};
 use crate::mask::{ColumnMask, ColumnMaskingEnforcer};
@@ -81,6 +81,11 @@ use crate::{CompositeEnforcer, Identity, PolicyEnforcer};
 #[derive(Debug)]
 pub struct TagBasedEnforcer {
     governance: Arc<OrgGovernance>,
+    /// Row-filter sources of the ENCLOSING composite (a static
+    /// `RowFilterEnforcer` next to this layer), handed to the mask enforcer
+    /// built per rewrite so a static admin predicate on a tag-masked column
+    /// keeps evaluating on real data.
+    outer_rls: Vec<Arc<dyn PolicyEnforcer>>,
 }
 
 impl TagBasedEnforcer {
@@ -95,6 +100,7 @@ impl TagBasedEnforcer {
     pub fn new(governance: OrgGovernance) -> Self {
         Self {
             governance: Arc::new(governance),
+            outer_rls: Vec::new(),
         }
     }
 
@@ -203,6 +209,41 @@ impl TagBasedEnforcer {
 }
 
 impl PolicyEnforcer for TagBasedEnforcer {
+    fn with_rls_sources(
+        &self,
+        sources: Vec<Arc<dyn PolicyEnforcer>>,
+    ) -> Option<Arc<dyn PolicyEnforcer>> {
+        if sources.is_empty() {
+            return None;
+        }
+        // This enforcer wires its own tag-derived filters into the mask it
+        // builds per rewrite; keep the other layers' sources for it too.
+        // Extend: a nested composite may already have supplied sources.
+        let mut outer_rls = self.outer_rls.clone();
+        outer_rls.extend(sources);
+        Some(Arc::new(Self {
+            governance: Arc::clone(&self.governance),
+            outer_rls,
+        }))
+    }
+
+    fn provides_rls_exemptions(&self) -> bool {
+        true
+    }
+
+    /// Tag-derived row filters resolved for `identity`, so a static mask layer
+    /// composed after this one never masks a tag-derived RLS predicate.
+    fn rls_referenced_columns(
+        &self,
+        table: &TableReference,
+        identity: &Identity,
+        scanned: &std::collections::HashSet<TableReference>,
+    ) -> Option<std::collections::HashSet<String>> {
+        let (_, row_filters) = self.resolve_for_identity(identity).ok()?;
+        let rls = RowFilterEnforcer::new(row_filters).ok()?;
+        Some(rls.referenced_columns(table, identity, scanned))
+    }
+
     fn rewrite(
         &self,
         plan: LogicalPlan,
@@ -250,10 +291,18 @@ impl PolicyEnforcer for TagBasedEnforcer {
         // Build the inner enforcers. Map `BuildError` to
         // `DataFusionError::Plan` so the optimizer surfaces a
         // plan-time error instead of an opaque internal one.
-        let mask_enforcer = ColumnMaskingEnforcer::new(masks)
-            .map_err(|e| DataFusionError::Plan(format!("tag-based mask resolution: {e}")))?;
         let filter_enforcer = RowFilterEnforcer::new(row_filters)
             .map_err(|e| DataFusionError::Plan(format!("tag-based row-filter resolution: {e}")))?;
+        // `CompositeEnforcer::new` hands the row filters to the masking layer
+        // so RLS predicates keep evaluating on real data.
+        let mask_enforcer: Arc<dyn PolicyEnforcer> = {
+            let base = ColumnMaskingEnforcer::new(masks)
+                .map_err(|e| DataFusionError::Plan(format!("tag-based mask resolution: {e}")))?;
+            match base.with_rls_sources(self.outer_rls.clone()) {
+                Some(wired) => wired,
+                None => Arc::new(base),
+            }
+        };
 
         // Compose: masks rewrite first, then filters. Order
         // doesn't change results (the two enforcers touch
@@ -261,7 +310,7 @@ impl PolicyEnforcer for TagBasedEnforcer {
         // `filter::tests::row_filter_and_column_mask_compose_in_either_order`)
         // but a fixed order keeps EXPLAIN output stable.
         let composite = CompositeEnforcer::new(vec![
-            Arc::new(mask_enforcer) as Arc<dyn PolicyEnforcer>,
+            mask_enforcer,
             Arc::new(filter_enforcer) as Arc<dyn PolicyEnforcer>,
         ]);
         composite.rewrite(plan, identity)

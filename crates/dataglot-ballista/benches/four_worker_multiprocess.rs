@@ -73,8 +73,8 @@ use tpchgen::generators::{
     PartSuppGenerator, RegionGenerator, SupplierGenerator,
 };
 use tpchgen_arrow::{
-    CustomerArrow, LineItemArrow, NationArrow, OrderArrow, PartArrow, PartSuppArrow,
-    RecordBatchIterator as TpchRecordBatchIterator, RegionArrow, SupplierArrow,
+    CustomerArrow, LineItemArrow, NationArrow, OrderArrow, PartArrow, PartSuppArrow, RegionArrow,
+    SupplierArrow,
 };
 
 // ---------------------------------------------------------------------------
@@ -365,8 +365,8 @@ fn seed_warehouse(dir: &Path, scale_factor: f64) {
 
 fn write_parquet<I>(dir: &Path, table: &str, iter: I)
 where
-    I: Iterator<Item = RecordBatch>,
-    I: SchemaProvider,
+    // tpchgen-arrow 4 generators are standard Arrow `RecordBatchReader`s.
+    I: ballista::datafusion::arrow::record_batch::RecordBatchReader,
 {
     let path = dir.join(format!("{table}.parquet"));
     let file = fs::File::create(&path).unwrap_or_else(|e| {
@@ -375,9 +375,10 @@ where
             path.display()
         )
     });
-    let mut writer = ArrowWriter::try_new(file, iter.schema_ref(), None)
+    let mut writer = ArrowWriter::try_new(file, iter.schema(), None)
         .unwrap_or_else(|e| panic!("open parquet writer for `{table}`: {e}"));
     for batch in iter {
+        let batch = batch.unwrap_or_else(|e| panic!("generate batch for `{table}`: {e}"));
         writer
             .write(&batch)
             .unwrap_or_else(|e| panic!("write batch for `{table}`: {e}"));
@@ -385,16 +386,6 @@ where
     writer
         .close()
         .unwrap_or_else(|e| panic!("close parquet writer for `{table}`: {e}"));
-}
-
-trait SchemaProvider {
-    fn schema_ref(&self) -> SchemaRef;
-}
-
-impl<T: TpchRecordBatchIterator> SchemaProvider for T {
-    fn schema_ref(&self) -> SchemaRef {
-        TpchRecordBatchIterator::schema(self).clone()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -444,16 +435,18 @@ async fn build_cluster_context(
 /// Arrow schema for a TPC-H table, matching exactly what `seed_warehouse`
 /// writes. Used to register tables on the remote client without inferring
 /// from a path only the cluster containers can see.
-fn tpch_table_schema(table: &str, scale_factor: f64) -> SchemaRef {
+// The schema is independent of scale factor (tpchgen-arrow 4 exposes it
+// without building a generator); the parameter is kept for call-site stability.
+fn tpch_table_schema(table: &str, _scale_factor: f64) -> SchemaRef {
     match table {
-        "nation" => NationArrow::new(NationGenerator::new(scale_factor, 1, 1)).schema_ref(),
-        "region" => RegionArrow::new(RegionGenerator::new(scale_factor, 1, 1)).schema_ref(),
-        "customer" => CustomerArrow::new(CustomerGenerator::new(scale_factor, 1, 1)).schema_ref(),
-        "orders" => OrderArrow::new(OrderGenerator::new(scale_factor, 1, 1)).schema_ref(),
-        "lineitem" => LineItemArrow::new(LineItemGenerator::new(scale_factor, 1, 1)).schema_ref(),
-        "part" => PartArrow::new(PartGenerator::new(scale_factor, 1, 1)).schema_ref(),
-        "supplier" => SupplierArrow::new(SupplierGenerator::new(scale_factor, 1, 1)).schema_ref(),
-        "partsupp" => PartSuppArrow::new(PartSuppGenerator::new(scale_factor, 1, 1)).schema_ref(),
+        "nation" => NationArrow::schema_ref(),
+        "region" => RegionArrow::schema_ref(),
+        "customer" => CustomerArrow::schema_ref(),
+        "orders" => OrderArrow::schema_ref(),
+        "lineitem" => LineItemArrow::schema_ref(),
+        "part" => PartArrow::schema_ref(),
+        "supplier" => SupplierArrow::schema_ref(),
+        "partsupp" => PartSuppArrow::schema_ref(),
         other => panic!("unknown TPC-H table: {other}"),
     }
 }

@@ -48,9 +48,9 @@
 use std::sync::{Arc, RwLock};
 
 use datafusion::common::tree_node::Transformed;
+use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::sql::TableReference;
 
 use crate::{Identity, PolicyEnforcer};
 

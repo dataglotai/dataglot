@@ -53,8 +53,8 @@ const SQL_IN_TABLE: usize = 60;
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
     /// A URL that isn't http(s).
-    #[error("invalid API URL {0:?}: expected an http:// or https:// URL")]
-    InvalidUrl(String),
+    #[error("invalid API URL: expected an http:// or https:// URL with a host")]
+    InvalidUrl,
     /// `--profile` can't be used, or doesn't have a URL the command needs.
     #[error("{0}")]
     Profile(String),
@@ -101,7 +101,7 @@ impl OpsError {
     #[must_use = "the process should exit with this code"]
     pub fn exit_code(&self) -> ExitCode {
         match self {
-            Self::InvalidUrl(_)
+            Self::InvalidUrl
             | Self::Profile(_)
             | Self::PlaintextToken(_)
             | Self::Unreachable { .. }
@@ -141,7 +141,7 @@ pub async fn run_with<O: Write, E: Write>(args: &OpsArgs, out: &mut O, err: &mut
 }
 
 async fn execute<O: Write>(args: &OpsArgs, out: &mut O) -> Result<(), OpsError> {
-    let target = Target::resolve(args)?;
+    let target = Target::resolve(args).await?;
     let (path, table): (&[&str], fn(&Value) -> Rows) = match &args.command {
         OpsCommand::Status => (&["api", "server"], status_rows),
         OpsCommand::Sources => (&["api", "connectors"], source_rows),
@@ -266,7 +266,7 @@ struct Target {
 }
 
 impl Target {
-    fn resolve(args: &OpsArgs) -> Result<Self, OpsError> {
+    async fn resolve(args: &OpsArgs) -> Result<Self, OpsError> {
         let env_token = || std::env::var(TOKEN_ENV).ok().filter(|t| !t.is_empty());
         let Some(name) = &args.profile else {
             return Ok(Self {
@@ -280,8 +280,12 @@ impl Target {
                 profile: None,
             });
         };
+        let profile_name = name.clone();
         let from_profile =
-            OpsTarget::from_profile(name).map_err(|e| OpsError::Profile(e.to_string()))?;
+            tokio::task::spawn_blocking(move || OpsTarget::from_profile(&profile_name))
+                .await
+                .map_err(|_| OpsError::Profile("could not load CLI profile".to_string()))?
+                .map_err(|e| OpsError::Profile(e.to_string()))?;
         Ok(Self {
             api: from_profile.api_url,
             explain: from_profile.explain_url,
@@ -325,21 +329,28 @@ struct Api {
 
 impl Api {
     fn new(base: &str, token: Option<String>) -> Result<Self, OpsError> {
-        let url = reqwest::Url::parse(base).map_err(|_| OpsError::InvalidUrl(base.to_string()))?;
+        // Invalid input may itself contain a password; never retain it in an
+        // error (including the error's Debug representation).
+        let url = reqwest::Url::parse(base).map_err(|_| OpsError::InvalidUrl)?;
         if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
-            return Err(OpsError::InvalidUrl(base.to_string()));
+            return Err(OpsError::InvalidUrl);
         }
         if token.is_some() && url.scheme() == "http" && !is_loopback(&url) {
             return Err(OpsError::PlaintextToken(origin(&url)));
         }
-        let http = reqwest::Client::builder()
+        let mut http = reqwest::Client::builder()
             .timeout(TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| OpsError::Unreachable {
-                url: origin(&url),
-                message: e.to_string(),
-            })?;
+            .redirect(reqwest::redirect::Policy::none());
+        // Environment/system proxies can turn a loopback HTTP request into
+        // plaintext traffic to another machine, carrying its bearer token.
+        // Keep these requests direct; remote HTTPS retains normal proxy support.
+        if url.scheme() == "http" && is_loopback(&url) {
+            http = http.no_proxy();
+        }
+        let http = http.build().map_err(|e| OpsError::Unreachable {
+            url: origin(&url),
+            message: e.to_string(),
+        })?;
         Ok(Self {
             base: url,
             http,
@@ -479,7 +490,7 @@ impl Rows {
                     .map(|row| {
                         let value = cell(row, i);
                         Some(if shorten {
-                            shortened(value)
+                            shortened(&one_line(value))
                         } else {
                             value.to_string()
                         })
@@ -538,6 +549,10 @@ fn items<'a>(value: &'a Value, key: Option<&str>) -> &'a [Value] {
 fn status_rows(value: &Value) -> Rows {
     let mut rows = Vec::new();
     flatten("", value, &mut rows);
+    // Other workspace crates can enable serde_json/preserve_order through
+    // feature unification. Status output promises sorted flattened names
+    // regardless of the map implementation used to parse the response.
+    rows.sort_unstable_by(|left, right| left[0].cmp(&right[0]));
     Rows {
         columns: &["setting", "value"],
         rows,
@@ -628,7 +643,7 @@ fn running_rows(value: &Value) -> Rows {
                 elapsed(query),
                 field(query, "user"),
                 field(query, "sources"),
-                one_line(&field(query, "sql")),
+                field(query, "sql"),
             ]
         })
         .collect();
@@ -649,7 +664,7 @@ fn history_rows(value: &Value) -> Rows {
                 elapsed(query),
                 field(query, "user"),
                 field(query, "sources"),
-                one_line(&field(query, "sql")),
+                field(query, "sql"),
                 field(query, "error"),
             ]
         })
@@ -740,8 +755,8 @@ fn elapsed(query: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// SQL on one line, so a multi-line statement doesn't break a table or a
-/// CSV row.
+/// SQL on one line for the abbreviated table display. CSV retains the
+/// original text and lets the writer quote multiline cells.
 fn one_line(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -836,11 +851,7 @@ mod tests {
         ]);
         let rows = running_rows(&running);
         let sql = &rows.rows[0][5];
-        assert!(!sql.contains('\n'), "{sql}");
-        assert!(
-            sql.starts_with("SELECT x, x,") && sql.ends_with("x, FROM t"),
-            "{sql}"
-        );
+        assert_eq!(sql, &long);
         assert_eq!(rows.rows[0][2], "1.5s");
         assert_eq!(rows.rows[0][4], "pg, files");
 
@@ -850,9 +861,21 @@ mod tests {
             "CSV keeps the whole statement: {csv}"
         );
         let table = render(running_rows(&running), OutputFormat::Table);
-        let cut: String = sql.chars().take(SQL_IN_TABLE - 1).collect();
+        let cut: String = one_line(sql).chars().take(SQL_IN_TABLE - 1).collect();
         assert!(table.contains(&format!("{cut}…")), "{table}");
         assert!(!table.contains("FROM t"), "{table}");
+    }
+
+    #[test]
+    fn query_csv_preserves_sql_whitespace() {
+        let sql = "SELECT 'a  b', \"quoted\" -- keep this newline\nFROM t";
+        let queries = json!([{"run_id": "r1", "sql": sql}]);
+        let quoted = format!("\"{}\"", sql.replace('"', "\"\""));
+        for rows in [running_rows(&queries), history_rows(&queries)] {
+            assert_eq!(rows.rows[0][5], sql);
+            let csv = render(rows, OutputFormat::Csv);
+            assert!(csv.contains(&quoted), "CSV changed SQL text: {csv}");
+        }
     }
 
     #[test]
@@ -950,7 +973,7 @@ mod tests {
             "not a url",
         ] {
             assert!(
-                matches!(Api::new(bad, None), Err(OpsError::InvalidUrl(_))),
+                matches!(Api::new(bad, None), Err(OpsError::InvalidUrl)),
                 "{bad} should be rejected"
             );
         }
@@ -1085,10 +1108,7 @@ mod tests {
             message: String::new(),
         };
         assert_eq!(unreachable.exit_code(), ExitCode::from(2));
-        assert_eq!(
-            OpsError::InvalidUrl(String::new()).exit_code(),
-            ExitCode::from(2)
-        );
+        assert_eq!(OpsError::InvalidUrl.exit_code(), ExitCode::from(2));
         assert_eq!(
             OpsError::Profile(String::new()).exit_code(),
             ExitCode::from(2)

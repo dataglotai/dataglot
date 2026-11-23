@@ -86,6 +86,18 @@ impl DisplayAs for FederationFilterGuard {
 }
 
 impl ExecutionPlan for FederationFilterGuard {
+    // No physical expressions of its own (DataFusion 55 made this required).
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &std::sync::Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> datafusion::common::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     // The trait fixes the return as `&str`; returning a literal trips
     // `unnecessary_literal_bound` but we can't widen the signature.
     #[allow(clippy::unnecessary_literal_bound)]
@@ -125,8 +137,24 @@ impl ExecutionPlan for FederationFilterGuard {
         self.input.execute(partition, context)
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+    // Statistics pass straight through from the child. DataFusion 55
+    // computes them bottom-up via `StatisticsContext`: declare the child we
+    // read, then hand its resolved statistics back unchanged.
+    fn child_stats_requests(
+        &self,
+        partition: Option<usize>,
+    ) -> Vec<datafusion::physical_plan::ChildStats> {
+        vec![datafusion::physical_plan::ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &datafusion::physical_plan::StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        input_stats.first().cloned().ok_or_else(|| {
+            DataFusionError::Internal("FederationFilterGuard expects exactly one child".to_string())
+        })
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -234,6 +262,18 @@ mod tests {
     }
 
     impl ExecutionPlan for NamedLeaf {
+        // No physical expressions of its own (DataFusion 55 made this required).
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &std::sync::Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+            ) -> datafusion::common::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn name(&self) -> &str {
             self.node_name
         }
@@ -287,7 +327,14 @@ mod tests {
         assert_eq!(guard.children().len(), 1);
 
         // with_new_children round-trips a single child back into a guard.
-        let rebuilt = Arc::new(guard).with_new_children(vec![vep]).unwrap();
+        let rebuilt = Arc::new(guard)
+            .replace_children(
+                vec![vep],
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )
+            .unwrap();
         assert_eq!(rebuilt.name(), "FederationFilterGuard");
 
         // …and rejects the wrong arity.
@@ -298,7 +345,14 @@ mod tests {
         let guard2 = Arc::new(FederationFilterGuard::new(NamedLeaf::named(
             "VirtualExecutionPlan",
         )));
-        assert!(guard2.with_new_children(two).is_err());
+        assert!(guard2
+            .replace_children(
+                two,
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute
+                ),
+            )
+            .is_err());
     }
 
     #[test]
@@ -348,7 +402,9 @@ mod tests {
         assert!(guard.execute(0, Arc::new(TaskContext::default())).is_err());
 
         // statistics + metrics delegate to the child's defaults.
-        assert!(guard.partition_statistics(None).is_ok());
+        assert!(datafusion::physical_plan::StatisticsContext::new()
+            .compute(&guard, &datafusion::physical_plan::StatisticsArgs::new())
+            .is_ok());
         assert!(guard.metrics().is_none());
     }
 

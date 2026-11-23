@@ -178,6 +178,44 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// TCP keep-alive on pooled connections, so long-lived idle sockets aren't
 /// silently reaped by a NAT/firewall between bursts.
 const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
+/// HTTP/2 keep-alive PING interval. TCP keep-alive proves the *socket* is up,
+/// but an HTTP/2 connection multiplexes many streams over one socket and can go
+/// half-dead (server GOAWAY / silent stream reset) while the TCP layer still
+/// looks healthy — so a request parked on it hangs to the request timeout.
+/// Application-level PINGs while a request is in flight detect that and let
+/// reqwest fail fast and evict the connection.
+///
+/// These settings are applied ONLY on the `http2_prior_knowledge` path, not to
+/// every h2 connection. Prior knowledge is an explicit operator opt-in for an
+/// endpoint they control and know speaks h2 — the  high-concurrency
+/// workload — so aggressive (sub-timeout) PINGs are appropriate there. An
+/// arbitrary HTTPS API that merely negotiates h2 via ALPN is NOT ours to
+/// control: many servers and proxies enforce a PING-rate policy (gRPC's default
+/// `EnforcementPolicy`, Envoy/Nginx ping-flood protection) and answer
+/// too-frequent PINGs with `GOAWAY`/`ENHANCE_YOUR_CALM`, so pinging them at a
+/// sub-timeout rate could tear down healthy connections — strictly worse than no
+/// keep-alive. We therefore leave ALPN-negotiated h2 on reqwest's defaults.
+///
+/// We deliberately do NOT enable keep-alive *while idle*: many servers apply a
+/// PING-flood policy (Go gRPC `EnforcementPolicy`, Netty) and answer an idle
+/// PING with `GOAWAY`, which would tear down otherwise-healthy pooled
+/// connections. The trade-off is that a connection which wedged *while idle* in
+/// the pool is not evicted proactively — but it is still caught reactively: the
+/// next request that reuses it opens a stream, the PING fires within the
+/// interval, and that request fails fast (~15s) and the connection is dropped,
+/// rather than a proactive idle eviction we can't do without risking the
+/// PING-flood `GOAWAY`. So the objective here is bounded-latency liveness for a
+/// request parked on a (dead-or-slow) connection, not proactive idle reaping.
+///
+/// The interval + timeout must both sit well UNDER [`REQUEST_TIMEOUT`] (30s), or
+/// the request times out before the first PING is even sent and the mechanism is
+/// dead weight: at 10s + 5s a half-dead connection is detected and evicted by
+/// ~15s, so the parked request fails fast (and the next one re-dials) instead of
+/// hanging the full 30s.
+const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// Close the h2 connection if a keep-alive PING isn't acknowledged in time, so a
+/// wedged connection is replaced rather than parked with in-flight requests.
+const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Tunables for the connector's shared HTTP client.
 ///
@@ -208,7 +246,12 @@ fn build_client(opts: &RestClientOptions) -> DataglotResult<Client> {
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .tcp_keepalive(TCP_KEEPALIVE);
     if opts.http2_prior_knowledge {
-        builder = builder.http2_prior_knowledge();
+        // Only for a declared, operator-controlled h2 endpoint — see the
+        // HTTP2_KEEPALIVE_* docs on why we don't ping ALPN-negotiated h2.
+        builder = builder
+            .http2_prior_knowledge()
+            .http2_keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
+            .http2_keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT);
     }
     builder
         .build()
@@ -743,6 +786,18 @@ impl DisplayAs for RestScanExec {
 }
 
 impl ExecutionPlan for RestScanExec {
+    // No physical expressions of its own (DataFusion 55 made this required).
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &std::sync::Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> datafusion::common::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &'static str {
         "RestScanExec"
     }
@@ -1161,7 +1216,8 @@ mod tests {
 
     #[test]
     fn builds_http2_prior_knowledge_client() {
-        // The tuned client (incl. HTTP/2 prior knowledge) builds cleanly.
+        // The tuned client builds cleanly both as the HTTP/1.1 default and with
+        // HTTP/2 prior knowledge (which additionally arms the h2 keep-alive PINGs).
         assert!(build_client(&RestClientOptions::default()).is_ok());
         assert!(build_client(&RestClientOptions {
             http2_prior_knowledge: true,

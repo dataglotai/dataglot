@@ -9,7 +9,38 @@ maintainers' phase-closure records.
 
 ## [Unreleased]
 
-_Nothing yet._
+## [0.5.3] — 2026-11-22
+
+### Changed
+
+- Coordinated DataFusion 55 ecosystem upgrade, all in lockstep:
+  DataFusion 54.1 → 55.3, Arrow/Parquet/Arrow Flight 58 → 59.2,
+  Ballista 54.1 → 55.0, datafusion-federation 0.5.5 → 0.5.10,
+  datafusion-postgres / datafusion-pg-catalog 0.18 → 0.19, pgwire 0.40 → 0.41.
+- `iceberg-datafusion` now comes from `apache/datafusion-iceberg` (the crate
+  moved out of iceberg-rust); the iceberg-rust rev moved to the one that repo
+  pins.
+- `tpchgen` / `tpchgen-arrow` now come from crates.io 4.0 (`arrow_59` feature)
+  instead of a git rev.
+- dataglot-ballista's `object_store` moved from 0.14 to 0.13.2, matching
+  DataFusion and Ballista, so only one copy is built.
+- The Ballista executor's `--concurrent-tasks` now sets Ballista 55's `vcores`
+  (the renamed task-slot setting); registration carries the Ballista protocol
+  version.
+- Harness only: dataglot-pgwire's `sqlparser` moved back from 0.63 to 0.62 to
+  match DataFusion 55; the fuzz crate moved to DataFusion 55.3 / sqlparser 0.62.
+- Workspace MSRV raised from 1.94 to 1.95: the iceberg-rust rev that
+  `apache/datafusion-iceberg` pins for DataFusion 55 requires rustc 1.95.
+- The imported DataFusion sqllogictest corpus is re-pinned from 53.1.0 to
+  55.3.0; `dataglot-testbench`'s `snowflake-api` pin now matches
+  `dataglot-federation`'s.
+
+### Fixed
+
+- SQL row-filter predicates such as `NOT (deleted)` are no longer rejected at
+  config load under DataFusion 55, which type-checks `NOT` while planning.
+  Columns in the config-time synthetic schema are now typed `Null` (unknown)
+  instead of `Utf8`.
 
 ## [0.5.0] — 2026-08-08
 
@@ -145,7 +176,8 @@ Phase 0 (Foundations, closed 2026-04-30) + Phase 0.5 (hardening).
 - Nightly differential SQL harness vs Trino (first clean run: 6/10
   queries match; the 4 divergences became Phase 1 input).
 
-[Unreleased]: https://github.com/dataglotai/dataglot/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/dataglotai/dataglot/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/dataglotai/dataglot/compare/v0.5.0...v0.5.3
 [0.5.0]: https://github.com/dataglotai/dataglot/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/dataglotai/dataglot/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/dataglotai/dataglot/compare/v0.1.0...v0.3.0

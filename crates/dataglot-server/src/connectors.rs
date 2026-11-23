@@ -131,6 +131,14 @@ const INVENTORY: &[Family] = &[
         note: "Direct TableProvider over OData v2: $filter/$select/$top pushdown",
     },
     Family {
+        name: "Arrow Flight SQL",
+        feature: "flightsql-source",
+        kinds: &["flightsql"],
+        note: "SQLExecutor over a remote Flight SQL server — Dremio, InfluxDB 3, \
+               another Dataglot; gRPC, no native driver. Not the `flight_sql` feature, which \
+               serves Flight SQL to clients",
+    },
+    Family {
         name: "REST / JSON API (Salesforce, athenahealth, generic)",
         feature: "rest",
         kinds: &["rest"],

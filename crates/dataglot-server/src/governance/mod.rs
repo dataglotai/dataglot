@@ -62,7 +62,7 @@ use dataglot_core::governance::{
     ColumnMetadata, DataProduct, DataProductPublisher, DynDataProductPublisher, ProductPlatform,
     TableName,
 };
-use dataglot_core::{CatalogBinding, LiveConnectorKind};
+use dataglot_core::CatalogBinding;
 use reqwest::Url;
 use serde_json::{json, Value};
 
@@ -290,6 +290,24 @@ fn column_to_field(column: &ColumnMetadata) -> Value {
 /// stay clear of the `iceberg`-internals exposure called out in
 /// hard rule 7 because the *operator* sees `DataHub`'s native
 /// "Iceberg" label, not Dataglot's internal `IcebergCache` naming.
+///
+/// This table stays in the `DataHub` adapter rather than moving to
+/// `dataglot-core` alongside [`ProductPlatform`]: the slugs are *this
+/// backend's* vocabulary, and the Phase 1 decision (the
+/// `data-product-registration` plan) is that each backend adapter owns its
+/// own mapping while the trait carries a typed enum. `OpenMetadata` and Informatica will want different strings for the
+/// same platform.
+///
+/// The final arm is a catch-all rather than one line per variant, and that
+/// is deliberate on two counts. It keeps adding a `ProductPlatform` a
+/// single-crate change in core (rule 5) instead of breaking this match. And
+/// `external` is the *right* answer for an unmapped platform: it is
+/// `DataHub`'s designated bucket for sources it cannot classify, so a new
+/// platform shows up honestly as external until someone gives it a slug,
+/// rather than being mislabelled as something it is not.
+/// `every_platform_has_a_datahub_slug` iterates `ProductPlatform::all()` and
+/// fails on a platform nobody has decided a slug for, so the defaulting is
+/// caught rather than silent.
 fn datahub_platform_slug(platform: ProductPlatform) -> &'static str {
     match platform {
         ProductPlatform::Postgres => "postgres",
@@ -298,11 +316,12 @@ fn datahub_platform_slug(platform: ProductPlatform) -> &'static str {
         ProductPlatform::Oracle => "oracle",
         ProductPlatform::ObjectStorage => "s3",
         ProductPlatform::Odata => "odata",
-        // DataHub has no vocabulary entry for "some ADBC driver" or a generic
-        // REST/JSON API; the generic `external` platform is its designated
-        // bucket for sources it can't classify.
-        ProductPlatform::Adbc | ProductPlatform::Rest => "external",
         ProductPlatform::Iceberg => "iceberg",
+        // Everything else — `Adbc`, `Rest`, and any platform added later —
+        // falls here. DataHub has no vocabulary entry for "some ADBC driver"
+        // or a generic REST/JSON API, and `external` is its designated
+        // bucket for sources it cannot classify.
+        _ => "external",
     }
 }
 
@@ -357,16 +376,10 @@ pub fn data_product_for_binding(catalog_name: &str, binding: &CatalogBinding) ->
     };
     let urn = name.to_urn();
     let platform = match binding {
-        CatalogBinding::LiveConnector(b) => match b.kind {
-            LiveConnectorKind::Postgres => ProductPlatform::Postgres,
-            LiveConnectorKind::Mysql => ProductPlatform::Mysql,
-            LiveConnectorKind::Snowflake => ProductPlatform::Snowflake,
-            LiveConnectorKind::Oracle => ProductPlatform::Oracle,
-            LiveConnectorKind::ObjectStorage => ProductPlatform::ObjectStorage,
-            LiveConnectorKind::Odata => ProductPlatform::Odata,
-            LiveConnectorKind::Adbc => ProductPlatform::Adbc,
-            LiveConnectorKind::Rest => ProductPlatform::Rest,
-        },
+        // The kind→platform table lives on `LiveConnectorKind` in
+        // `dataglot-core`, beside both enums, so adding a connector kind
+        // stays a single-crate change (rule 5).
+        CatalogBinding::LiveConnector(b) => b.kind.product_platform(),
         // `SemanticCatalog` is the cross-source semantic-model
         // binding (Architecture Decisions §09); it has no
         // single source platform of its own. Phase 1 treats it
@@ -554,7 +567,7 @@ mod tests {
     use super::*;
 
     use dataglot_core::governance::{placeholder_column, ColumnDefinitionSource, TableName};
-    use dataglot_core::{IcebergCacheBinding, LiveConnectorBinding};
+    use dataglot_core::{IcebergCacheBinding, LiveConnectorBinding, LiveConnectorKind};
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -573,6 +586,56 @@ mod tests {
                 placeholder_column("email".to_string(), "Utf8".to_string(), true),
             ],
             description: None,
+        }
+    }
+
+    /// The `DataHub` slugs are a published integration contract, so each is
+    /// asserted rather than left to whoever next edits the match — and a
+    /// platform with no entry here fails the test.
+    ///
+    /// That second half is the point. `datahub_platform_slug` ends in a
+    /// catch-all so adding a `ProductPlatform` stays a single-crate change
+    /// in `dataglot-core` rather than a compile error in the adapter — which
+    /// does mean a new platform would otherwise publish as `external` with
+    /// nobody having decided that.
+    ///
+    /// The table below is therefore **exhaustive on purpose**: a new variant
+    /// stops compiling right here, which is a stronger signal than a runtime
+    /// assertion and lands in the place where the decision has to be made —
+    /// give it a real `DataHub` name, or record `external` deliberately.
+    ///
+    /// Two weaker versions preceded it. The first iterated a hardcoded list,
+    /// so a new variant was simply absent and the test kept passing. The
+    /// second kept a `_ => None` catch-all here as the safety net, which the
+    /// compiler flagged as unreachable the moment every variant had an arm —
+    /// a guard that only starts working once it is too late to help.
+    #[test]
+    fn every_platform_has_a_datahub_slug() {
+        // No catch-all: a new `ProductPlatform` must fail to compile here.
+        let expected = |platform: ProductPlatform| match platform {
+            ProductPlatform::Postgres => "postgres",
+            ProductPlatform::Mysql => "mysql",
+            ProductPlatform::Snowflake => "snowflake",
+            ProductPlatform::Oracle => "oracle",
+            ProductPlatform::ObjectStorage => "s3",
+            ProductPlatform::Odata => "odata",
+            ProductPlatform::Iceberg => "iceberg",
+            // Deliberately `external`: DataHub has no vocabulary entry for
+            // "some ADBC driver", a generic REST/JSON API, or whatever a
+            // Flight SQL endpoint fronts.
+            ProductPlatform::Adbc | ProductPlatform::Rest | ProductPlatform::FlightSql => {
+                "external"
+            }
+        };
+        // `all()` is derived from the enum, so it cannot go stale: every
+        // variant is both compiled against the table above and asserted
+        // against the production mapping.
+        for platform in ProductPlatform::all() {
+            assert_eq!(
+                datahub_platform_slug(platform),
+                expected(platform),
+                "{platform:?}"
+            );
         }
     }
 

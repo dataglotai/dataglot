@@ -43,11 +43,11 @@ use std::sync::Arc;
 
 use ballista::datafusion::arrow::array::RecordBatch;
 use ballista::datafusion::arrow::util::pretty::pretty_format_batches;
+use ballista::datafusion::common::TableReference;
 use ballista::datafusion::execution::session_state::SessionStateBuilder;
 use ballista::datafusion::logical_expr::{col, lit};
 use ballista::datafusion::optimizer::OptimizerRule;
 use ballista::datafusion::prelude::SessionContext;
-use ballista::datafusion::sql::TableReference;
 use datafusion_federation::sql::SQLExecutor;
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;

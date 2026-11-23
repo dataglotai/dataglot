@@ -138,11 +138,56 @@ pub enum LiveConnectorKind {
     /// lineage / catalog-service surfaces the source regardless of how
     /// the server was built.
     Adbc,
+    /// `kind: "flightsql"` in `dataglot.toml` — Phase 4 task 05.
+    /// An Arrow Flight SQL server reached over gRPC: a `SQLExecutor` source
+    /// like [`Self::Adbc`], but speaking a wire protocol rather than loading
+    /// a driver, so it needs no native library on the host. The connector is
+    /// gated behind the server's `flightsql-source` feature; the binding kind
+    /// is always present so lineage / catalog-service surfaces the source
+    /// regardless of how the server was built.
+    ///
+    /// Spelled `flightsql`, not `flight_sql`: one spelling across the config
+    /// `kind`, this binding and the governance platform, matching the crate
+    /// feature and the published spec.
+    #[serde(rename = "flightsql")]
+    FlightSql,
     /// `kind: "rest"` in `dataglot.toml` — Phase 4. A generic
     /// REST/JSON source (Salesforce, Athena Health APIs): a direct
     /// `TableProvider` (rule 3), sibling of [`Self::Odata`], with a per-table
     /// declared Arrow schema. Pure-Rust, so always compiled into the server.
     Rest,
+}
+
+impl LiveConnectorKind {
+    /// The governance platform this connector kind publishes as.
+    ///
+    /// Lives here, next to both enums, rather than in the server: the
+    /// mapping is a property of the two types, and keeping it beside them
+    /// means adding a connector kind is one crate's change with the
+    /// exhaustive match right there to force the decision. Held in the
+    /// server it made every new kind a cross-crate change that could not be
+    /// staged (rule 5) without giving up that compile-time check.
+    ///
+    /// Backend-neutral by construction: both sides are this crate's own
+    /// enums. Vendor vocabulary — `DataHub`'s platform slugs, and whatever
+    /// `OpenMetadata` and Informatica use — stays in each backend's adapter,
+    /// per the Phase 1 decision that the trait carries a typed enum and the
+    /// per-backend adapter does the string mapping.
+    #[must_use]
+    pub fn product_platform(self) -> crate::governance::ProductPlatform {
+        use crate::governance::ProductPlatform;
+        match self {
+            Self::Postgres => ProductPlatform::Postgres,
+            Self::Mysql => ProductPlatform::Mysql,
+            Self::Snowflake => ProductPlatform::Snowflake,
+            Self::Oracle => ProductPlatform::Oracle,
+            Self::ObjectStorage => ProductPlatform::ObjectStorage,
+            Self::Odata => ProductPlatform::Odata,
+            Self::Adbc => ProductPlatform::Adbc,
+            Self::Rest => ProductPlatform::Rest,
+            Self::FlightSql => ProductPlatform::FlightSql,
+        }
+    }
 }
 
 /// Binding for a Peaka-managed semantic catalog. `data_product_id`
@@ -214,6 +259,46 @@ mod tests {
         })
     }
 
+    /// Every connector kind maps to a platform, and the mapping lives in
+    /// this crate so that adding a kind is a single-crate change with the
+    /// exhaustive match right beside the enum.
+    #[test]
+    fn every_connector_kind_maps_to_a_governance_platform() {
+        use crate::governance::ProductPlatform;
+        for (kind, platform) in [
+            (LiveConnectorKind::Postgres, ProductPlatform::Postgres),
+            (LiveConnectorKind::Mysql, ProductPlatform::Mysql),
+            (LiveConnectorKind::Snowflake, ProductPlatform::Snowflake),
+            (LiveConnectorKind::Oracle, ProductPlatform::Oracle),
+            (
+                LiveConnectorKind::ObjectStorage,
+                ProductPlatform::ObjectStorage,
+            ),
+            (LiveConnectorKind::Odata, ProductPlatform::Odata),
+            (LiveConnectorKind::Adbc, ProductPlatform::Adbc),
+            (LiveConnectorKind::Rest, ProductPlatform::Rest),
+            (LiveConnectorKind::FlightSql, ProductPlatform::FlightSql),
+        ] {
+            assert_eq!(kind.product_platform(), platform, "{kind:?}");
+        }
+    }
+
+    /// One spelling everywhere it is written down: the config `kind`, this
+    /// binding, and the governance platform. `rename_all = "snake_case"`
+    /// would have made this `flight_sql` and left the `dataglot.toml` key
+    /// spelled differently from the wire.
+    #[test]
+    fn the_flight_sql_kind_is_spelled_the_way_the_config_key_is() {
+        assert_eq!(
+            serde_json::to_string(&LiveConnectorKind::FlightSql).unwrap(),
+            "\"flightsql\""
+        );
+        assert_eq!(
+            serde_json::from_str::<LiveConnectorKind>("\"flightsql\"").unwrap(),
+            LiveConnectorKind::FlightSql
+        );
+    }
+
     #[test]
     fn binding_serde_roundtrip_all_variants() {
         // Pin the wire shape — the catalog service serdes
@@ -234,6 +319,10 @@ mod tests {
             CatalogBinding::LiveConnector(LiveConnectorBinding {
                 kind: LiveConnectorKind::ObjectStorage,
                 endpoint_hint: "file:///var/parquet".to_string(),
+            }),
+            CatalogBinding::LiveConnector(LiveConnectorBinding {
+                kind: LiveConnectorKind::FlightSql,
+                endpoint_hint: "grpc://dremio.internal:32010".to_string(),
             }),
             CatalogBinding::SemanticCatalog(
                 SemanticCatalogBinding::try_new("dp_42".to_string(), pg_binding())

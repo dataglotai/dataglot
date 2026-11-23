@@ -71,6 +71,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{
     CatalogProvider as DfCatalogProvider, SchemaProvider as DfSchemaProvider,
 };
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::SendableRecordBatchStream;
@@ -78,7 +79,6 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::sql::sqlparser::ast::{self};
 use datafusion::sql::unparser::dialect::Dialect;
-use datafusion::sql::TableReference;
 use datafusion_federation::sql::{
     AstAnalyzer, LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider,
     SQLTableSource,

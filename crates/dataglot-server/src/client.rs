@@ -163,6 +163,24 @@ impl Endpoint {
             (None, None) => Ok(None),
         }
     }
+
+    /// Resolve CLI settings without reading a profile on an async worker.
+    pub(crate) async fn resolve(
+        server: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<Option<Self>, ClientError> {
+        if server.is_some() {
+            return Self::from_args(server, profile);
+        }
+        let Some(name) = profile else {
+            return Ok(None);
+        };
+        let name = name.to_owned();
+        tokio::task::spawn_blocking(move || Self::from_profile(&name))
+            .await
+            .map_err(|_| ClientError::Profile("could not load CLI profile".to_string()))?
+            .map(Some)
+    }
 }
 
 impl From<&str> for Endpoint {

@@ -31,7 +31,7 @@ use ballista::datafusion::arrow::datatypes::SchemaRef;
 use ballista::datafusion::arrow::record_batch::RecordBatch;
 use ballista::datafusion::error::{DataFusionError, Result as DfResult};
 use ballista::datafusion::execution::context::QueryPlanner;
-use ballista::datafusion::execution::{SessionState, TaskContext};
+use ballista::datafusion::execution::TaskContext;
 use ballista::datafusion::logical_expr::LogicalPlan;
 use ballista::datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
@@ -69,7 +69,7 @@ impl QueryPlanner for CancelOnDropQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &SessionState,
+        session_state: &dyn ballista::datafusion::catalog::Session,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let plan = self
             .inner
@@ -111,6 +111,20 @@ impl DisplayAs for CancelOnDropExec {
 }
 
 impl ExecutionPlan for CancelOnDropExec {
+    // No physical expressions of its own (DataFusion 55 made this required).
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &std::sync::Arc<dyn ballista::datafusion::physical_expr::PhysicalExpr>,
+        ) -> ballista::datafusion::common::Result<
+            ballista::datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> ballista::datafusion::common::Result<
+        ballista::datafusion::common::tree_node::TreeNodeRecursion,
+    > {
+        Ok(ballista::datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     // The trait fixes the `&str` return; the literal is naturally
     // 'static (same shape as upstream `DistributedQueryExec::name`).
     #[allow(clippy::unnecessary_literal_bound)]
@@ -491,6 +505,20 @@ mod tests {
     }
 
     impl ExecutionPlan for StubStreamExec {
+        // No physical expressions of its own (DataFusion 55 made this required).
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &std::sync::Arc<dyn ballista::datafusion::physical_expr::PhysicalExpr>,
+            ) -> ballista::datafusion::common::Result<
+                ballista::datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> ballista::datafusion::common::Result<
+            ballista::datafusion::common::tree_node::TreeNodeRecursion,
+        > {
+            Ok(ballista::datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         #[allow(clippy::unnecessary_literal_bound)]
         fn name(&self) -> &str {
             "StubStreamExec"
@@ -538,7 +566,7 @@ mod tests {
         async fn create_physical_plan(
             &self,
             _logical_plan: &LogicalPlan,
-            _session_state: &SessionState,
+            _session_state: &dyn ballista::datafusion::catalog::Session,
         ) -> DfResult<Arc<dyn ExecutionPlan>> {
             Ok(Arc::clone(&self.plan))
         }
@@ -630,7 +658,12 @@ mod tests {
         // Rebuild with a fresh inner and confirm the swap took.
         let new_inner = Arc::new(StubStreamExec::new(schema(), vec![])) as Arc<dyn ExecutionPlan>;
         let rebuilt = exec
-            .with_new_children(vec![Arc::clone(&new_inner)])
+            .replace_children(
+                vec![Arc::clone(&new_inner)],
+                ballista::datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    ballista::datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )
             .expect("rebuild");
         let rebuilt = rebuilt
             .downcast_ref::<CancelOnDropExec>()
@@ -737,6 +770,20 @@ mod tests {
         }
     }
     impl ExecutionPlan for AbandonProbeExec {
+        // No physical expressions of its own (DataFusion 55 made this required).
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &std::sync::Arc<dyn ballista::datafusion::physical_expr::PhysicalExpr>,
+            ) -> ballista::datafusion::common::Result<
+                ballista::datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> ballista::datafusion::common::Result<
+            ballista::datafusion::common::tree_node::TreeNodeRecursion,
+        > {
+            Ok(ballista::datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         #[allow(clippy::unnecessary_literal_bound)]
         fn name(&self) -> &str {
             "AbandonProbeExec"
@@ -834,6 +881,20 @@ mod tests {
         }
     }
     impl ExecutionPlan for DistUnsupportedExec {
+        // No physical expressions of its own (DataFusion 55 made this required).
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &std::sync::Arc<dyn ballista::datafusion::physical_expr::PhysicalExpr>,
+            ) -> ballista::datafusion::common::Result<
+                ballista::datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> ballista::datafusion::common::Result<
+            ballista::datafusion::common::tree_node::TreeNodeRecursion,
+        > {
+            Ok(ballista::datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         #[allow(clippy::unnecessary_literal_bound)]
         fn name(&self) -> &str {
             "DistUnsupportedExec"
@@ -905,7 +966,12 @@ mod tests {
             scheduler_url: "df://scheduler:50050".to_string(),
         });
         let rebuilt = exec
-            .with_new_children(vec![])
+            .replace_children(
+                vec![],
+                ballista::datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    ballista::datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )
             .expect("rebuild with no children");
         let rebuilt = rebuilt
             .downcast_ref::<CancelOnDropExec>()

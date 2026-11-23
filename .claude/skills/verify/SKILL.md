@@ -122,16 +122,20 @@ declares, listing a subset — `postgres`, `mysql`, `iceberg`, `odata`, `rest`
 — so anything left out of that list is skipped. Cargo's `--all-features`
 enables every *declared* feature, so it does include the ones `all` omits.
 
-A feature omitted from `all` therefore has to be named explicitly, or the
-shortcut quietly leaves its suite unrun. Compare the crate's `[features]`
-table against the `all` list to find them.
+The federation crate's Flight SQL ingress is one of the omitted ones, and it
+carries the pushdown-parity suite, so a change anywhere near it runs it by
+name rather than relying on a shortcut:
+
+```bash
+cargo test -p dataglot-federation --features flightsql
+```
 
 `[features]` in the crate's `Cargo.toml` is the authority on what exists, and
 the feature matrix in `.github/workflows/integration.yml` on what CI covers.
-If a name is not in yours, check the spelling there first — the other likely
-cause is that the feature postdates your checkout. Either way the failure is
-`does not contain this feature`, not a test failure, which is easy to read as
-"nothing to run here".
+If a name here is not in yours, check the spelling there first — the other
+likely cause is that the feature postdates your checkout. Either way the
+failure is `does not contain this feature`, not a test failure, which is easy
+to read as "nothing to run here".
 
 Watch for pairs whose names differ only in punctuation and which mean
 opposite things. `flight_sql` on the server *serves* Flight SQL to clients;

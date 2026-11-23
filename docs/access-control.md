@@ -63,7 +63,13 @@ mode = "grant"   # "open" (default) | "grant"
 ```
 
 - **`open`** (default) — no enforcement. Any authenticated (or trusted) session
-  may read any table. Existing deployments are unchanged.
+  may read any table. Existing deployments are unchanged. `GRANT` / `REVOKE`
+  are still accepted from **administrator** sessions (the control-plane DDL
+  gate applies in every mode) and **persisted** — but they are *dormant*:
+  every grant written under `open` takes effect, all at once, the moment
+  `mode` is switched to `"grant"`. The server logs a warning at boot when it
+  runs in `open` mode with persisted grants in the store, so persisted grants
+  are never mistaken for active authorization.
 - **`grant`** — **deny-unless-granted**. To read `catalog.schema.table`, a
   session must hold **both** `USAGE` on the catalog **and** `SELECT` on the
   table. Missing either, the query is rejected at plan time with `permission
@@ -105,17 +111,22 @@ Once a read is authorized, governance decides what the rows actually contain.
 Three enforcers, all plan-time, all in `crates/dataglot-policy/`:
 
 - **Column masks** (`mask.rs`) — the mask expression is substituted for a
-  matching column in every **output-reaching** position: the output projection,
-  **aggregate** arguments, and window functions. So `SELECT max(email)`
-  returns the mask, never cleartext (the aggregate operates on masked values).
-  Predicates, join keys, and sort keys are **not** masked: `Filter` (user `WHERE`
-  *and* admin row-filter RLS predicates) and `Join` keys keep their real values
-  — masking a governance predicate would silently break RLS and masking a join
-  key would break the join — and `Sort` orders by the real value (nothing is
-  emitted, so no cleartext leaks; `ORDER BY email` may therefore order by the
-  unmasked value). So `WHERE email = 'alice@…'` still finds Alice's row while the
-  projected `email` comes back masked. (Amended from the original
-  projection-only rule, which leaked PII through aggregates —.)
+  matching column **wherever it is accessed**: the output projection,
+  **aggregate** arguments, window functions, **and** predicates — user `WHERE`
+  / `LIKE`, join conditions, `ORDER BY` keys and predicates already pushed
+  into the source scan. So `SELECT max(email)` returns the mask, and
+  `WHERE email = 'alice@…'` or `LIKE 'alice%'` matches **nothing**: a masked
+  user cannot confirm, brute-force or join on a real value (the value oracle,
+  closed 2026-09). This is the Snowflake / BigQuery / Databricks
+  dynamic-data-masking semantic. One exception keeps RLS intact: the columns
+  referenced by the **admin row filter that applies to the session** are
+  exempt from *predicate* masking on that table, so `email LIKE
+  '%@corp.example'` as a row filter still evaluates on real data — and so
+  does a user predicate on that same column (an admin who filters on a column
+  has made it a governance key; another tenant's filter never opens this).
+  Output positions of such a column stay masked. Masks are applied on every
+  optimizer pass, so custom mask expressions should be idempotent (the
+  built-in kinds are).
 - **Row filters** (`filter.rs`) — a mandatory boolean predicate is baked into
   every scan of the target table. Predicate pushdown collapses it into the
   source scan where possible; where not, it is evaluated locally. Either way it

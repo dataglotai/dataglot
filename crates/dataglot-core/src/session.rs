@@ -555,7 +555,7 @@ mod tests {
         // object into the reserved writable schema and resolve it back.
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
         ctx.register_table(
-            datafusion::sql::TableReference::full(RUNTIME_CATALOG, RUNTIME_SCHEMA, "v"),
+            datafusion::common::TableReference::full(RUNTIME_CATALOG, RUNTIME_SCHEMA, "v"),
             Arc::new(EmptyTable::new(schema)),
         )
         .expect("register into reserved writable catalog");

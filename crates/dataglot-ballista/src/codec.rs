@@ -79,7 +79,9 @@ use ballista::datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRec
 use ballista::datafusion::common::{Result as DfResult, TableReference};
 use ballista::datafusion::error::DataFusionError;
 use ballista::datafusion::execution::TaskContext;
-use ballista::datafusion::logical_expr::{Expr, Extension, LogicalPlan, SubqueryAlias, TableScan};
+use ballista::datafusion::logical_expr::{
+    Expr, Extension, LogicalPlan, SubqueryAlias, TableScanBuilder,
+};
 use ballista_core::serde::BallistaLogicalExtensionCodec;
 use datafusion_federation::sql::{SQLFederationProvider, SQLTableSource};
 use datafusion_federation::{get_table_source, FederatedPlanNode, FederatedTableProviderAdaptor};
@@ -791,13 +793,16 @@ fn strip_federation_catalog_qualifiers(plan: LogicalPlan) -> DfResult<LogicalPla
         //      recompute below requalifies the aliased fields.
         let node = match node {
             LogicalPlan::TableScan(scan) => match reduce_catalog_ref(&scan.table_name) {
-                Some(reduced) => LogicalPlan::TableScan(TableScan::try_new(
-                    reduced,
-                    scan.source,
-                    scan.projection,
-                    scan.filters,
-                    scan.fetch,
-                )?),
+                Some(reduced) => LogicalPlan::TableScan(
+                    TableScanBuilder::new(reduced, scan.source)
+                        .with_projection(scan.projection)
+                        .with_filters(scan.filters)
+                        .with_fetch(scan.fetch)
+                        // Preserve DF 55's statistics requests (the deprecated
+                        // `TableScan::try_new` silently dropped them).
+                        .with_statistics_requests(scan.statistics_requests)
+                        .build()?,
+                ),
                 None => LogicalPlan::TableScan(scan),
             },
             LogicalPlan::SubqueryAlias(alias) => match reduce_catalog_ref(&alias.alias) {
@@ -1239,7 +1244,7 @@ mod tests {
     /// source that was never distributed-wired at all.
     #[test]
     fn unregistered_federated_provider_encodes_to_the_friendly_error() {
-        use ballista::datafusion::sql::TableReference;
+        use ballista::datafusion::common::TableReference;
         use datafusion_proto::logical_plan::LogicalExtensionCodec as _;
         use dataglot_federation::InMemoryConnectorRegistry;
 

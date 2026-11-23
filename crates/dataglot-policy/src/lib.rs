@@ -59,11 +59,11 @@
 use std::sync::Arc;
 
 use datafusion::common::tree_node::Transformed;
+use datafusion::common::TableReference;
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::{AnalyzerRule, OptimizerConfig, OptimizerRule};
-use datafusion::sql::TableReference;
 
 /// Candidate keys for matching a query's table reference against registered
 /// policy rules, ordered most- to least-qualified.
@@ -419,6 +419,41 @@ pub trait PolicyEnforcer: Send + Sync + std::fmt::Debug + 'static {
         let _ = (plan, identity);
         Vec::new()
     }
+
+    /// Does this layer inject admin row filters (statically or tag-derived)?
+    /// [`CompositeEnforcer`] hands every such layer to the masking layer so
+    /// RLS predicates keep evaluating on real data (see
+    /// [`ColumnMaskingEnforcer::with_row_filter_exemptions`]).
+    fn provides_rls_exemptions(&self) -> bool {
+        false
+    }
+
+    /// The columns of `table` that the row filters this layer would inject
+    /// for `identity` read — considering only filters whose target table is
+    /// in `scanned` (the alias-resolved tables the current plan scans), since
+    /// a filter that is not injected into this plan protects nothing here and
+    /// must not open a predicate on another table. `None` when the layer
+    /// injects no row filters.
+    fn rls_referenced_columns(
+        &self,
+        table: &TableReference,
+        identity: &Identity,
+        scanned: &std::collections::HashSet<TableReference>,
+    ) -> Option<std::collections::HashSet<String>> {
+        let _ = (table, identity, scanned);
+        None
+    }
+
+    /// A copy of this layer that consults `sources` for row-filter
+    /// exemptions, or `None` if the layer has no use for them. Implemented by
+    /// the masking enforcer.
+    fn with_rls_sources(
+        &self,
+        sources: Vec<Arc<dyn PolicyEnforcer>>,
+    ) -> Option<Arc<dyn PolicyEnforcer>> {
+        let _ = sources;
+        None
+    }
 }
 
 /// The `Arc<LogicalPlan>` embedded directly in a subquery-bearing `Expr`, for
@@ -506,58 +541,6 @@ where
         Expr::Exists(Exists { subquery, negated }) => Ok(rebuild(subquery, f)?
             .update_data(|subquery| Expr::Exists(Exists::new(subquery, negated)))),
         other => Ok(Transformed::no(other)),
-    }
-}
-
-/// Collect every qualified column reference in `plan` (for explain paths),
-/// **descending into subqueries embedded in expressions** (the four variants
-/// [`embedded_subquery`] enumerates) to any depth — which
-/// [`LogicalPlan::apply`] / [`datafusion::common::tree_node::TreeNode::apply`]
-/// would otherwise skip. This keeps `explain` consistent with `rewrite`: now
-/// that `mask` (and, via `try_for_each_table_scan`, `access_deny`) govern
-/// columns nested in a subquery, `explain` must *report* them too, or it
-/// under-reports a mask/denial that `rewrite` actually applies.
-///
-/// Duplicates are kept; callers dedup as needed. Correlated-subquery outer
-/// references are `Expr::OuterReferenceColumn` (not `Expr::Column`) and belong
-/// to the parent, so they are never collected here — matching the rewrite,
-/// which governs the subquery's own scans, not the outer refs.
-pub(crate) fn collect_plan_columns(plan: &LogicalPlan) -> Vec<datafusion::common::Column> {
-    let mut cols = Vec::new();
-    collect_plan_columns_into(plan, &mut cols);
-    cols
-}
-
-/// Recursive worker for [`collect_plan_columns`]. Nested subquery plans are
-/// gathered during the walk and recursed into afterwards (rather than inside
-/// the borrowing closure) so the `&mut cols` borrow stays single-threaded.
-fn collect_plan_columns_into(plan: &LogicalPlan, cols: &mut Vec<datafusion::common::Column>) {
-    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-    let mut nested: Vec<Arc<LogicalPlan>> = Vec::new();
-    if let Err(err) = plan.apply(|node| {
-        for expr in node.expressions() {
-            if let Err(err) = expr.apply(|e| {
-                if let datafusion::logical_expr::Expr::Column(c) = e {
-                    cols.push(c.clone());
-                } else if let Some(sub) = embedded_subquery(e) {
-                    // `Expr::apply` treats these as opaque, so queue the nested
-                    // plan for a separate recursive pass.
-                    nested.push(Arc::clone(sub));
-                }
-                Ok(TreeNodeRecursion::Continue)
-            }) {
-                // A per-expression traversal failure drops columns from
-                // the set that feeds the explain paths, silently
-                // under-reporting which columns a policy would mask/deny.
-                tracing::warn!(error = %err, "policy: expression traversal failed during column collection; explain may under-report enforcement");
-            }
-        }
-        Ok(TreeNodeRecursion::Continue)
-    }) {
-        tracing::warn!(error = %err, "policy: plan traversal failed during column collection; explain may under-report enforcement");
-    }
-    for sub in nested {
-        collect_plan_columns_into(&sub, cols);
     }
 }
 
@@ -656,8 +639,33 @@ impl CompositeEnforcer {
     /// Build a composite from a sequence of enforcers. The order of
     /// `inner` is the rewrite order at runtime; an empty `inner` is
     /// accepted and is observably identical to `NoopPolicyEnforcer`.
+    /// Compose `inner` in order. If one layer is a [`RowFilterEnforcer`], every
+    /// layer that can use it (the masking enforcer) is replaced by a copy that
+    /// knows about it — so composing masks with row filters never masks the
+    /// admin predicates, whatever order the caller chose.
     #[must_use]
     pub fn new(inner: Vec<Arc<dyn PolicyEnforcer>>) -> Self {
+        let sources: Vec<Arc<dyn PolicyEnforcer>> = inner
+            .iter()
+            .filter(|l| l.provides_rls_exemptions())
+            .cloned()
+            .collect();
+        let inner = if sources.is_empty() {
+            inner
+        } else {
+            inner
+                .into_iter()
+                .map(|l| {
+                    // A layer never needs itself as a source.
+                    let others: Vec<Arc<dyn PolicyEnforcer>> = sources
+                        .iter()
+                        .filter(|s| !Arc::ptr_eq(s, &l))
+                        .cloned()
+                        .collect();
+                    l.with_rls_sources(others).unwrap_or(l)
+                })
+                .collect()
+        };
         Self { inner }
     }
 
@@ -675,6 +683,46 @@ impl CompositeEnforcer {
 }
 
 impl PolicyEnforcer for CompositeEnforcer {
+    /// A composite provides exemptions when any nested layer does, so a
+    /// row-filter enforcer wrapped in an inner composite is still seen by a
+    /// mask in the outer one.
+    fn provides_rls_exemptions(&self) -> bool {
+        self.inner.iter().any(|l| l.provides_rls_exemptions())
+    }
+
+    fn rls_referenced_columns(
+        &self,
+        table: &TableReference,
+        identity: &Identity,
+        scanned: &std::collections::HashSet<TableReference>,
+    ) -> Option<std::collections::HashSet<String>> {
+        let sets: Vec<_> = self
+            .inner
+            .iter()
+            .filter_map(|l| l.rls_referenced_columns(table, identity, scanned))
+            .collect();
+        (!sets.is_empty()).then(|| sets.into_iter().flatten().collect())
+    }
+
+    fn with_rls_sources(
+        &self,
+        sources: Vec<Arc<dyn PolicyEnforcer>>,
+    ) -> Option<Arc<dyn PolicyEnforcer>> {
+        if sources.is_empty() {
+            return None;
+        }
+        // Forward the outer sources to every nested layer that can use them.
+        let inner = self
+            .inner
+            .iter()
+            .map(|l| {
+                l.with_rls_sources(sources.clone())
+                    .unwrap_or_else(|| Arc::clone(l))
+            })
+            .collect();
+        Some(Arc::new(Self { inner }))
+    }
+
     fn rewrite(
         &self,
         plan: datafusion::logical_expr::LogicalPlan,

@@ -95,7 +95,7 @@ and the rest) accepts an `Authorization: Bearer <token>` header:
 
 If a variable named here is unset or empty, the server refuses to start rather than serving `/api` without the token. `/metrics`, `/health`, `/lineage` and `/ui` are not covered. The dashboard doesn't send a token yet, so with `api_token_env` set its pages can't load data.
 
-```toml 
+```toml
 [observability]
 metrics_addr = "0.0.0.0:9090"
 api_token_env = "DATAGLOT_API_TOKEN"
@@ -199,16 +199,16 @@ driver = "pure"
 kind = "warehouse"
 catalog_url = "http://lakekeeper:8181/catalog"
 warehouse = "demo"
-s3_endpoint = "http://minio:9000"
+s3_endpoint = "http://rustfs:9000"
 s3_region = "us-east-1"
-credentials = { kind = "static", access_key_id = "minio", secret_access_key_env = "LAKEHOUSE_S3_SECRET" }
+credentials = { kind = "static", access_key_id = "dataglot-demo-access", secret_access_key_env = "LAKEHOUSE_S3_SECRET" }
 ```
 
 `catalog_url`, `warehouse`, `credentials` are required. `credentials.kind`
 is `"environment"` (standard AWS env vars) or `"static"`
 (`access_key_id` + exactly one of `secret_access_key` /
 `secret_access_key_env`). `s3_endpoint` targets S3-compatible stores
-(MinIO, RustFS); omit for AWS S3.
+(RustFS, MinIO, …); omit for AWS S3.
 
 ### `kind: "object_storage"` — query files directly
 
@@ -217,9 +217,9 @@ is `"environment"` (standard AWS env vars) or `"static"`
 kind = "object_storage"
 
 [catalogs.files.s3]
-endpoint = "http://minio:9000"
+endpoint = "http://rustfs:9000"
 region = "us-east-1"
-access_key_id = "minioadmin"
+access_key_id = "dataglot-demo-access"
 secret_access_key_env = "S3_SECRET"
 path_style_access = true
 
@@ -247,10 +247,10 @@ Each table becomes `<catalog>.<schema>.<name>` (schema defaults to `public`).
 - **Schemes:** `file://` always; `s3://` when the `[s3]` block is present.
   Globs work (`s3://lake/events/*.parquet`, `file:///data/part-*.parquet`).
 - **`[s3]` block:** omit `endpoint` for real AWS; set it for S3-compatibles
-  (MinIO, Cloudflare R2, …). `secret_access_key_env` names an env var holding
+  (RustFS, Cloudflare R2, …). `secret_access_key_env` names an env var holding
   the secret (preferred over inline `secret_access_key`, rule 12). Omit both to
   fall back to the ambient AWS credential chain (for public buckets, that's
-  fine). `path_style_access` defaults to `true` (MinIO / self-hosted); set
+  fine). `path_style_access` defaults to `true` (RustFS / self-hosted); set
   `false` for virtual-hosted AWS buckets. `region` defaults to `us-east-1`.
 - `gs://` and `abfs://` are not yet supported.
 
@@ -340,6 +340,71 @@ first query, cached, and refreshed before expiry.
 
 Like OData, REST is a direct `TableProvider` (rule 3) — it federates and is
 governed (masks / row-filters apply) exactly like a SQL source.
+
+### `kind: "flightsql"` — Arrow Flight SQL servers *(feature-gated: `flightsql-source`)*
+
+For any engine that speaks Arrow Flight SQL: Dremio, InfluxDB 3, Spark
+Connect-style gateways, another Dataglot, or a vendor driver wrapped in a
+sidecar. It is a SQL source like `adbc`, but reached over gRPC instead of by
+loading a driver, so it needs no native library on the host.
+
+```toml
+[catalogs.lakehouse]
+kind = "flightsql"
+endpoint = "grpc+tls://dremio.internal:32010"
+# Dremio: there is no DataFusion unparser dialect for it, and `dialect =
+# "dremio"` is refused with a message saying so. PostgreSQL is the closest
+# supported spelling.
+dialect = "postgresql"
+auth = "basic"
+username = "svc_dataglot"
+password_env = "LAKEHOUSE_PASSWORD"
+handshake = true
+schema = "analytics"
+```
+
+`endpoint` takes `grpc://`, `grpc+tcp://` or `http://` for plaintext and
+`grpc+tls://` or `https://` for TLS. Credentials never go in the URI — one
+carrying userinfo is refused when the connector is built. Any userinfo is
+stripped from logs and from the catalog binding regardless, so a misconfigured
+endpoint does not leak before that check runs.
+
+`dialect` is mandatory and names the SQL the *remote* engine speaks, which is
+what pushdown is unparsed into: `datafusion` (another Dataglot, InfluxDB 3,
+Sail, ROAPI), `postgresql`, `mysql`, `sqlite`, `duckdb`, or `bigquery`.
+
+`auth` is `none` (default), `basic` (needs `username` and `password_env`), or
+`bearer` (needs `token_env`). With `handshake = true` the Basic credential is
+exchanged once at connect for whatever bearer token the server issues, instead
+of sending Basic on every call.
+
+Optional: `tls_ca_file` and `tls_domain` for a private CA or an SNI override;
+`schema` to scope discovery, and `catalog` too — but only for the dialects
+that have a three-part namespace: `datafusion`, `duckdb` and `bigquery`. With
+`postgresql`, `mysql` or `sqlite` a reference cannot carry a catalog, so
+setting one is refused rather than silently dropped; use `schema` alone there.
+Also: `connect_timeout_secs` (default 10)
+and `request_timeout_secs`, the latter doubling as the inactivity deadline on a
+result stream, so a server that answers and then stalls is caught by the same
+number.
+
+`follow_endpoint_locations` is off by default and should usually stay off. A
+Flight SQL server may answer a query by pointing at *other hosts* to fetch the
+results from; following one sends this catalog's credentials wherever the
+remote nominates, so Dataglot refuses by default and names the setting in the
+error. Turn it on only for a cluster you control.
+
+Set `catalog` when the tables you want are not in the server's default catalog.
+Without it, references are two-part (`schema.table`) and resolve against
+whatever the server defaults to. Dataglot never guesses: if discovery finds
+tables spanning more than one catalog it refuses to list them and tells you to
+set this.
+
+> **Not the `[flight_sql]` block.** That section configures the Flight SQL
+> listener Dataglot *exposes* to clients, and is gated behind the similarly
+> named `flight_sql` feature. This is the opposite direction — a Flight SQL
+> server Dataglot *reads* — and needs `flightsql-source`. Building with one
+> does not enable the other.
 
 ## Governance and policy
 
@@ -711,6 +776,8 @@ The connectors the *server* leaves opt-in:
 | Server Cargo feature | Unlocks |
 |---|---|
 | `adbc` | `kind: "adbc"` (bring-your-own ADBC driver) |
+| `flightsql-source` | `kind: "flightsql"` (read from a remote Flight SQL server) |
+| `flight_sql` | the `[flight_sql]` block — *serve* Flight SQL to clients (the opposite direction to `flightsql-source`) |
 | `oracle` / `oracle-pure` | `kind: "oracle"` catalogs (OCI / pure-Rust backend) |
 | `ballista` | the `ballista` config block (distributed execution) |
 | `dashboard` | the operational dashboard at `/ui` (shipped in stock release binaries + the container image; off for a bare `cargo build` — add `--features dashboard` locally — ) |
