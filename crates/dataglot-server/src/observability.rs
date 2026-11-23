@@ -798,15 +798,16 @@ async fn cluster_dot_handler(
     }
 }
 
-/// `GET /api/connectors` — configured connectors (kind + boot registration
-/// status) plus the supported families that are available but not configured
-///. No credentials (rule 12).
+/// `GET /api/connectors` — configured and runtime connectors (kind + boot
+/// registration status) plus the supported families that are available but not
+/// configured. No credentials (rule 12).
 async fn connectors_handler(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.connectors.view())
+    Json(state.connectors.view().await)
 }
 
 /// `POST /api/connectors/{name}/probe` — on-demand liveness for one connector
-/// (a fresh connect under a timeout). 404 when `name` isn't configured.
+/// (a fresh connect under a timeout). 404 when `name` is neither configured
+/// nor a runtime catalog.
 async fn connector_probe_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,

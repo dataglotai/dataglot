@@ -164,6 +164,10 @@ pub struct DataglotServer {
     /// dashboard view (`GET /api/control-plane`, ). `Some` exactly when a
     /// `catalog_service` is configured (a clone of the slice-C `ddl_store`).
     control_plane_store: Option<Arc<dyn MetaStore>>,
+    /// Resolves `*_secret` catalog options against the meta store. `Some` when
+    /// both a `catalog_service` and `DATAGLOT_SECRET_KEY` are configured. Shared
+    /// by catalog DDL and the dashboard's runtime-catalog probe.
+    secret_resolver: Option<Arc<dyn crate::config::SecretResolver>>,
     /// SQL-native catalog-DDL executor. `Some` when a
     /// `catalog_service` is configured — it holds the same meta-store handle
     /// the live registry refreshes from, so a `CREATE / ALTER / DROP CATALOG`
@@ -734,16 +738,21 @@ impl DataglotServer {
             .as_ref()
             .map_or_else(|| "default".to_string(), |c| c.org_id().to_string());
 
+        let secret_resolver: Option<Arc<dyn crate::config::SecretResolver>> =
+            match (&ddl_store, &secret_cipher) {
+                (Some(store), Some(cipher)) => {
+                    Some(Arc::new(crate::secret_admin::StoreSecretResolver::new(
+                        Arc::clone(store),
+                        Arc::clone(cipher),
+                    )))
+                }
+                _ => None,
+            };
         let catalog_admin: Option<Arc<dyn dataglot_pgwire::catalog_admin::CatalogAdmin>> =
             ddl_store.as_ref().map(|store| {
                 let mut admin = crate::catalog_admin::StoreCatalogAdmin::new(Arc::clone(store));
-                if let Some(cipher) = &secret_cipher {
-                    let resolver: Arc<dyn crate::config::SecretResolver> =
-                        Arc::new(crate::secret_admin::StoreSecretResolver::new(
-                            Arc::clone(store),
-                            Arc::clone(cipher),
-                        ));
-                    admin = admin.with_secret_resolver(resolver);
+                if let Some(resolver) = &secret_resolver {
+                    admin = admin.with_secret_resolver(Arc::clone(resolver));
                 }
                 Arc::new(admin) as Arc<dyn dataglot_pgwire::catalog_admin::CatalogAdmin>
             });
@@ -1177,6 +1186,7 @@ impl DataglotServer {
             live_catalogs,
             boot_org,
             control_plane_store: ddl_store.clone(),
+            secret_resolver,
             catalog_admin,
             secret_admin,
             user_admin,
@@ -1274,6 +1284,7 @@ impl DataglotServer {
             live_catalogs: None,
             boot_org: "default".to_string(),
             control_plane_store: None,
+            secret_resolver: None,
             catalog_admin: None,
             secret_admin: None,
             user_admin: None,
@@ -1814,13 +1825,22 @@ impl DataglotServer {
                 let server_info = self.server_info();
                 //  — configured connectors + which registered at boot,
                 // for the dashboard Connectors tab + on-demand liveness probe.
-                let connectors = crate::connectors::ConnectorMonitor::new(
+                let mut connectors = crate::connectors::ConnectorMonitor::new(
                     Arc::new(self.config.catalogs.clone()),
                     Arc::new(self.catalogs.keys().cloned().collect()),
                     //: reuse the boot-built connectors for cheap liveness
                     // probes instead of rebuilding on every poll tick.
                     Arc::clone(&self.health_handles),
                 );
+                // Catalogs created with `CREATE CATALOG` show up too, from the
+                // same store and org as the Control Plane view.
+                if let Some(store) = &self.control_plane_store {
+                    connectors = connectors.with_runtime_catalogs(
+                        Arc::clone(store),
+                        self.boot_org.clone(),
+                        self.secret_resolver.clone(),
+                    );
+                }
                 //  continuous mode — a background poller refreshes each
                 // source's liveness, feeding both the dashboard Connectors tab
                 // (via the shared health cache in `connectors`) and the
