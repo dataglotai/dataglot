@@ -30,10 +30,10 @@ RUN npm ci && npm run build
 
 # Stage 1: Build environment
 #
-# Pinned to `rust:1.94-bookworm` (the workspace MSRV). The builder image never
+# Pinned to `rust:1.95-bookworm` (the workspace MSRV). The builder image never
 # ships to production; only the binary it produces moves into the runtime
 # stage below.
-FROM rust:1.94-bookworm AS builder
+FROM rust:1.95-bookworm AS builder
 
 WORKDIR /build
 

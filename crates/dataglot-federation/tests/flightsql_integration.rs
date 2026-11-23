@@ -104,7 +104,7 @@ use datafusion::prelude::{SessionConfig as DfSessionConfig, SessionContext};
 use dataglot_federation::flightsql::{
     FlightSqlAuth, FlightSqlConfig, FlightSqlConnector, FlightSqlDialect,
 };
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt as _, TryStreamExt};
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -126,9 +126,9 @@ enum Metadata {
 struct TestServer {
     ctx: Arc<SessionContext>,
     metadata: Metadata,
-    /// Advertised on every endpoint when set, to exercise the
+    /// Advertised, in order, on every endpoint, to exercise the
     /// foreign-location policy.
-    advertise_location: Option<String>,
+    advertise_locations: Vec<String>,
     /// Answer every `GetFlightInfo` with a ticket-less endpoint.
     drop_tickets: bool,
     /// Advertise the result across this many endpoints (all redeeming the
@@ -154,6 +154,18 @@ struct TestServer {
     /// The one bearer token currently accepted. A test sets it to `None` to
     /// expire the token the connector holds.
     valid_token: Arc<Mutex<Option<String>>>,
+    /// While set, the handshake sends its headers (token included) and then
+    /// never finishes the response body — a stalled handshake.
+    stall_handshake: Arc<std::sync::atomic::AtomicBool>,
+    /// One-shot: the next `GetFlightInfo` is authorised and then expires the
+    /// token, so the `DoGet` that follows is the first RPC to be refused.
+    expire_after_plan: Arc<std::sync::atomic::AtomicBool>,
+    /// Report a refused `DoGet` *inside* the stream (after the response
+    /// headers) instead of as the call's status.
+    unauthenticated_in_stream: Arc<std::sync::atomic::AtomicBool>,
+    /// One-shot: the next `DoGet` delivers its rows and then fails with
+    /// `Unauthenticated` as a later stream item.
+    unauthenticated_after_rows: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TestServer {
@@ -210,7 +222,7 @@ impl TestServer {
         Self {
             ctx: Arc::new(ctx),
             metadata,
-            advertise_location: None,
+            advertise_locations: Vec::new(),
             drop_tickets: false,
             endpoints: 1,
             ordered: false,
@@ -220,6 +232,10 @@ impl TestServer {
             issue_tokens: false,
             issued_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             valid_token: Arc::new(Mutex::new(None)),
+            stall_handshake: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            expire_after_plan: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            unauthenticated_in_stream: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            unauthenticated_after_rows: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -251,11 +267,11 @@ impl TestServer {
         if self.drop_tickets {
             return FlightEndpoint::new();
         }
-        let endpoint = FlightEndpoint::new().with_ticket(ticket);
-        match &self.advertise_location {
-            Some(uri) => endpoint.with_location(uri.clone()),
-            None => endpoint,
-        }
+        self.advertise_locations
+            .iter()
+            .fold(FlightEndpoint::new().with_ticket(ticket), |e, uri| {
+                e.with_location(uri.clone())
+            })
     }
 
     /// Plan `sql` and answer with its schema plus a ticket carrying the SQL.
@@ -318,6 +334,12 @@ impl FlightSqlService for TestServer {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         self.record_auth(&request)?;
+        if self
+            .expire_after_plan
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            *self.valid_token.lock().expect("token lock") = None;
+        }
         self.seen_sql
             .lock()
             .expect("sql lock")
@@ -330,12 +352,35 @@ impl FlightSqlService for TestServer {
         ticket: TicketStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        self.record_auth(&request)?;
+        if let Err(status) = self.record_auth(&request) {
+            if !self
+                .unauthenticated_in_stream
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(status);
+            }
+            // Headers first, then the refusal as the first stream item.
+            let refused: <Self as FlightService>::DoGetStream =
+                Box::pin(futures::stream::iter(vec![Err(status)]));
+            return Ok(Response::new(refused));
+        }
         self.served_tickets
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let sql = String::from_utf8(ticket.statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("ticket is not UTF-8 SQL"))?;
-        self.stream_sql(&sql).await
+        let response = self.stream_sql(&sql).await?;
+        if !self
+            .unauthenticated_after_rows
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(response);
+        }
+        let rows = response.into_inner();
+        let refused = futures::stream::iter(vec![Err(Status::unauthenticated(
+            "bearer token expired mid-stream",
+        ))]);
+        let stream: <Self as FlightService>::DoGetStream = Box::pin(rows.chain(refused));
+        Ok(Response::new(stream))
     }
 
     async fn get_flight_info_tables(
@@ -386,11 +431,18 @@ impl FlightSqlService for TestServer {
             + 1;
         let token = format!("tok-{n}");
         *self.valid_token.lock().expect("token lock") = Some(token.clone());
-        let output: Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>> =
-            Box::pin(futures::stream::iter(vec![Ok(HandshakeResponse {
-                protocol_version: 0,
-                payload: prost::bytes::Bytes::default(),
-            })]));
+        let body = futures::stream::iter(vec![Ok(HandshakeResponse {
+            protocol_version: 0,
+            payload: prost::bytes::Bytes::default(),
+        })]);
+        let output: Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>> = if self
+            .stall_handshake
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            Box::pin(body.chain(futures::stream::pending()))
+        } else {
+            Box::pin(body)
+        };
         let mut response = Response::new(output);
         response.metadata_mut().insert(
             "authorization",
@@ -1011,7 +1063,7 @@ async fn a_credential_reflected_into_an_advertised_location_is_redacted() {
     let fx = Fixture::start(|_| {
         let mut fixture = TestServer::new(Metadata::GetTables);
         // The password, echoed back as the host of the result location.
-        fixture.advertise_location = Some("grpc://Hunter2:32010".to_string());
+        fixture.advertise_locations = vec!["grpc://Hunter2:32010".to_string()];
         fixture
     })
     .await;
@@ -1053,7 +1105,7 @@ async fn a_foreign_endpoint_location_is_refused_by_default() {
     let _env = env_read().await;
     let fx = Fixture::start(|_| {
         let mut fixture = TestServer::new(Metadata::GetTables);
-        fixture.advertise_location = Some("grpc://elsewhere.invalid:32010".to_string());
+        fixture.advertise_locations = vec!["grpc://elsewhere.invalid:32010".to_string()];
         fixture
     })
     .await;
@@ -1086,7 +1138,7 @@ async fn an_endpoint_location_naming_the_configured_server_is_followed() {
     let fx = Fixture::start(|uri| {
         let mut fixture = TestServer::new(Metadata::GetTables);
         // The address this server is about to listen on.
-        fixture.advertise_location = Some(uri.to_string());
+        fixture.advertise_locations = vec![uri.to_string()];
         fixture
     })
     .await;
@@ -1272,7 +1324,7 @@ async fn an_opted_in_foreign_location_is_dialled_and_its_ticket_redeemed() {
         let holder_uri = holder.uri.clone();
         move |_| {
             let mut fixture = TestServer::new(Metadata::GetTables);
-            fixture.advertise_location = Some(holder_uri);
+            fixture.advertise_locations = vec![holder_uri];
             fixture
         }
     })
@@ -1328,7 +1380,7 @@ async fn the_same_topology_is_refused_without_the_opt_in() {
         let holder_uri = holder.uri.clone();
         move |_| {
             let mut fixture = TestServer::new(Metadata::GetTables);
-            fixture.advertise_location = Some(holder_uri);
+            fixture.advertise_locations = vec![holder_uri];
             fixture
         }
     })
@@ -1397,7 +1449,7 @@ async fn an_opted_in_plaintext_location_is_refused_when_credentials_are_configur
 
     let fx = Fixture::start(|_| {
         let mut fixture = TestServer::new(Metadata::GetTables);
-        fixture.advertise_location = Some("grpc://replica.invalid:32010".to_string());
+        fixture.advertise_locations = vec!["grpc://replica.invalid:32010".to_string()];
         fixture
     })
     .await;
@@ -1526,5 +1578,256 @@ async fn a_failed_schema_probe_does_not_echo_a_credential_in_the_table_name() {
     assert!(
         err.contains("resolving the schema"),
         "still actionable: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2: location choice, bounded handshakes, in-stream expiry
+// ---------------------------------------------------------------------------
+
+/// A Basic-credentialed config against `uri` with handshake mode on.
+fn handshake_config(uri: &str, password_var: &str) -> FlightSqlConfig {
+    let mut config = FlightSqlConfig::new("flight", uri, FlightSqlDialect::DataFusion);
+    config.auth = FlightSqlAuth::Basic {
+        username: "svc".to_string(),
+        password_env: password_var.to_string(),
+    };
+    config.handshake = true;
+    config
+}
+
+/// A server may advertise several locations for one ticket, any of which
+/// redeems it. A plaintext remote listed first must not get the whole ticket
+/// refused while a location the credential policy permits (here: loopback)
+/// is listed after it.
+#[tokio::test]
+async fn a_refused_plaintext_location_does_not_shadow_a_permitted_one() {
+    const PASSWORD_VAR: &str = "DATAGLOT_TEST_FLIGHTSQL_LOCATION_CHOICE";
+    let _env = env_write().await;
+    let _var = EnvVar::set(PASSWORD_VAR, "hunter2");
+
+    let holder = Fixture::with(Metadata::GetTables).await;
+    let planner = Fixture::start({
+        let holder_uri = holder.uri.clone();
+        move |_| {
+            let mut fixture = TestServer::new(Metadata::GetTables);
+            fixture.advertise_locations =
+                vec!["grpc://replica.invalid:32010".to_string(), holder_uri];
+            fixture
+        }
+    })
+    .await;
+    let mut config = FlightSqlConfig::new("flight", &planner.uri, FlightSqlDialect::DataFusion);
+    config.follow_endpoint_locations = true;
+    config.auth = FlightSqlAuth::Basic {
+        username: "svc".to_string(),
+        password_env: PASSWORD_VAR.to_string(),
+    };
+    let connector = Arc::new(
+        FlightSqlConnector::connect(config)
+            .await
+            .expect("connector connects"),
+    );
+    let ctx = federated_ctx(&connector).await;
+    let batches = ctx
+        .sql("SELECT id FROM users")
+        .await
+        .expect("plans")
+        .collect()
+        .await
+        .expect("the permitted location is chosen");
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
+    let tickets = |f: &Fixture| {
+        f.server
+            .served_tickets
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+    assert!(
+        tickets(&holder) > 0,
+        "the loopback holder served the ticket"
+    );
+    assert_eq!(tickets(&planner), 0);
+}
+
+/// A handshake that sends its headers and then never finishes the body is
+/// not covered by the tonic request timeout, which bounds only the headers.
+/// With `request_timeout_secs` set, `connect` gives up instead of hanging.
+#[tokio::test]
+async fn a_stalled_connect_handshake_is_bounded_by_the_request_timeout() {
+    const PASSWORD_VAR: &str = "DATAGLOT_TEST_FLIGHTSQL_STALLED_CONNECT";
+    let _env = env_write().await;
+    let _var = EnvVar::set(PASSWORD_VAR, "hunter2");
+
+    let fx = Fixture::start(|_| {
+        let mut fixture = TestServer::new(Metadata::GetTables);
+        fixture.issue_tokens = true;
+        fixture
+            .stall_handshake
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        fixture
+    })
+    .await;
+    let mut config = handshake_config(&fx.uri, PASSWORD_VAR);
+    config.request_timeout_secs = Some(1);
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        FlightSqlConnector::connect(config),
+    )
+    .await
+    .expect("connect must not hang on a stalled handshake")
+    .expect_err("a handshake that never completes fails connect")
+    .to_string();
+    assert!(err.contains("request_timeout_secs"), "{err}");
+    assert!(!err.contains("hunter2"), "{err}");
+}
+
+/// The same stall during *renewal* holds the renewal lock. It is bounded,
+/// reported without a credential, and releases the lock so a later request
+/// renews successfully.
+#[tokio::test]
+async fn a_stalled_renewal_handshake_times_out_and_releases_the_lock() {
+    const PASSWORD_VAR: &str = "DATAGLOT_TEST_FLIGHTSQL_STALLED_RENEWAL";
+    let _env = env_write().await;
+    let _var = EnvVar::set(PASSWORD_VAR, "hunter2");
+
+    let fx = Fixture::start(|_| {
+        let mut fixture = TestServer::new(Metadata::GetTables);
+        fixture.issue_tokens = true;
+        fixture
+    })
+    .await;
+    let mut config = handshake_config(&fx.uri, PASSWORD_VAR);
+    config.request_timeout_secs = Some(1);
+    let connector = Arc::new(
+        FlightSqlConnector::connect(config)
+            .await
+            .expect("connector connects and handshakes"),
+    );
+    let ctx = federated_ctx(&connector).await;
+    let run = || async {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            ctx.sql("SELECT id FROM users")
+                .await
+                .expect("plans")
+                .collect()
+                .await
+        })
+        .await
+        .expect("a stalled renewal must not hang the query")
+    };
+
+    fx.server
+        .stall_handshake
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    *fx.server.valid_token.lock().unwrap() = None;
+    let err = run()
+        .await
+        .expect_err("renewal cannot complete")
+        .to_string();
+    assert!(err.contains("request_timeout_secs"), "{err}");
+    assert!(!err.contains("hunter2"), "{err}");
+
+    // The lock was released: once the server answers again, renewal works.
+    fx.server
+        .stall_handshake
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    *fx.server.valid_token.lock().unwrap() = None;
+    let batches = run().await.expect("a later request renews the token");
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
+}
+
+/// A server can answer `DoGet` with headers and report the expired token as
+/// the first stream item. No row has been delivered, so the token is renewed
+/// and the fetch retried, exactly as for a refusal in the call status.
+#[tokio::test]
+async fn an_in_stream_expiry_before_any_row_is_renewed_and_retried() {
+    const PASSWORD_VAR: &str = "DATAGLOT_TEST_FLIGHTSQL_IN_STREAM_EXPIRY";
+    let _env = env_write().await;
+    let _var = EnvVar::set(PASSWORD_VAR, "hunter2");
+
+    let fx = Fixture::start(|_| {
+        let mut fixture = TestServer::new(Metadata::GetTables);
+        fixture.issue_tokens = true;
+        fixture
+            .unauthenticated_in_stream
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        fixture
+    })
+    .await;
+    let connector = Arc::new(
+        FlightSqlConnector::connect(handshake_config(&fx.uri, PASSWORD_VAR))
+            .await
+            .expect("connector connects and handshakes"),
+    );
+    let issued = || {
+        fx.server
+            .issued_tokens
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+    let ctx = federated_ctx(&connector).await;
+    let run = || async {
+        ctx.sql("SELECT id FROM users")
+            .await
+            .expect("plans")
+            .collect()
+            .await
+    };
+    let rows = |b: &[RecordBatch]| b.iter().map(RecordBatch::num_rows).sum::<usize>();
+    assert_eq!(rows(&run().await.expect("the issued token works")), 4);
+    assert_eq!(issued(), 1);
+
+    // Planning succeeds on the old token; the fetch is the first refusal.
+    fx.server
+        .expire_after_plan
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(rows(&run().await.expect("renewed and retried")), 4);
+    assert_eq!(issued(), 2, "exactly one re-handshake");
+}
+
+/// Once rows have been delivered, an in-stream `Unauthenticated` is an error:
+/// replaying the ticket would deliver those rows twice.
+#[tokio::test]
+async fn an_in_stream_expiry_after_rows_is_not_replayed() {
+    const PASSWORD_VAR: &str = "DATAGLOT_TEST_FLIGHTSQL_MID_STREAM_EXPIRY";
+    let _env = env_write().await;
+    let _var = EnvVar::set(PASSWORD_VAR, "hunter2");
+
+    let fx = Fixture::start(|_| {
+        let mut fixture = TestServer::new(Metadata::GetTables);
+        fixture.issue_tokens = true;
+        fixture
+    })
+    .await;
+    let connector = Arc::new(
+        FlightSqlConnector::connect(handshake_config(&fx.uri, PASSWORD_VAR))
+            .await
+            .expect("connector connects and handshakes"),
+    );
+    let ctx = federated_ctx(&connector).await;
+    let served = || {
+        fx.server
+            .served_tickets
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+    let before = served();
+    fx.server
+        .unauthenticated_after_rows
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = ctx
+        .sql("SELECT id FROM users")
+        .await
+        .expect("plans")
+        .collect()
+        .await
+        .expect_err("a refusal after rows fails the query")
+        .to_string();
+    assert!(err.contains("expired mid-stream"), "{err}");
+    assert_eq!(served() - before, 1, "the ticket was redeemed once");
+    assert_eq!(
+        fx.server
+            .issued_tokens
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "no renewal-and-replay after rows"
     );
 }

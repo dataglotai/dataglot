@@ -1454,10 +1454,30 @@ fn keyless_join_beneath(plan: &LogicalPlan) -> Option<&Join> {
 /// The single input of `node` whose output still carries column `c`
 /// unchanged — the pass-through case of every wrapper (filter, sort, limit,
 /// distinct, a window's input columns, …).
+///
+/// An `Unnest` passes through every column except the ones it expands: an
+/// unnested column keeps its name but not its values (one list becomes many
+/// elements), so the input's definition of it — a literal `[2, 1] AS x`, say
+/// — no longer describes it. Columns it merely carries along still do. A
+/// carried `b.x` beside an expanded `a.x` is told apart by its qualifier;
+/// when either side is unqualified the walk stops (conservative: the key is
+/// then masked in place rather than traced).
 fn passthrough_input<'a>(
     node: &'a LogicalPlan,
     c: &datafusion::common::Column,
 ) -> Option<&'a LogicalPlan> {
+    if let LogicalPlan::Unnest(u) = node {
+        let expanded = u.exec_columns.iter().any(|e| {
+            e.name == c.name
+                && match (&e.relation, &c.relation) {
+                    (Some(a), Some(b)) => a.resolved_eq(b),
+                    _ => true,
+                }
+        });
+        if expanded {
+            return None;
+        }
+    }
     match node.inputs().as_slice() {
         [only] if only.schema().index_of_column(c).is_ok() => Some(only),
         _ => None,
@@ -1494,6 +1514,19 @@ fn base_sides(c: &datafusion::common::Column, input: &LogicalPlan) -> Sides {
                 Err(_) => Sides::NONE,
             }
         }
+        // Unnesting changes a column's values (and its name: `…,depth=1`) but
+        // not which join input produced them: follow every output field —
+        // expanded or carried — to the input field it derives from.
+        LogicalPlan::Unnest(u) => match u.schema.index_of_column(c) {
+            Ok(idx) => match u.dependency_indices.get(idx) {
+                Some(&dep) => {
+                    let (q, f) = u.input.schema().qualified_field(dep);
+                    base_sides(&datafusion::common::Column::from((q, f)), &u.input)
+                }
+                None => Sides::NONE,
+            },
+            Err(_) => Sides::NONE,
+        },
         other => match passthrough_input(other, c) {
             Some(inner) => base_sides(c, inner),
             None => Sides::NONE,
@@ -4742,6 +4775,105 @@ mod tests {
         );
     }
 
+    /// `Unnest(x)` keeps the column name of a literal `[2, 1] AS x` but emits
+    /// two distinct values, so the sort key over it is NOT a constant to drop:
+    /// with an unrelated mask configured, ascending top-one is still `1`.
+    #[tokio::test]
+    async fn sort_key_over_an_unnested_literal_list_is_kept() {
+        use datafusion::common::ScalarValue;
+        use datafusion::logical_expr::{col, lit, LogicalPlanBuilder};
+
+        let (ctx, users) = ctx_with_users();
+        // Unrelated mask: it only makes the rewrite run.
+        let enforcer = ColumnMaskingEnforcer::new([mask_id_mod3(&users)]).expect("build");
+        // A literal list, as `make_array(2, 1)` becomes after constant folding
+        // on an earlier optimizer pass.
+        let list = ScalarValue::List(ScalarValue::new_list(
+            &[ScalarValue::Int32(Some(2)), ScalarValue::Int32(Some(1))],
+            &DataType::Int32,
+            true,
+        ));
+        let plan = LogicalPlanBuilder::empty(true)
+            .project(vec![lit(list).alias("x")])
+            .unwrap()
+            .unnest_column("x")
+            .unwrap()
+            .sort(vec![col("x").sort(true, false)])
+            .unwrap()
+            .limit(0, Some(1))
+            .unwrap()
+            .build()
+            .unwrap();
+        let out = enforcer
+            .rewrite(plan, &crate::Identity::anonymous())
+            .expect("rewrite")
+            .data;
+        let rows = execute_plan(&ctx, out).await;
+        assert_eq!(rows, vec![vec!["1".to_string()]], "sort key kept");
+    }
+
+    /// A column an `Unnest` only CARRIES (not one it expands) still traces back
+    /// to the masked projection beneath it, so a sort on it orders by the
+    /// displayed mask value — not by the mask applied a second time.
+    #[tokio::test]
+    async fn sort_key_carried_through_unnest_is_not_masked_twice() {
+        use datafusion::common::ScalarValue;
+        use datafusion::logical_expr::{col, lit};
+
+        let (ctx, users) = ctx_with_users();
+        let enforcer = ColumnMaskingEnforcer::new([mask_id_mod3(&users)]).expect("build");
+        let list = ScalarValue::List(ScalarValue::new_list(
+            &[ScalarValue::Int32(Some(2)), ScalarValue::Int32(Some(1))],
+            &DataType::Int32,
+            true,
+        ));
+        let plan = ctx
+            .table("users")
+            .await
+            .unwrap()
+            .select(vec![col("id"), lit(list).alias("x")])
+            .unwrap()
+            .unnest_columns(&["x"])
+            .unwrap()
+            .sort(vec![col("id").sort(true, false)])
+            .unwrap()
+            .limit(0, Some(1))
+            .unwrap()
+            .logical_plan()
+            .clone();
+        let out = enforcer
+            .rewrite(plan, &crate::Identity::anonymous())
+            .expect("rewrite")
+            .data;
+        let rows = execute_plan(&ctx, out).await;
+        // Displayed (masked) ids: alice 2, bob 3, carol 1 — the minimum is 1.
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0][0], "1", "sorted by the displayed id: {rows:?}");
+    }
+
+    /// An `Unnest` changes an expanded column's values but not which join input
+    /// produced them: `x.ve` (unnested from `v`) still relates `v` to `u`, so
+    /// once masking makes `x.ue` a constant the filter no longer pairs the
+    /// inputs and the cross-product guard must refuse it.
+    #[tokio::test]
+    async fn cross_join_relation_traced_through_an_expanded_unnest_column_is_guarded() {
+        let (ctx, users) = ctx_with_users();
+        let enforcer = ColumnMaskingEnforcer::new([mask_email_literal(&users)]).expect("build");
+        let plan = ctx
+            .sql(
+                "SELECT * FROM (SELECT u.email AS ue, unnest(make_array(v.email)) AS ve \
+                 FROM users u CROSS JOIN users v) x WHERE x.ue = x.ve",
+            )
+            .await
+            .expect("plan")
+            .logical_plan()
+            .clone();
+        let err = enforcer
+            .rewrite(plan, &crate::Identity::anonymous())
+            .expect_err("an unnested column must not hide its join side from the guard");
+        assert!(err.to_string().contains("masked column"), "{err}");
+    }
+
     /// `INTERSECT` plans as a semi join whose keys compare NULL-safely. Keys
     /// that both mask to a typed NULL literal are TRUE under that comparison
     /// (dropped), not a NULL filter that empties the result.
@@ -4901,22 +5033,32 @@ mod tests {
                     .build();
                 let session = SessionContext::new_with_state(state);
                 let result = match session.sql("SELECT id FROM users").await {
-                    Ok(df) => df
-                        .collect()
-                        .await
-                        .map(|b| b.iter().map(RecordBatch::num_rows).sum::<usize>()),
+                    Ok(df) => df.collect().await.map(|batches| {
+                        batches
+                            .iter()
+                            .flat_map(|b| {
+                                b.column(0)
+                                    .as_any()
+                                    .downcast_ref::<Int32Array>()
+                                    .expect("id is Int32")
+                                    .iter()
+                                    .flatten()
+                                    .collect::<Vec<i32>>()
+                            })
+                            .collect::<Vec<i32>>()
+                    }),
                     Err(e) => Err(e),
                 };
                 // Either the plan is refused, or the row filter ran on the REAL
-                // threshold (2): exactly one row (`id = 1`). Never the three
-                // rows the masked threshold (100) would admit.
+                // threshold (2): exactly `id = 1` survives. Never any id the
+                // masked threshold (100) would admit.
                 match result {
                     Err(err) => assert!(
                         err.to_string().contains("row filter"),
                         "first={first}: {err}"
                     ),
-                    Ok(rows) => {
-                        assert_eq!(rows, 1, "first={first}: the row filter was bypassed");
+                    Ok(ids) => {
+                        assert_eq!(ids, vec![1], "first={first}: the row filter was bypassed");
                     }
                 }
             }

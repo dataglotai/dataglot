@@ -773,11 +773,25 @@ fn is_reuse_sentinel(uri: &str) -> bool {
         .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case(REUSE_CONNECTION_SCHEME))
 }
 
-fn route_for(locations: &[String], ours: Option<&Transport>) -> Result<TicketRoute, String> {
+/// Choose where to redeem one endpoint's ticket.
+///
+/// Any listed location redeems the ticket, so the choice is ours: the
+/// connection already held wins outright; otherwise the first foreign
+/// location the plaintext-credential rule permits for `credentialed`
+/// ([`refuse_plaintext_credentials`]). Only when no foreign location is
+/// permitted is the first one returned, for the caller to refuse with the
+/// policy error — a plaintext replica listed first must not get the ticket
+/// refused while a permitted alternative follows it.
+fn route_for(
+    locations: &[String],
+    ours: Option<&Transport>,
+    credentialed: bool,
+) -> Result<TicketRoute, String> {
     if locations.is_empty() {
         return Ok(TicketRoute::SameChannel);
     }
     let mut foreign: Option<Transport> = None;
+    let mut permitted: Option<Transport> = None;
     let mut first_error: Option<String> = None;
     for uri in locations {
         let uri = uri.trim();
@@ -790,6 +804,11 @@ fn route_for(locations: &[String], ours: Option<&Transport>) -> Result<TicketRou
                     return Ok(TicketRoute::SameChannel);
                 }
 
+                if permitted.is_none()
+                    && refuse_plaintext_credentials(&transport, credentialed).is_ok()
+                {
+                    permitted = Some(transport.clone());
+                }
                 if foreign.is_none() {
                     foreign = Some(transport);
                 }
@@ -806,7 +825,7 @@ fn route_for(locations: &[String], ours: Option<&Transport>) -> Result<TicketRou
             }
         }
     }
-    match foreign {
+    match permitted.or(foreign) {
         Some(transport) => Ok(TicketRoute::Foreign(Box::new(transport))),
         None => Err(first_error
             .unwrap_or_else(|| "the server returned no usable result location".to_string())),
@@ -850,13 +869,21 @@ struct Inner {
 }
 
 impl Inner {
-    /// A client for one operation, with this connector's credentials
-    /// applied. Built per call rather than cloned from a prepared one: a
-    /// client's channel cannot be swapped while keeping its headers, and a
-    /// foreign endpoint location needs exactly that.
-    fn client_on(&self, channel: Channel) -> FlightSqlServiceClient<Channel> {
+    /// A client for one operation, carrying `token` (the bearer-token
+    /// snapshot [`Inner::with_reauth`] hands each attempt) or, without one,
+    /// the Basic header. Built per call rather than cloned from a prepared
+    /// one: a client's channel cannot be swapped while keeping its headers,
+    /// and a foreign endpoint location needs exactly that.
+    ///
+    /// The token is a parameter rather than read here, so the token an RPC
+    /// carries is provably the one its renewal decision compares against.
+    fn client_on(
+        &self,
+        channel: Channel,
+        token: Option<&Secret>,
+    ) -> FlightSqlServiceClient<Channel> {
         let mut client = FlightSqlServiceClient::new(channel);
-        if let Some(token) = self.current_token() {
+        if let Some(token) = token {
             client.set_token(token.expose().to_string());
         } else if let Some(header) = &self.auth_header {
             client.set_header("authorization", header.expose());
@@ -865,8 +892,8 @@ impl Inner {
     }
 
     /// A client on the configured endpoint.
-    fn client(&self) -> FlightSqlServiceClient<Channel> {
-        self.client_on(self.channel.clone())
+    fn client(&self, token: Option<&Secret>) -> FlightSqlServiceClient<Channel> {
+        self.client_on(self.channel.clone(), token)
     }
 
     /// The bearer token RPCs carry right now, if any.
@@ -888,19 +915,25 @@ impl Inner {
     /// A token issued by the handshake expires (Dremio's do), while the
     /// Basic credential behind it stays valid — so without this every query
     /// and health probe after expiry fails until the connector is rebuilt.
-    /// `rpc` builds its client on each call, so the retry carries the
-    /// renewed token. Only handshake mode retries: a configured bearer token
-    /// or a Basic header has nothing to renew it from.
+    /// Only handshake mode retries: a configured bearer token or a Basic
+    /// header has nothing to renew it from.
+    ///
+    /// Each attempt takes **one** token snapshot and hands it to `rpc`, which
+    /// must build its client from it ([`Inner::client`]). Reading the token
+    /// again inside `rpc` would let a concurrent renewal slip in between:
+    /// the RPC would carry the new token while renewal compared the old one,
+    /// skip the handshake, and retry with the very token just rejected. The
+    /// retry takes a fresh snapshot, so it carries the renewed token.
     async fn with_reauth<T, F, Fut>(&self, mut rpc: F) -> Result<T, FlightError>
     where
-        F: FnMut() -> Fut,
+        F: FnMut(Option<Secret>) -> Fut,
         Fut: Future<Output = Result<T, FlightError>>,
     {
         let sent = self.current_token();
-        match rpc().await {
+        match rpc(sent.clone()).await {
             Err(e) if self.reauth.is_some() && sent.is_some() && is_unauthenticated(&e) => {
                 self.reauthenticate(sent.as_ref()).await?;
-                rpc().await
+                rpc(self.current_token()).await
             }
             other => other,
         }
@@ -921,10 +954,12 @@ impl Inner {
         if self.current_token().as_ref().map(Secret::expose) != rejected.map(Secret::expose) {
             return Ok(());
         }
-        // A fresh client: the rejected token must not ride along.
+        // A fresh client: the rejected token must not ride along. Bounded,
+        // because this runs under `reauth_lock`: a stalled handshake would
+        // otherwise park every later renewal behind it. On expiry the error
+        // return drops the guard, so the next request can try again.
         let mut client = FlightSqlServiceClient::new(self.channel.clone());
-        client
-            .handshake(username, password.expose())
+        bounded_handshake(&self.config, &mut client, username, password.expose())
             .await
             .map_err(|e| {
                 FlightError::ProtocolError(self.scrub(&format!(
@@ -984,8 +1019,8 @@ impl Inner {
     /// `GetFlightInfo` for a statement — plans it on the remote and returns
     /// the advertised schema plus the tickets, without fetching a row.
     async fn plan_statement(&self, sql: String) -> DataglotResult<arrow_flight::FlightInfo> {
-        self.with_reauth(|| {
-            let mut client = self.client();
+        self.with_reauth(|token| {
+            let mut client = self.client(token.as_ref());
             let sql = sql.clone();
             async move { client.execute(sql, None).await }
         })
@@ -1009,11 +1044,12 @@ impl Inner {
         // Routing errors are scrubbed too: they describe a *remote-supplied*
         // URI, and while `Transport::parse` echoes none of its input, that is
         // an invariant of another function — rule 12 does not rely on it.
-        let route = route_for(&locations, Some(&self.transport)).map_err(|e| {
-            DataglotError::federation(
-                self.scrub(&format!("flightsql catalog '{}': {e}", self.config.name)),
-            )
-        })?;
+        let route =
+            route_for(&locations, Some(&self.transport), self.credentialed()).map_err(|e| {
+                DataglotError::federation(
+                    self.scrub(&format!("flightsql catalog '{}': {e}", self.config.name)),
+                )
+            })?;
         let TicketRoute::Foreign(transport) = route else {
             return Ok(None);
         };
@@ -1081,38 +1117,42 @@ impl Inner {
             )));
         };
         let channel = self.channel_for(endpoint).await?;
-        let stream = self
-            .with_reauth(|| {
-                let mut client = match &channel {
-                    Some(channel) => self.client_on(channel.clone()),
-                    None => self.client(),
-                };
-                let ticket = ticket.clone();
-                async move { client.do_get(ticket).await }
-            })
-            .await
-            .map_err(|e| self.flight_err("fetching a result stream failed", &e))?;
-
-        // `Endpoint::timeout` bounds the future that produces the response
-        // *headers*; everything after that — the actual data — is polled
-        // without a deadline, so a server that answers promptly and then
-        // stalls mid-stream would hang forever. Apply the same budget as an
-        // INACTIVITY deadline: it catches the stall without capping a long
-        // legitimate transfer, which a whole-stream timeout would.
-        let Some(secs) = self.config.request_timeout_secs else {
-            return Ok(stream.boxed());
-        };
-        let idle = Duration::from_secs(secs);
-        Ok(tokio_stream::StreamExt::timeout(stream, idle)
-            .map(move |item| {
-                item.unwrap_or_else(|_| {
-                    Err(FlightError::ProtocolError(format!(
-                        "the server sent no data for {secs}s \
-                         (`request_timeout_secs`); giving up on the stalled stream"
-                    )))
-                })
-            })
-            .boxed())
+        let idle_secs = self.config.request_timeout_secs;
+        // Renewal covers a refusal reported either way a server can report
+        // it: as the call's status, or — after the response headers — as
+        // the first stream item. The first item is therefore awaited inside
+        // the retried attempt; only an `Unauthenticated` there is lifted
+        // out to trigger renewal, and anything else (a batch, another
+        // error, the end) is put back in front of the stream. Once a batch
+        // has been handed on, nothing is retried: replaying the ticket
+        // would deliver those rows twice.
+        //
+        // Replaying the ticket after a refusal (review G5): Flight leaves
+        // DoGet retry semantics to the server when the endpoint has no
+        // `expiration_time`, so a single-use ticket could in principle fail
+        // its second redemption. That costs nothing over not retrying — no
+        // row was delivered and the query fails either way, just with the
+        // server's second error — while refusing to retry would break token
+        // renewal for servers that never set `expiration_time`.
+        self.with_reauth(|token| {
+            let mut client = match &channel {
+                Some(channel) => self.client_on(channel.clone(), token.as_ref()),
+                None => self.client(token.as_ref()),
+            };
+            let ticket = ticket.clone();
+            async move {
+                let mut stream = with_idle_deadline(client.do_get(ticket).await?, idle_secs);
+                match stream.next().await {
+                    Some(Err(e)) if is_unauthenticated(&e) => Err(e),
+                    None => Ok(futures::stream::empty().boxed()),
+                    Some(first) => Ok(futures::stream::once(async move { first })
+                        .chain(stream)
+                        .boxed()),
+                }
+            }
+        })
+        .await
+        .map_err(|e| self.flight_err("fetching a result stream failed", &e))
     }
 
     /// Fetch one endpoint's ticket as a stream of batches aligned to
@@ -1165,6 +1205,63 @@ impl Inner {
         }
         Ok(out)
     }
+}
+
+/// Apply `request_timeout_secs` to a result stream as an **inactivity**
+/// deadline.
+///
+/// `Endpoint::timeout` bounds the future that produces the response
+/// *headers*; everything after that — the actual data — is polled without a
+/// deadline, so a server that answers promptly and then stalls mid-stream
+/// would hang forever. The same budget between items catches the stall
+/// without capping a long legitimate transfer, which a whole-stream timeout
+/// would.
+fn with_idle_deadline(
+    stream: arrow_flight::decode::FlightRecordBatchStream,
+    secs: Option<u64>,
+) -> BoxStream<'static, Result<RecordBatch, FlightError>> {
+    let Some(secs) = secs else {
+        return stream.boxed();
+    };
+    tokio_stream::StreamExt::timeout(stream, Duration::from_secs(secs))
+        .map(move |item| {
+            item.unwrap_or_else(|_| {
+                Err(FlightError::ProtocolError(format!(
+                    "the server sent no data for {secs}s (`request_timeout_secs`); giving up on the stalled stream"
+                )))
+            })
+        })
+        .boxed()
+}
+
+/// Run the Basic → bearer handshake on `client`, bounded by
+/// `request_timeout_secs` when it is set.
+///
+/// The channel's request timeout bounds only the future that yields the
+/// response *headers*; the handshake then drains the response body, and a
+/// server that stalls there would hang this call indefinitely — at connect,
+/// or during a renewal holding `reauth_lock`. So the whole exchange is
+/// bounded here.
+///
+/// # Errors
+/// The handshake failure or the expiry, as text that has **not** been
+/// scrubbed: the caller scrubs it with the secrets it holds.
+async fn bounded_handshake(
+    config: &FlightSqlConfig,
+    client: &mut FlightSqlServiceClient<Channel>,
+    username: &str,
+    password: &str,
+) -> Result<(), String> {
+    let handshake = client.handshake(username, password);
+    let outcome = match config.request_timeout_secs {
+        None => handshake.await,
+        Some(secs) => tokio::time::timeout(Duration::from_secs(secs), handshake)
+            .await
+            .map_err(|_| {
+                format!("the handshake did not complete within {secs}s (`request_timeout_secs`)")
+            })?,
+    };
+    outcome.map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Build a tonic channel for one already-parsed [`Transport`], using this
@@ -1313,14 +1410,13 @@ impl FlightSqlConnector {
                     unreachable!("validate() rejects handshake without Basic credentials");
                 };
                 let mut client = FlightSqlServiceClient::new(channel.clone());
-                client
-                    .handshake(username, password.expose())
+                bounded_handshake(&config, &mut client, username, password.expose())
                     .await
                     .map_err(|e| {
                         DataglotError::federation(format!(
                             "flightsql catalog '{}': handshake failed: {}",
                             config.name,
-                            scrub_with(&e.to_string(), &secrets)
+                            scrub_with(&e, &secrets)
                         ))
                     })?;
                 if let Some(issued) = client.token() {
@@ -1828,8 +1924,8 @@ impl FlightSqlConnector {
         };
         let info = self
             .inner
-            .with_reauth(|| {
-                let mut client = self.inner.client();
+            .with_reauth(|token| {
+                let mut client = self.inner.client(token.as_ref());
                 let command = command.clone();
                 async move { client.get_tables(command).await }
             })
@@ -2069,14 +2165,52 @@ fn is_unimplemented(e: &FlightError) -> bool {
 /// lowercasing is what URL host normalisation does, and it preserves byte
 /// length, so offsets found in the lowercased copy address the original
 /// exactly.
+///
+/// Every secret is matched against the **original** text and the union of
+/// the matched spans is redacted in one pass. Redacting one secret at a time
+/// would let an earlier replacement break a later match: superseded tokens
+/// stay registered, and when a renewed token extends an older one (`tok-1`,
+/// `tok-10`) replacing the older first would leave the newer one's suffix
+/// readable.
 fn scrub_with(msg: &str, secrets: &[Secret]) -> String {
-    secrets.iter().fold(msg.to_string(), |acc, s| {
-        if s.expose().is_empty() {
-            acc
-        } else {
-            redact(&acc, s.expose())
+    let folded = msg.to_ascii_lowercase();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for secret in secrets {
+        let needle = secret.expose().to_ascii_lowercase();
+        if needle.is_empty() {
+            continue;
         }
-    })
+        // Overlapping occurrences too, stepping one character at a time; a
+        // match of valid UTF-8 inside valid UTF-8 always starts and ends on
+        // a character boundary, so the spans slice `msg` safely.
+        let mut from = 0usize;
+        while let Some(hit) = folded[from..].find(&needle) {
+            let at = from + hit;
+            spans.push((at, at + needle.len()));
+            from = at + folded[at..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    if spans.is_empty() {
+        return msg.to_string();
+    }
+    spans.sort_unstable();
+    let mut out = String::with_capacity(msg.len());
+    let mut cursor = 0usize;
+    let mut spans = spans.into_iter().peekable();
+    while let Some((start, mut end)) = spans.next() {
+        while let Some(&(next_start, next_end)) = spans.peek() {
+            if next_start > end {
+                break;
+            }
+            end = end.max(next_end);
+            spans.next();
+        }
+        out.push_str(&msg[cursor..start]);
+        out.push_str("[redacted]");
+        cursor = end;
+    }
+    out.push_str(&msg[cursor..]);
+    out
 }
 
 /// The form a URL parser would turn `secret` into if it appeared as a host,
@@ -2091,7 +2225,7 @@ fn scrub_with(msg: &str, secrets: &[Secret]) -> String {
 /// us that we never format ourselves.
 ///
 /// Returns `None` when the secret cannot appear in a host at all, or when
-/// normalisation leaves it unchanged apart from case (which `redact` already
+/// normalisation leaves it unchanged apart from case (which `scrub_with` already
 /// handles).
 fn normalised_host(secret: &str) -> Option<Secret> {
     if secret.is_empty() {
@@ -2100,21 +2234,6 @@ fn normalised_host(secret: &str) -> Option<Secret> {
     let parsed = url::Url::parse(&format!("http://{secret}")).ok()?;
     let host = parsed.host_str()?;
     (!host.eq_ignore_ascii_case(secret)).then(|| Secret(host.to_string()))
-}
-
-/// Replace every ASCII-case-insensitive occurrence of `needle` in `haystack`.
-fn redact(haystack: &str, needle: &str) -> String {
-    let (folded, needle_folded) = (haystack.to_ascii_lowercase(), needle.to_ascii_lowercase());
-    let mut out = String::with_capacity(haystack.len());
-    let mut cursor = 0usize;
-    while let Some(hit) = folded[cursor..].find(&needle_folded) {
-        let at = cursor + hit;
-        out.push_str(&haystack[cursor..at]);
-        out.push_str("[redacted]");
-        cursor = at + needle_folded.len();
-    }
-    out.push_str(&haystack[cursor..]);
-    out
 }
 
 #[async_trait]
@@ -2652,7 +2771,7 @@ mod tests {
     fn route(locations: &[&str]) -> Result<TicketRoute, String> {
         let owned: Vec<String> = locations.iter().map(|s| (*s).to_string()).collect();
         let ours = Transport::parse("grpc://coordinator:1").expect("ours parses");
-        route_for(&owned, Some(&ours))
+        route_for(&owned, Some(&ours), false)
     }
 
     #[test]
@@ -2703,6 +2822,30 @@ mod tests {
         };
         assert_eq!(transport.uri, "https://replica:2");
         assert!(transport.tls, "the replica's scheme decides its posture");
+    }
+
+    /// With credentials, a plaintext remote replica listed first yields to
+    /// a permitted (TLS) alternative; when none is permitted, the first is
+    /// still returned so `channel_for` refuses it with the policy error.
+    #[test]
+    fn a_credentialed_route_prefers_a_location_the_plaintext_rule_permits() {
+        let ours = Transport::parse("grpc+tls://coordinator:1").expect("ours parses");
+        let pick = |locations: &[&str], credentialed: bool| {
+            let owned: Vec<String> = locations.iter().map(|s| (*s).to_string()).collect();
+            match route_for(&owned, Some(&ours), credentialed).unwrap() {
+                TicketRoute::Foreign(t) => t.uri,
+                TicketRoute::SameChannel => "same".to_string(),
+            }
+        };
+        let replicas = ["grpc://replica:2", "grpc+tls://replica:3"];
+        assert_eq!(pick(&replicas, true), "https://replica:3");
+        assert_eq!(pick(&replicas, false), "http://replica:2", "listed order");
+        assert_eq!(pick(&["grpc://replica:2"], true), "http://replica:2");
+        assert_eq!(
+            pick(&["grpc+tls://replica:3", "grpc+tls://coordinator:1"], true),
+            "same",
+            "the held connection still wins"
+        );
     }
 
     #[test]
@@ -3046,7 +3189,7 @@ mod tests {
         ] {
             assert!(is_reuse_sentinel(uri), "{uri}");
             assert!(matches!(
-                route_for(&[uri.to_string()], None).unwrap(),
+                route_for(&[uri.to_string()], None, false).unwrap(),
                 TicketRoute::SameChannel
             ));
         }
@@ -3079,7 +3222,7 @@ mod tests {
             "dialling http://[redacted]:443 failed"
         );
 
-        // Case-only differences are `redact`'s job, not this one — no point
+        // Case-only differences are `scrub_with`'s job, not this one — no point
         // registering a second secret that the fold already matches.
         assert!(normalised_host("Hunter2").is_none());
         assert!(normalised_host("hunter2").is_none());
@@ -3436,7 +3579,7 @@ mod tests {
         // …and routing surfaces it without echoing the credential either.
         let locations = vec!["grpc+tls://svc:secret@replica:2".to_string()];
         let ours = Transport::parse("grpc://coordinator:1").unwrap();
-        let err = route_for(&locations, Some(&ours)).unwrap_err();
+        let err = route_for(&locations, Some(&ours), false).unwrap_err();
         assert!(!err.contains("secret"), "routing error leaked it: {err}");
         assert!(
             !err.contains("replica"),
@@ -3578,7 +3721,7 @@ mod tests {
         // …and routing agrees, which is the point.
         let locations = vec!["grpc+tls://flight.example:443".to_string()];
         assert_eq!(
-            route_for(&locations, Some(&implicit)).unwrap(),
+            route_for(&locations, Some(&implicit), false).unwrap(),
             TicketRoute::SameChannel
         );
     }
@@ -3851,6 +3994,82 @@ mod tests {
         assert!(
             err.contains("cast"),
             "the cast failure stays visible: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Review round 2: token snapshots, overlapping secrets
+    // -----------------------------------------------------------------
+
+    /// Another request can publish a renewed token between the moment
+    /// `with_reauth` notes the token and the moment the RPC's client is
+    /// built. The token compared at renewal must be the one the rejected RPC
+    /// actually carried; otherwise renewal is skipped and the retry resends
+    /// the token the server just refused.
+    #[tokio::test]
+    async fn a_retry_never_resends_the_token_the_server_rejected() {
+        let mut inner = inner_with(&[]);
+        inner.reauth = Some(("svc".to_string(), Secret("pw".to_string())));
+        *inner.token.write().unwrap() = Some(Secret("tok-1".to_string()));
+        let sent: std::sync::Mutex<Vec<Option<String>>> = std::sync::Mutex::new(Vec::new());
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        inner
+            .with_reauth(|token| {
+                let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    // A concurrent renewal lands right now.
+                    *inner.token.write().unwrap() = Some(Secret("tok-2".to_string()));
+                }
+                let client = inner.client(token.as_ref());
+                sent.lock().unwrap().push(client.token().cloned());
+                async move {
+                    if n == 0 {
+                        Err(FlightError::Tonic(Box::new(
+                            tonic::Status::unauthenticated("expired"),
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await
+            .expect("the retry succeeds");
+        let sent = sent.into_inner().unwrap();
+        assert_eq!(sent.len(), 2, "one attempt and one retry: {sent:?}");
+        assert_ne!(
+            sent[0], sent[1],
+            "the retry resent the token the server rejected: {sent:?}"
+        );
+        assert_eq!(sent[0].as_deref(), Some("tok-1"), "the snapshot: {sent:?}");
+        assert_eq!(sent[1].as_deref(), Some("tok-2"), "{sent:?}");
+    }
+
+    /// Superseded tokens stay registered, and a renewed token can extend an
+    /// older one (`tok-1` / `tok-10`). Redacting in sequence would replace
+    /// the shorter one first and leave the longer one's suffix readable.
+    #[test]
+    fn overlapping_secrets_are_redacted_whichever_is_listed_first() {
+        let secrets = |names: &[&str]| -> Vec<Secret> {
+            names.iter().map(|s| Secret((*s).to_string())).collect()
+        };
+        for order in [["tok-1", "tok-10"], ["tok-10", "tok-1"]] {
+            assert_eq!(
+                scrub_with("rejected Bearer TOK-10; earlier tok-1", &secrets(&order)),
+                "rejected Bearer [redacted]; earlier [redacted]",
+                "{order:?}"
+            );
+        }
+        // Overlapping without being a prefix: the union is redacted.
+        assert_eq!(
+            scrub_with("xxabcdefxx", &secrets(&["abcd", "cdef"])),
+            "xx[redacted]xx"
+        );
+        // A secret that overlaps itself.
+        assert_eq!(scrub_with("aaa!", &secrets(&["aa"])), "[redacted]!");
+        // Non-ASCII text around a match keeps its characters intact.
+        assert_eq!(
+            scrub_with("é-pässwörd-é", &secrets(&["pässwörd"])),
+            "é-[redacted]-é"
         );
     }
 }
