@@ -1835,10 +1835,24 @@ impl DataglotServer {
                 // Catalogs created with `CREATE CATALOG` show up too, from the
                 // same store and org as the Control Plane view.
                 if let Some(store) = &self.control_plane_store {
+                    // "Registered" means in the live registry, which the
+                    // control-plane refresh keeps current; a stored catalog
+                    // that failed to build isn't in it.
+                    let live = self.live_catalogs.clone();
+                    let org = self.boot_org.clone();
+                    let is_registered = Arc::new(move |name: &str| {
+                        live.as_ref().is_some_and(|reg| {
+                            reg.read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get(&org)
+                                .is_some_and(|snapshot| snapshot.contains_key(name))
+                        })
+                    });
                     connectors = connectors.with_runtime_catalogs(
                         Arc::clone(store),
                         self.boot_org.clone(),
                         self.secret_resolver.clone(),
+                        is_registered,
                     );
                 }
                 //  continuous mode — a background poller refreshes each

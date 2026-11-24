@@ -49,6 +49,13 @@ export function Connectors() {
         setConnectors(v.configured);
         setAvailable(v.available);
         setError(false);
+        // Forget Check now results for rows that are gone (a dropped runtime
+        // catalog), so a new catalog under the same name starts fresh.
+        const names = new Set(v.configured.map((c) => c.name));
+        setLive((prev) => {
+          const kept = Object.entries(prev).filter(([name]) => names.has(name));
+          return kept.length === Object.keys(prev).length ? prev : Object.fromEntries(kept);
+        });
       } catch {
         // Keep the last good snapshot; only blank on the very first failure.
         setConnectors((prev) => {
@@ -168,7 +175,13 @@ export function Connectors() {
                   </td>
                   <td>
                     <span className={`pill ${c.registered ? "idle" : "queue"}`}>
-                      {c.runtime ? "RUNTIME" : c.registered ? "REGISTERED" : "SKIPPED"}
+                      {c.runtime
+                        ? c.registered
+                          ? "RUNTIME"
+                          : "RUNTIME · SKIPPED"
+                        : c.registered
+                          ? "REGISTERED"
+                          : "SKIPPED"}
                     </span>
                   </td>
                   <td>
@@ -194,7 +207,8 @@ export function Connectors() {
         <span className="mono">SKIPPED</span> was configured but unreachable (tolerated);{" "}
         <span className="mono">RUNTIME</span> was created with{" "}
         <span className="mono">CREATE CATALOG</span> and isn't polled in the background, so its
-        liveness comes from <b>Check now</b>.{" "}
+        liveness comes from <b>Check now</b> (<span className="mono">RUNTIME · SKIPPED</span>: stored,
+        but couldn't be loaded).{" "}
         <b>Liveness</b> is refreshed automatically by the server's background health poller;{" "}
         <b>Check now</b> forces an immediate fresh probe; <span className="mono">NOT CHECKED</span>{" "}
         means the check itself couldn't run (e.g. refused without an API token). Set{" "}

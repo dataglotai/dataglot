@@ -81,6 +81,20 @@ struct RuntimeCatalogs {
     /// `None` ⇒ a catalog that references a secret probes as not live, with
     /// the resolver's error.
     resolver: Option<Arc<dyn SecretResolver>>,
+    /// Whether a catalog name is in the live registry right now. A stored
+    /// catalog that failed to build (`--tolerate-unreachable-catalogs`) is in
+    /// the store but not here.
+    is_registered: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+}
+
+/// One runtime catalog as read from the meta store.
+struct RuntimeCatalog {
+    name: String,
+    cfg: CatalogConfig,
+    /// Fingerprint of the stored config. A cached health result only belongs
+    /// to the catalog it was probed for: after `DROP` + `CREATE` under the
+    /// same name, the old result no longer matches.
+    generation: u64,
 }
 
 /// A supported connector *family* Dataglot can federate, whether or not this
@@ -229,6 +243,10 @@ pub struct ConnectorHealth {
     /// Redacted failure reason when `!live`. Absent on success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// For a runtime catalog: the config fingerprint the probe ran against
+    /// (see [`RuntimeCatalog::generation`]). `None` for `[catalogs.*]`.
+    #[serde(skip)]
+    generation: Option<u64>,
 }
 
 /// Result of an on-demand liveness probe.
@@ -279,11 +297,13 @@ impl ConnectorMonitor {
         store: Arc<dyn MetaStore>,
         org: String,
         resolver: Option<Arc<dyn SecretResolver>>,
+        is_registered: Arc<dyn Fn(&str) -> bool + Send + Sync>,
     ) -> Self {
         self.runtime = Some(RuntimeCatalogs {
             store,
             org,
             resolver,
+            is_registered,
         });
         self
     }
@@ -332,21 +352,27 @@ impl ConnectorMonitor {
     pub async fn view(&self) -> ConnectorsView {
         let runtime = self.runtime_catalogs().await;
         let mut configured = self.list();
-        {
+        if let Some(rt) = &self.runtime {
             let health = self.health.read().unwrap_or_else(PoisonError::into_inner);
-            configured.extend(runtime.iter().map(|(name, cfg)| ConnectorSummary {
-                name: name.clone(),
-                kind: catalog_kind(cfg),
-                registered: true,
-                runtime: true,
-                health: health.get(name).cloned(),
+            configured.extend(runtime.iter().map(|c| {
+                ConnectorSummary {
+                    name: c.name.clone(),
+                    kind: catalog_kind(&c.cfg),
+                    registered: (rt.is_registered)(&c.name),
+                    runtime: true,
+                    // Only a result probed against this exact config.
+                    health: health
+                        .get(&c.name)
+                        .filter(|h| h.generation == Some(c.generation))
+                        .cloned(),
+                }
             }));
         }
         configured.sort_by(|a, b| a.name.cmp(&b.name));
         let in_use: HashSet<&'static str> = self
             .configured
             .values()
-            .chain(runtime.iter().map(|(_, cfg)| cfg))
+            .chain(runtime.iter().map(|c| &c.cfg))
             .map(catalog_kind)
             .collect();
         ConnectorsView {
@@ -358,7 +384,7 @@ impl ConnectorMonitor {
     /// The runtime catalogs (meta store, minus names `[catalogs.*]` already
     /// has). A store error or an unreadable stored config leaves the catalog
     /// out with a warning; the dashboard still shows everything else.
-    async fn runtime_catalogs(&self) -> Vec<(String, CatalogConfig)> {
+    async fn runtime_catalogs(&self) -> Vec<RuntimeCatalog> {
         let Some(rt) = &self.runtime else {
             return Vec::new();
         };
@@ -373,8 +399,13 @@ impl ConnectorMonitor {
             .into_iter()
             .filter(|(name, _)| !self.configured.contains_key(name))
             .filter_map(|(name, value)| {
+                let generation = generation_of(&value);
                 if let Ok(cfg) = serde_json::from_value(value) {
-                    return Some((name, cfg));
+                    return Some(RuntimeCatalog {
+                        name,
+                        cfg,
+                        generation,
+                    });
                 }
                 // The serde error can quote stored option values, so it isn't
                 // logged (rule 12).
@@ -393,18 +424,45 @@ impl ConnectorMonitor {
     /// probe reuses it (a cheap `SELECT 1`); otherwise it falls back to
     /// rebuilding the connector from config.
     pub async fn probe(&self, name: &str) -> Option<ProbeResult> {
-        let result = if let Some(cfg) = self.configured.get(name) {
-            probe_one(name, cfg, self.health_handles.get(name)).await
-        } else {
-            let rt = self.runtime.as_ref()?;
-            let (_, cfg) = self
+        if let Some(cfg) = self.configured.get(name) {
+            let result = probe_one(name, cfg, self.health_handles.get(name)).await;
+            self.record(&result, None);
+            return Some(result);
+        }
+        let rt = self.runtime.as_ref()?;
+        // One deadline over the whole probe: the store read and the secret
+        // lookup can stall too, not only the rebuild.
+        let lookup_and_probe = async {
+            let catalog = self
                 .runtime_catalogs()
                 .await
                 .into_iter()
-                .find(|(n, _)| n == name)?;
-            probe_runtime(rt, name, &cfg).await
+                .find(|c| c.name == name)?;
+            Some((
+                probe_runtime(rt, name, &catalog.cfg).await,
+                Some(catalog.generation),
+            ))
         };
-        self.record(&result);
+        let (result, generation) = match tokio::time::timeout(PROBE_TIMEOUT, lookup_and_probe).await
+        {
+            Ok(found) => found?,
+            Err(_) => (
+                ProbeResult {
+                    name: name.to_string(),
+                    kind: "unknown",
+                    live: false,
+                    latency_ms: PROBE_TIMEOUT.as_millis(),
+                    error: Some(format!(
+                        "probe timed out after {}s (catalog store, secrets and connect)",
+                        PROBE_TIMEOUT.as_secs()
+                    )),
+                },
+                None,
+            ),
+        };
+        // A timed-out probe has no generation, so the view won't show it as
+        // this catalog's health.
+        self.record(&result, generation);
         Some(result)
     }
 
@@ -437,11 +495,13 @@ impl ConnectorMonitor {
     }
 
     /// Store one probe result in the shared health cache.
-    fn record(&self, result: &ProbeResult) {
+    fn record(&self, result: &ProbeResult, generation: Option<u64>) {
+        let mut health = ConnectorHealth::from(result);
+        health.generation = generation;
         self.health
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(result.name.clone(), ConnectorHealth::from(result));
+            .insert(result.name.clone(), health);
     }
 }
 
@@ -481,8 +541,19 @@ impl From<&ProbeResult> for ConnectorHealth {
             latency_ms: r.latency_ms,
             checked_at_ms: now_ms(),
             error: r.error.clone(),
+            generation: None,
         }
     }
+}
+
+/// Fingerprint of a stored source config. The JSON text is stable for one
+/// stored value, so the same config always gives the same number within this
+/// process.
+fn generation_of(stored: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    stored.to_string().hash(&mut h);
+    h.finish()
 }
 
 /// Current wall-clock time as Unix epoch milliseconds (saturating; `0` if the
@@ -846,6 +917,12 @@ mod tests {
         Arc::new(store)
     }
 
+    /// A registry check that knows exactly `names`.
+    fn registered(names: &[&str]) -> Arc<dyn Fn(&str) -> bool + Send + Sync> {
+        let names: HashSet<String> = names.iter().map(ToString::to_string).collect();
+        Arc::new(move |name: &str| names.contains(name))
+    }
+
     fn csv_catalog(dir: &std::path::Path) -> CatalogConfig {
         let csv = dir.join("segments.csv");
         std::fs::write(&csv, "user_id,segment\n7,enterprise\n").expect("write csv");
@@ -864,7 +941,12 @@ mod tests {
     async fn runtime_catalogs_are_listed_and_can_be_probed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = store_with(&[("files", csv_catalog(dir.path()))]).await;
-        let m = monitor().with_runtime_catalogs(store, "default".to_string(), None);
+        let m = monitor().with_runtime_catalogs(
+            store,
+            "default".to_string(),
+            None,
+            registered(&["files"]),
+        );
 
         let v = m.view().await;
         let names: Vec<&str> = v.configured.iter().map(|c| c.name.as_str()).collect();
@@ -897,7 +979,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = store_with(&[("pg", csv_catalog(dir.path()))]).await;
         let v = monitor()
-            .with_runtime_catalogs(store, "default".to_string(), None)
+            .with_runtime_catalogs(store, "default".to_string(), None, registered(&["pg"]))
             .view()
             .await;
         let pg: Vec<&ConnectorSummary> = v.configured.iter().filter(|c| c.name == "pg").collect();
@@ -913,11 +995,64 @@ mod tests {
             ..Default::default()
         });
         let store = store_with(&[("vault_pg", cfg)]).await;
-        let m = ConnectorMonitor::empty().with_runtime_catalogs(store, "default".to_string(), None);
+        let m = ConnectorMonitor::empty().with_runtime_catalogs(
+            store,
+            "default".to_string(),
+            None,
+            registered(&[]),
+        );
 
         let probe = m.probe("vault_pg").await.expect("listed");
         assert!(!probe.live);
         let err = probe.error.unwrap_or_default();
         assert!(err.contains("no secret backend"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_stored_catalog_missing_from_the_registry_is_not_registered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_with(&[("files", csv_catalog(dir.path()))]).await;
+        let v = ConnectorMonitor::empty()
+            .with_runtime_catalogs(store, "default".to_string(), None, registered(&[]))
+            .view()
+            .await;
+        assert_eq!(v.configured.len(), 1);
+        assert!(v.configured[0].runtime);
+        assert!(!v.configured[0].registered, "stored but not live");
+    }
+
+    #[tokio::test]
+    async fn health_from_a_replaced_catalog_is_not_shown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_with(&[("files", csv_catalog(dir.path()))]).await;
+        let m = ConnectorMonitor::empty().with_runtime_catalogs(
+            Arc::clone(&store),
+            "default".to_string(),
+            None,
+            registered(&["files"]),
+        );
+        assert!(m.probe("files").await.expect("listed").live);
+        assert!(m.view().await.configured[0].health.is_some());
+
+        // DROP + CREATE under the same name, pointing somewhere else.
+        let other: CatalogConfig = serde_json::from_value(serde_json::json!({
+            "kind": "object_storage",
+            "tables": [{"name": "segments", "url": "file:///nowhere/x.csv", "format": "csv"}],
+        }))
+        .expect("config");
+        store
+            .set_source_config(
+                "default",
+                "files",
+                &serde_json::to_value(&other).expect("json"),
+            )
+            .await
+            .expect("replace config");
+
+        let v = m.view().await;
+        assert!(
+            v.configured[0].health.is_none(),
+            "the old catalog's result must not carry over"
+        );
     }
 }
