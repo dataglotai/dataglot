@@ -107,8 +107,6 @@ deliberately deferred:
   only listed columns are visible and unlisted columns are projected away
   (`SELECT *` returns the visible subset, not an error), org + group scoped.
   `WITH GRANT OPTION` delegation is still not implemented.
-- **Access-deny is group-scoped, not org-scoped.** Column/table denials scope by
-  org-group; unlike masks, row filters, and grants they are not yet per-tenant
-  (org) scoped.
+  
 - **SCRAM is SCRAM-SHA-256 (no channel binding).** The `-PLUS` channel-binding
   variant is not offered; use ingress TLS for transport protection.

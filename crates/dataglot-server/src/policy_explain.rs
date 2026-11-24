@@ -317,6 +317,7 @@ mod tests {
         let denials = AccessDenyEnforcer::new([AccessDenial {
             table: TableReference::bare("users"),
             column: Some("dept".into()),
+            org: None,
             groups: vec!["contractor".into()],
         }]);
         let enforcer: Arc<dyn PolicyEnforcer> = Arc::new(CompositeEnforcer::new(vec![

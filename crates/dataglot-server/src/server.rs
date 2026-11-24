@@ -4213,6 +4213,7 @@ mod tests {
             access_denials: vec![crate::config::AccessDenyConfig {
                 table: "pg.public.t".to_string(),
                 column: Some("ssn".to_string()),
+                org: None,
                 groups: vec![],
             }],
             column_grants: vec![crate::config::ColumnGrantConfig {

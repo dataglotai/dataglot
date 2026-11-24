@@ -23,6 +23,10 @@
 //! [`AccessDenial::groups`] applies to **everyone**; otherwise it applies
 //! only when the session [`Identity::org_groups`] intersects the list.
 //!
+//! Org scoping is the same as for masks and column grants: a denial with no
+//! [`AccessDenial::org`] is operator-wide; with one, it applies only to
+//! sessions in that org.
+//!
 //! Table matching reuses `match_candidates`, so a bare-name
 //! denial (`users`) covers a qualified scan (`pg.public.users`) —
 //! qualifying a table can't dodge the denial (same convention as the
@@ -51,6 +55,9 @@ pub struct AccessDenial {
     pub table: TableReference,
     /// Column within `table` to deny, or `None` to deny the whole table.
     pub column: Option<String>,
+    /// Tenant scope. `None` ⇒ operator-wide; `Some(org)` ⇒ only sessions
+    /// whose [`Identity::org`] is `org`.
+    pub org: Option<String>,
     /// Org-groups the denial applies to. Empty ⇒ applies to all
     /// identities; otherwise applies when the session identity is in any
     /// listed group.
@@ -60,11 +67,12 @@ pub struct AccessDenial {
 impl AccessDenial {
     /// Whether this denial applies to `identity`.
     fn applies_to(&self, identity: &Identity) -> bool {
-        self.groups.is_empty()
-            || self
-                .groups
-                .iter()
-                .any(|g| identity.org_groups.iter().any(|og| og == g))
+        crate::org_rule_applies(self.org.as_deref(), identity)
+            && (self.groups.is_empty()
+                || self
+                    .groups
+                    .iter()
+                    .any(|g| identity.org_groups.iter().any(|og| og == g)))
     }
 }
 
@@ -305,6 +313,7 @@ mod tests {
         AccessDenyEnforcer::new([AccessDenial {
             table: TableReference::from(table),
             column: None,
+            org: None,
             groups: vec![],
         }])
     }
@@ -313,7 +322,17 @@ mod tests {
         AccessDenyEnforcer::new([AccessDenial {
             table: TableReference::from(table),
             column: Some(column.to_string()),
+            org: None,
             groups,
+        }])
+    }
+
+    fn deny_table_in_org(table: &str, org: &str) -> AccessDenyEnforcer {
+        AccessDenyEnforcer::new([AccessDenial {
+            table: TableReference::from(table),
+            column: None,
+            org: Some(org.to_string()),
+            groups: vec![],
         }])
     }
 
@@ -379,6 +398,64 @@ mod tests {
         let plan = plan_of(&ctx, "SELECT email FROM users").await;
         let contractor = Identity::user("c").with_groups(["contractor"]);
         assert!(enforcer.rewrite(plan, &contractor).is_err());
+    }
+
+    #[tokio::test]
+    async fn org_scoped_deny_only_fires_in_that_org() {
+        let ctx = ctx();
+        let enforcer = deny_table_in_org("users", "acme");
+
+        let plan = plan_of(&ctx, "SELECT id FROM users").await;
+        let in_acme = Identity::user("a").with_org("acme");
+        assert!(enforcer.rewrite(plan, &in_acme).is_err());
+
+        let plan = plan_of(&ctx, "SELECT id FROM users").await;
+        let in_globex = Identity::user("g").with_org("globex");
+        assert!(enforcer.rewrite(plan, &in_globex).is_ok());
+
+        // A session with no org only sees operator-wide rules.
+        let plan = plan_of(&ctx, "SELECT id FROM users").await;
+        assert!(enforcer.rewrite(plan, &Identity::user("anon")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn deny_without_org_applies_in_every_org() {
+        let ctx = ctx();
+        let enforcer = deny_table("users");
+        for org in ["acme", "globex"] {
+            let plan = plan_of(&ctx, "SELECT id FROM users").await;
+            let identity = Identity::user("u").with_org(org);
+            assert!(enforcer.rewrite(plan, &identity).is_err(), "{org}");
+        }
+    }
+
+    #[tokio::test]
+    async fn org_and_groups_must_both_match() {
+        let ctx = ctx();
+        let enforcer = AccessDenyEnforcer::new([AccessDenial {
+            table: TableReference::from("users"),
+            column: Some("email".to_string()),
+            org: Some("acme".to_string()),
+            groups: vec!["contractor".to_string()],
+        }]);
+
+        let plan = plan_of(&ctx, "SELECT email FROM users").await;
+        let acme_contractor = Identity::user("c")
+            .with_org("acme")
+            .with_groups(["contractor"]);
+        assert!(enforcer.rewrite(plan, &acme_contractor).is_err());
+
+        let plan = plan_of(&ctx, "SELECT email FROM users").await;
+        let globex_contractor = Identity::user("c")
+            .with_org("globex")
+            .with_groups(["contractor"]);
+        assert!(enforcer.rewrite(plan, &globex_contractor).is_ok());
+
+        let plan = plan_of(&ctx, "SELECT email FROM users").await;
+        let acme_analyst = Identity::user("a")
+            .with_org("acme")
+            .with_groups(["analyst"]);
+        assert!(enforcer.rewrite(plan, &acme_analyst).is_ok());
     }
 
     #[tokio::test]
