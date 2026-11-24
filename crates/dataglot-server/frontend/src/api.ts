@@ -294,7 +294,8 @@ export interface ConnectorHealth {
   error?: string;
 }
 
-/** One configured connector — mirrors `ConnectorSummary` in connectors.rs. */
+/** One configured or runtime connector — mirrors `ConnectorSummary` in
+ *  connectors.rs. */
 export interface ConnectorSummary {
   name: string;
   /** "postgres" | "mysql" | "warehouse" | "snowflake" | … */
@@ -302,6 +303,9 @@ export interface ConnectorSummary {
   /** Registered into the live catalog set at boot (false ⇒ configured but
    *  skipped, e.g. unreachable under --tolerate-unreachable-catalogs). */
   registered: boolean;
+  /** Created at runtime with CREATE CATALOG rather than declared in
+   *  [catalogs.*]. Not polled in the background; "Check now" probes it. */
+  runtime: boolean;
   /** Most-recent liveness from the background poller / an on-demand probe.
    *  Undefined until the first probe completes or when polling is disabled. */
   health?: ConnectorHealth;

@@ -49,6 +49,13 @@ export function Connectors() {
         setConnectors(v.configured);
         setAvailable(v.available);
         setError(false);
+        // Forget Check now results for rows that are gone (a dropped runtime
+        // catalog), so a new catalog under the same name starts fresh.
+        const names = new Set(v.configured.map((c) => c.name));
+        setLive((prev) => {
+          const kept = Object.entries(prev).filter(([name]) => names.has(name));
+          return kept.length === Object.keys(prev).length ? prev : Object.fromEntries(kept);
+        });
       } catch {
         // Keep the last good snapshot; only blank on the very first failure.
         setConnectors((prev) => {
@@ -96,8 +103,9 @@ export function Connectors() {
           <b>No connectors configured.</b>
         </p>
         <p className="muted">
-          Federated sources declared in <span className="mono">[catalogs.*]</span> appear here with
-          their kind, whether they registered at boot, and their live reachability.
+          Federated sources declared in <span className="mono">[catalogs.*]</span> or created with{" "}
+          <span className="mono">CREATE CATALOG</span> appear here with their kind, whether they
+          registered at boot, and their live reachability.
         </p>
       </div>
     );
@@ -167,7 +175,13 @@ export function Connectors() {
                   </td>
                   <td>
                     <span className={`pill ${c.registered ? "idle" : "queue"}`}>
-                      {c.registered ? "REGISTERED" : "SKIPPED"}
+                      {c.runtime
+                        ? c.registered
+                          ? "RUNTIME"
+                          : "RUNTIME · SKIPPED"
+                        : c.registered
+                          ? "REGISTERED"
+                          : "SKIPPED"}
                     </span>
                   </td>
                   <td>
@@ -190,9 +204,14 @@ export function Connectors() {
       </div>
       <p className="caption muted" style={{ marginTop: 10 }}>
         <b>At boot</b>: <span className="mono">REGISTERED</span> came up when the server started;{" "}
-        <span className="mono">SKIPPED</span> was configured but unreachable (tolerated).{" "}
+        <span className="mono">SKIPPED</span> was configured but unreachable (tolerated);{" "}
+        <span className="mono">RUNTIME</span> was created with{" "}
+        <span className="mono">CREATE CATALOG</span> and isn't polled in the background, so its
+        liveness comes from <b>Check now</b> (<span className="mono">RUNTIME · SKIPPED</span>: stored,
+        but couldn't be loaded).{" "}
         <b>Liveness</b> is refreshed automatically by the server's background health poller;{" "}
-        <b>Check now</b> forces an immediate fresh probe. Set{" "}
+        <b>Check now</b> forces an immediate fresh probe; <span className="mono">NOT CHECKED</span>{" "}
+        means the check itself couldn't run (e.g. refused without an API token). Set{" "}
         <span className="mono">connector_health_interval_secs = 0</span> to disable background
         polling.
       </p>
@@ -234,9 +253,13 @@ function LivenessCell({
 }) {
   if (liveness.state === "checking") return <span className="muted">checking…</span>;
   if (liveness.state === "error") {
+    // The check itself didn't run (refused, unknown name, network error). An
+    // unreachable source comes back as a result with live: false, so this
+    // says nothing about the source.
     return (
-      <span className="pill fail" title={liveness.message}>
-        DOWN
+      <span title={liveness.message}>
+        <span className="pill idle">NOT CHECKED</span>{" "}
+        <span className="mono muted">{liveness.message}</span>
       </span>
     );
   }
