@@ -106,11 +106,13 @@ fn enforcer() -> Arc<dyn PolicyEnforcer> {
         AccessDenial {
             table: TableReference::bare("secrets"),
             column: None,
+            org: None,
             groups: vec![],
         },
         AccessDenial {
             table: TableReference::bare("users"),
             column: Some("dept".into()),
+            org: None,
             groups: vec!["contractor".into()],
         },
     ]);

@@ -135,7 +135,8 @@ Three enforcers, all plan-time, all in `crates/dataglot-policy/`:
   denies any scan of the table; column-level denies any *reference* to the
   column (projection, predicate, `SELECT *`). Both are **group-scoped**: an
   empty group list applies to everyone, otherwise it applies when the session's
-  org-groups intersect the list.
+  org-groups intersect the list. An optional `org` limits a denial to one
+  tenant; without it, the denial is operator-wide.
 
 **Deny vs grant.** They answer different questions and both must pass. Grant is
 *deny-unless-granted* (you need a positive privilege to read at all); access-deny

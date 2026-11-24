@@ -1384,10 +1384,12 @@ impl MaskTypeConfig {
 /// ```json
 ///   { "table": "users", "column": "ssn", "groups": ["contractor"] }
 ///   { "table": "secrets" }            // deny the whole table, everyone
+///   { "table": "payroll", "org": "acme" }  // only sessions in org acme
 /// ```
 ///
 /// `column` absent ⇒ deny the whole table. `groups` absent/empty ⇒ deny
 /// for every identity; otherwise deny only sessions in a listed group.
+/// `org` absent ⇒ operator-wide; otherwise only sessions in that org.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessDenyConfig {
     /// Target table — bare, partial, or full reference.
@@ -1395,6 +1397,9 @@ pub struct AccessDenyConfig {
     /// Column to deny within `table`; omit to deny the whole table.
     #[serde(default)]
     pub column: Option<String>,
+    /// Tenant scope. Absent ⇒ operator-wide; `Some(org)` ⇒ only that org.
+    #[serde(default)]
+    pub org: Option<String>,
     /// Groups the denial applies to. Empty ⇒ applies to everyone.
     #[serde(default)]
     pub groups: Vec<String>,
@@ -3773,6 +3778,7 @@ pub(crate) fn build_access_deny_enforcer(
         rules.push(AccessDenial {
             table,
             column: d.column.clone(),
+            org: d.org.clone(),
             groups: d.groups.clone(),
         });
     }
@@ -7837,6 +7843,7 @@ mod tests {
             Arc::new(AccessDenyEnforcer::new([AccessDenial {
                 table: TableReference::bare("emp"),
                 column: Some("salary".into()),
+                org: None,
                 groups: vec!["pii_reader".into()],
             }]));
 
@@ -7860,6 +7867,31 @@ mod tests {
             1,
             "bob reads the row"
         );
+    }
+
+    #[tokio::test]
+    async fn access_denial_org_comes_from_config() {
+        let scoped: AccessDenyConfig =
+            toml::from_str("table = \"payroll\"\norg = \"acme\"").expect("parses");
+        assert_eq!(scoped.org.as_deref(), Some("acme"));
+        let unscoped: AccessDenyConfig = toml::from_str("table = \"payroll\"").expect("parses");
+        assert!(unscoped.org.is_none(), "org is optional");
+
+        let enforcer = build_access_deny_enforcer(&[scoped])
+            .expect("builds")
+            .expect("one rule");
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE payroll (id INT)").await.unwrap();
+        let plan = || async {
+            ctx.state()
+                .create_logical_plan("SELECT id FROM payroll")
+                .await
+                .unwrap()
+        };
+        let acme = dataglot_policy::Identity::user("a").with_org("acme");
+        let globex = dataglot_policy::Identity::user("g").with_org("globex");
+        assert!(enforcer.rewrite(plan().await, &acme).is_err());
+        assert!(enforcer.rewrite(plan().await, &globex).is_ok());
     }
 
     #[test]

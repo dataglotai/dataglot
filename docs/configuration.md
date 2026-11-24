@@ -464,10 +464,17 @@ groups = ["analyst"]
 table = "users"
 column = "ssn"
 groups = []
+
+
+[[access_denials]]
+table = "payroll"
+org = "acme"        # only sessions in org acme
 ```
 
 Enforced plan-time *before* masking; a denied query fails with
-`permission denied`. Empty `groups` denies everyone.
+`permission denied`. Empty `groups` denies everyone. Without `org` a denial
+is operator-wide; with it, it applies only to sessions in that org (the same
+as masks and `column_grants`).
 
 ### `identities` and `roles`
 
