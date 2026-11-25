@@ -1,7 +1,8 @@
 // REST client for the engine dashboard. Everything is a plain fetch
 // against dataglot-server's axum routes: /api/queries (slice
-// 1) and /api/cluster (slice 2). No auth here — the endpoints are
-// loopback-only, same posture as /metrics.
+// 1) and /api/cluster (slice 2). When the server wants a bearer token
+// ([observability] api_token_env), every request carries the one the user
+// entered; see apiFetch.
 
 /** One remote pushdown's stats — mirrors `PushdownStat` in
  *  dataglot-core/pushdown_stats.rs. The dialect SQL sent to one
@@ -108,8 +109,61 @@ export interface ClusterSummary {
   running_jobs?: number;
 }
 
+// The /api bearer token the user entered. sessionStorage keeps it across a
+// reload but not past closing the tab. Storage can be blocked (private
+// windows, strict settings); then the token just isn't remembered.
+const TOKEN_KEY = "dataglot.apiToken";
+const AUTH_REQUIRED = "dataglot:auth-required";
+
+export function apiToken(): string | null {
+  try {
+    return sessionStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+/** Remember the token for this tab. `false` when the browser refused to
+ *  store it (blocked site data, some private modes). */
+export function setApiToken(token: string): boolean {
+  try {
+    sessionStorage.setItem(TOKEN_KEY, token);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Run `listener` whenever the server answers 401. Returns the unsubscribe. */
+export function onAuthRequired(listener: () => void): () => void {
+  window.addEventListener(AUTH_REQUIRED, listener);
+  return () => window.removeEventListener(AUTH_REQUIRED, listener);
+}
+
+/** fetch with the token attached, if there is one. A 401 tells the app to
+ *  ask for a token. */
+async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  const token = apiToken();
+  if (token) headers.set("authorization", `Bearer ${token}`);
+  const res = await fetch(url, { ...init, headers });
+  if (res.status === 401) window.dispatchEvent(new Event(AUTH_REQUIRED));
+  return res;
+}
+
+/** The server's `{"error": "..."}` message, or the status if there is none. */
+async function errorMessage(res: Response): Promise<string> {
+  try {
+    const body = (await res.json()) as { error?: unknown };
+    if (typeof body.error === "string") return body.error;
+  } catch {
+    // Not JSON.
+  }
+  return `HTTP ${res.status}`;
+}
+
 async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(url, { signal, headers: { accept: "application/json" } });
+  const res = await apiFetch(url, { signal, headers: { accept: "application/json" } });
   if (!res.ok) throw new Error(`${url} → ${res.status}`);
   return (await res.json()) as T;
 }
@@ -392,20 +446,21 @@ export const getMaintenance = (signal?: AbortSignal) =>
 /** On-demand liveness probe for one connector (POST). Rejects on transport
  *  failure; the caller renders the thrown message as "down". */
 export async function probeConnector(name: string): Promise<ProbeResult> {
-  const res = await fetch(`/api/connectors/${encodeURIComponent(name)}/probe`, {
+  const res = await apiFetch(`/api/connectors/${encodeURIComponent(name)}/probe`, {
     method: "POST",
   });
-  if (!res.ok) throw new Error(`probe ${name} → ${res.status}`);
+  if (!res.ok) throw new Error(`probe ${name} → ${await errorMessage(res)}`);
   return (await res.json()) as ProbeResult;
 }
 
-/** Best-effort kill of a running query. Resolves true
- *  when the server signalled a cancellable query (HTTP 200). */
-export async function cancelQuery(runId: string): Promise<boolean> {
-  const res = await fetch(`/api/queries/${encodeURIComponent(runId)}/cancel`, {
+/** Best-effort kill of a running query. Resolves null when the server
+ *  signalled a cancellable query (HTTP 200), else the server's reason
+ *  (a 403 when the API has no token on a non-loopback address, say). */
+export async function cancelQuery(runId: string): Promise<string | null> {
+  const res = await apiFetch(`/api/queries/${encodeURIComponent(runId)}/cancel`, {
     method: "POST",
   });
-  return res.ok;
+  return res.ok ? null : errorMessage(res);
 }
 
 // ---- defensive readers for the upstream Ballista JSON --------------------

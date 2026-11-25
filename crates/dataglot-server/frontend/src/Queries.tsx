@@ -24,10 +24,27 @@ export function Queries({
   // run_ids the user has asked to cancel — disables the button until the
   // poll drops the row.
   const [killing, setKilling] = useState<Set<string>>(new Set());
+  const [killError, setKillError] = useState<string | null>(null);
 
   const kill = (runId: string) => {
     setKilling((s) => new Set(s).add(runId));
-    void cancelQuery(runId);
+    setKillError(null);
+        // Refused or unreachable: say why and give the button back. On success it
+    // stays disabled until polling drops the row.
+    const giveBack = (reason: string) => {
+      setKillError(`Cancel failed: ${reason}`);
+      setKilling((s) => {
+        const next = new Set(s);
+        next.delete(runId);
+        return next;
+      });
+    };
+    void cancelQuery(runId).then(
+      (error) => {
+        if (error !== null) giveBack(error);
+      },
+      (e: unknown) => giveBack(e instanceof Error ? e.message : "request failed"),
+    );
   };
 
   if (queries.length === 0) {
@@ -106,6 +123,7 @@ export function Queries({
           ))}
         </tbody>
       </table>
+      {killError && <p className="err">{killError}</p>}
     </div>
   );
 }
