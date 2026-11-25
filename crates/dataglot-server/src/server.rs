@@ -1944,17 +1944,7 @@ impl DataglotServer {
     ) -> Result<dataglot_policy::Identity> {
         let identity =
             resolve_identity_with_roles(user, &self.config.identities, &self.config.roles);
-        // Users created with `CREATE USER` aren't in the config file, so their
-        // org has to come from the meta store. A config identity's own org
-        // still wins, as on pg-wire.
-        let store_org = match &self.control_plane_store {
-            Some(store) if identity.org.is_none() && !user.is_empty() => store
-                .find_user(user)
-                .await
-                .context("looking up the user in the meta store")?
-                .map(|(org, _, _)| org),
-            _ => None,
-        };
+        let store_org = self.store_org_for(&identity, user).await?;
         let resolved_org = resolved_session_org(identity.org.as_deref(), store_org, &self.boot_org);
         if self.live_catalogs.is_some() && resolved_org != self.boot_org {
             anyhow::bail!(
@@ -1969,6 +1959,25 @@ impl DataglotServer {
         } else {
             identity
         })
+    }
+
+    /// The org of a user created with `CREATE USER`, from the meta store. Those
+    /// users aren't in the config file, so their org has to come from there. A
+    /// config identity's own org still wins, as on pg-wire, so this is `None`
+    /// when the identity already has one (or there's no meta store).
+    async fn store_org_for(
+        &self,
+        identity: &dataglot_policy::Identity,
+        user: &str,
+    ) -> Result<Option<String>> {
+        match &self.control_plane_store {
+            Some(store) if identity.org.is_none() && !user.is_empty() => Ok(store
+                .find_user(user)
+                .await
+                .context("looking up the user in the meta store")?
+                .map(|(org, _, _)| org)),
+            _ => Ok(None),
+        }
     }
 
     /// Authenticate a Flight SQL request from its `authorization` metadata and
@@ -1990,8 +1999,12 @@ impl DataglotServer {
         use dataglot_pgwire::AuthMode;
         match &self.auth {
             AuthMode::Trust => match authorization.and_then(parse_basic_auth) {
-                Some((user, _pw)) => FlightAuth::Ok(self.resolve_flight_identity(&user)),
-                None => FlightAuth::Ok(dataglot_policy::Identity::anonymous()),
+                Some((user, _pw)) => self.resolve_flight_identity(&user).await,
+                // No user, but still a session of the boot org, as every
+                // pg-wire session is: org-scoped rules for that org apply.
+                None => FlightAuth::Ok(
+                    dataglot_policy::Identity::anonymous().with_org(self.boot_org.clone()),
+                ),
             },
             // md5 and scram-sha-256 both verify a Basic password against the
             // same cleartext-returning `PasswordSource`; the SCRAM wire
@@ -2018,7 +2031,7 @@ impl DataglotServer {
                     false
                 };
                 if ok {
-                    FlightAuth::Ok(self.resolve_flight_identity(&user))
+                    self.resolve_flight_identity(&user).await
                 } else {
                     FlightAuth::Unauthenticated("invalid username or password")
                 }
@@ -2034,10 +2047,29 @@ impl DataglotServer {
     }
 
     /// Resolve a verified/trusted username to its policy [`Identity`](dataglot_policy::Identity),
-    /// applying role membership — identical to the pg-wire `StartupObserver` path.
+    /// applying role membership and the same org fallback as the pg-wire
+    /// `StartupObserver` path: the identity's own org, else the meta-store
+    /// org of a `CREATE USER` user, else the boot org. Without the fallback a
+    /// Flight session had no org, so rules scoped to the boot org (masks, row
+    /// filters, column grants, access denials) didn't apply to it.
     #[cfg(feature = "flight_sql")]
-    fn resolve_flight_identity(&self, user: &str) -> dataglot_policy::Identity {
-        resolve_identity_with_roles(user, &self.config.identities, &self.config.roles)
+    async fn resolve_flight_identity(&self, user: &str) -> FlightAuth {
+        let identity =
+            resolve_identity_with_roles(user, &self.config.identities, &self.config.roles);
+        if identity.org.is_some() {
+            return FlightAuth::Ok(identity);
+        }
+        match self.store_org_for(&identity, user).await {
+            Ok(store_org) => {
+                let org = resolved_session_org(None, store_org, &self.boot_org);
+                FlightAuth::Ok(identity.with_org(org))
+            }
+            Err(e) => {
+                // Fail closed: running without the org would skip its rules.
+                tracing::warn!(error = %e, "flight sql: can't resolve the user's org");
+                FlightAuth::Unauthenticated("could not resolve the user's org")
+            }
+        }
     }
 
     /// TLS config for the Flight SQL listener, if `[flight_sql].tls` is set.
@@ -5920,10 +5952,63 @@ mod tests {
             FlightAuth::Ok(id) => assert!(!id.is_anonymous(), "asserted user → named identity"),
             _ => panic!("trust mode must accept an asserted username"),
         }
-        // Trust: no header → anonymous (behaviour-neutral default, matches pg-wire).
+        // Trust: no header → no user, but still in the boot org.
         match server.authenticate_flight(None).await {
-            FlightAuth::Ok(id) => assert!(id.is_anonymous(), "no header → anonymous"),
-            _ => panic!("trust with no header → anonymous"),
+            FlightAuth::Ok(id) => {
+                assert!(id.user.is_none(), "no header → no user");
+                assert_eq!(id.org.as_deref(), Some("default"), "boot org applies");
+            }
+            _ => panic!("trust with no header → anonymous user"),
+        }
+    }
+
+    /// Flight SQL resolves the session org the way pg-wire does, so a rule
+    /// scoped to the boot org reaches Flight sessions too.
+    #[cfg(feature = "flight_sql")]
+    #[tokio::test]
+    async fn flight_identity_gets_the_same_org_as_pgwire() {
+        use dataglot_pgwire::AuthMode;
+        let mut cfg = ServerConfig::default();
+        cfg.identities.insert(
+            "tenant_admin".to_string(),
+            crate::config::IdentityProfileConfig {
+                org: Some("acme".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut server =
+            DataglotServer::new_with_catalogs(cfg, HashMap::new(), Arc::new(NoopPolicyEnforcer))
+                .expect("server");
+
+        // A user without an org gets the boot org, as on pg-wire
+        // (`resolved_session_org(None, None, boot_org)`).
+        let pgwire_org = resolved_session_org(None, None, &server.boot_org);
+        match server
+            .authenticate_flight(Some(&basic_header("alice", "x")))
+            .await
+        {
+            FlightAuth::Ok(id) => assert_eq!(id.org.as_deref(), Some(pgwire_org.as_str())),
+            _ => panic!("trust accepts alice"),
+        }
+        // A config identity's own org still wins.
+        match server
+            .authenticate_flight(Some(&basic_header("tenant_admin", "x")))
+            .await
+        {
+            FlightAuth::Ok(id) => assert_eq!(id.org.as_deref(), Some("acme")),
+            _ => panic!("trust accepts tenant_admin"),
+        }
+        // Same under password auth.
+        server.auth = AuthMode::Md5(Arc::new(OneUser {
+            user: "alice".into(),
+            password: "s3cret".into(),
+        }));
+        match server
+            .authenticate_flight(Some(&basic_header("alice", "s3cret")))
+            .await
+        {
+            FlightAuth::Ok(id) => assert_eq!(id.org.as_deref(), Some(pgwire_org.as_str())),
+            _ => panic!("md5 accepts alice"),
         }
     }
 
@@ -6140,6 +6225,150 @@ mod tests {
     /// `DataglotServer` serving pg-wire + Flight together (via `run()`),
     /// queries a masked column over `tokio_postgres` and over the arrow-flight
     /// client, and asserts the two agree (and are actually masked).
+    /// Run `sql` over Flight SQL: plan, then fetch. A refusal can surface at
+    /// either step.
+    #[cfg(feature = "flight_sql")]
+    async fn flight_query(
+        flight: &mut arrow_flight::sql::client::FlightSqlServiceClient<tonic::transport::Channel>,
+        sql: &str,
+    ) -> Result<Vec<datafusion::arrow::record_batch::RecordBatch>, String> {
+        use futures::TryStreamExt;
+        let info = flight
+            .execute(sql.to_string(), None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let ticket = info.endpoint[0].ticket.clone().ok_or("no ticket")?;
+        flight
+            .do_get(ticket)
+            .await
+            .map_err(|e| e.to_string())?
+            .try_collect()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// A rule scoped to the boot org must govern a Flight SQL session exactly
+    /// as it governs pg-wire: a user without an explicit org is in the boot
+    /// org on both paths. Before the fix, Flight left the org empty, so a
+    /// boot-org column grant didn't apply and `email` came back over Flight.
+    #[cfg(feature = "flight_sql")]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn boot_org_rules_apply_over_flight_like_pgwire() {
+        use crate::config::{ColumnGrantConfig, FlightSqlConfig};
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::catalog::{MemoryCatalogProvider, MemorySchemaProvider};
+        use datafusion::datasource::MemTable;
+        use tokio_postgres::NoTls;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("email", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["real@example.com"])),
+            ],
+        )
+        .unwrap();
+        let sp = Arc::new(MemorySchemaProvider::new());
+        sp.register_table(
+            "users".to_string(),
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+        )
+        .unwrap();
+        let cp = Arc::new(MemoryCatalogProvider::new());
+        cp.register_schema("public", sp).unwrap();
+        let catalogs: HashMap<String, Arc<dyn DfCatalogProvider>> =
+            HashMap::from([("dataglot".to_string(), cp as Arc<dyn DfCatalogProvider>)]);
+
+        // Only `id` is visible to sessions in the boot org.
+        let grants = vec![ColumnGrantConfig {
+            table: "users".to_string(),
+            columns: vec!["id".to_string()],
+            org: Some("default".to_string()),
+            groups: vec![],
+        }];
+        let pg_port = dataglot_test_support::reserve_loopback_port();
+        let flight_port = dataglot_test_support::reserve_loopback_port();
+        let config = ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: pg_port,
+            default_catalog: "dataglot".to_string(),
+            default_schema: "public".to_string(),
+            flight_sql: Some(FlightSqlConfig {
+                addr: format!("127.0.0.1:{flight_port}"),
+                tls: None,
+            }),
+            observability: crate::observability::ObservabilityConfig {
+                metrics_addr: None,
+                ..Default::default()
+            },
+            ..ServerConfig::default()
+        };
+        let mut server =
+            DataglotServer::new_with_catalogs(config, catalogs, Arc::new(NoopPolicyEnforcer))
+                .expect("server boots");
+        server.whitelist_enforcer =
+            crate::config::build_column_whitelist_enforcer(&grants).expect("grants build");
+        assert_eq!(server.boot_org, "default");
+        let shutdown_tx = server.shutdown_tx.clone();
+        let server_handle = tokio::spawn(async move { server.run().await.expect("server runs") });
+
+        // pg-wire: user `alice` has no org in config → boot org → `email` is hidden.
+        let pg_conn = format!("host=127.0.0.1 port={pg_port} user=alice dbname=dataglot");
+        let mut pg = None;
+        for _ in 0..50 {
+            if let Ok((client, conn)) = tokio_postgres::connect(&pg_conn, NoTls).await {
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                pg = Some(client);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let pg = pg.expect("pg-wire ready");
+        assert!(
+            pg.query("SELECT email FROM users", &[]).await.is_err(),
+            "pg-wire: email is not granted to the boot org"
+        );
+        assert!(pg.query("SELECT id FROM users", &[]).await.is_ok());
+
+        // Flight SQL: the same user and query must be refused the same way.
+        let mut channel = None;
+        for _ in 0..50 {
+            if let Ok(c) =
+                tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{flight_port}"))
+                    .unwrap()
+                    .connect()
+                    .await
+            {
+                channel = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let mut flight = FlightSqlServiceClient::new(channel.expect("Flight SQL listener ready"));
+        flight.set_header("authorization", basic_header("alice", "x"));
+        let email = flight_query(&mut flight, "SELECT email FROM users").await;
+        assert!(
+            email.is_err(),
+            "Flight SQL: email must be hidden from the boot org too, got {email:?}"
+        );
+        assert!(flight_query(&mut flight, "SELECT id FROM users")
+            .await
+            .is_ok());
+
+        let _ = shutdown_tx.send(());
+        let _ = server_handle.await;
+    }
+
     #[cfg(feature = "flight_sql")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[allow(clippy::too_many_lines)] // one server, two full client stacks
