@@ -317,6 +317,7 @@ fn datahub_platform_slug(platform: ProductPlatform) -> &'static str {
         ProductPlatform::ObjectStorage => "s3",
         ProductPlatform::Odata => "odata",
         ProductPlatform::Iceberg => "iceberg",
+        ProductPlatform::ClickHouse => "clickhouse",
         // Everything else — `Adbc`, `Rest`, and any platform added later —
         // falls here. DataHub has no vocabulary entry for "some ADBC driver"
         // or a generic REST/JSON API, and `external` is its designated
@@ -620,6 +621,7 @@ mod tests {
             ProductPlatform::ObjectStorage => "s3",
             ProductPlatform::Odata => "odata",
             ProductPlatform::Iceberg => "iceberg",
+            ProductPlatform::ClickHouse => "clickhouse",
             // Deliberately `external`: DataHub has no vocabulary entry for
             // "some ADBC driver", a generic REST/JSON API, or whatever a
             // Flight SQL endpoint fronts.
@@ -700,6 +702,10 @@ mod tests {
         assert_eq!(datahub_platform_slug(ProductPlatform::ObjectStorage), "s3");
         assert_eq!(datahub_platform_slug(ProductPlatform::Odata), "odata");
         assert_eq!(datahub_platform_slug(ProductPlatform::Iceberg), "iceberg");
+        assert_eq!(
+            datahub_platform_slug(ProductPlatform::ClickHouse),
+            "clickhouse"
+        );
     }
 
     #[test]

@@ -184,6 +184,13 @@ pub enum ProductPlatform {
     /// everywhere it is written down.
     #[serde(rename = "flightsql")]
     FlightSql,
+    /// Live federated ClickHouse source.
+    ///
+    /// Spelled `clickhouse` for the same reason as
+    /// [`crate::catalog::LiveConnectorKind::ClickHouse`]: `snake_case` would
+    /// make it `click_house`.
+    #[serde(rename = "clickhouse")]
+    ClickHouse,
     /// Iceberg-cached warehouse table (hard rule 7:
     /// the *governance* platform name is `iceberg` because
     /// that's what `DataHub` / `OpenMetadata` expect; the
@@ -427,11 +434,12 @@ mod tests {
                 | ProductPlatform::Adbc
                 | ProductPlatform::Rest
                 | ProductPlatform::FlightSql
+                | ProductPlatform::ClickHouse
                 | ProductPlatform::Iceberg => {}
             }
         }
         assert!(
-            seen.contains(&ProductPlatform::FlightSql),
+            seen.contains(&ProductPlatform::ClickHouse),
             "the newest variant must be reachable through all()"
         );
         // A `HashSet`, not `Vec::dedup` — dedup only collapses *consecutive*
@@ -456,6 +464,7 @@ mod tests {
             (ProductPlatform::Snowflake, "\"snowflake\""),
             (ProductPlatform::Oracle, "\"oracle\""),
             (ProductPlatform::FlightSql, "\"flightsql\""),
+            (ProductPlatform::ClickHouse, "\"clickhouse\""),
             (ProductPlatform::ObjectStorage, "\"object_storage\""),
             (ProductPlatform::Iceberg, "\"iceberg\""),
         ] {
