@@ -74,6 +74,7 @@ impl DataglotFlightSqlService {
             FlightAuth::Unauthenticated(msg) | FlightAuth::BadHeader(msg) => {
                 Err(Status::unauthenticated(msg))
             }
+            FlightAuth::Forbidden(msg) => Err(Status::permission_denied(msg)),
         }
     }
 }

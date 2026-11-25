@@ -70,6 +70,9 @@ pub(crate) enum FlightAuth {
     /// Malformed `authorization` header — maps to gRPC `UNAUTHENTICATED` with a
     /// format hint (treated as an auth failure, not `INVALID_ARGUMENT`).
     BadHeader(&'static str),
+    /// Authenticated, but not allowed over this listener — maps to gRPC
+    /// `PERMISSION_DENIED`.
+    Forbidden(&'static str),
 }
 
 /// Parse `Authorization: Basic <base64(user:password)>` into `(user, password)`.
@@ -2056,20 +2059,32 @@ impl DataglotServer {
     async fn resolve_flight_identity(&self, user: &str) -> FlightAuth {
         let identity =
             resolve_identity_with_roles(user, &self.config.identities, &self.config.roles);
-        if identity.org.is_some() {
-            return FlightAuth::Ok(identity);
+        let org = match &identity.org {
+            Some(org) => org.clone(),
+            None => match self.store_org_for(&identity, user).await {
+                Ok(store_org) => resolved_session_org(None, store_org, &self.boot_org),
+                Err(e) => {
+                    // Fail closed: running without the org would skip its rules.
+                    tracing::warn!(error = %e, "flight sql: can't resolve the user's org");
+                    return FlightAuth::Unauthenticated("could not resolve the user's org");
+                }
+            },
+        };
+        // A Flight session is built from the boot org's catalogs and views
+        // (`create_session`), like the embedded engine. With a control plane,
+        // another org's catalogs aren't loaded here, so its users are refused
+        // rather than planned against boot-org data under their own org's
+        // rules (the same check as `embedded_session_identity`).
+        if self.live_catalogs.is_some() && org != self.boot_org {
+            return FlightAuth::Forbidden(
+                "this user's org is not served over Flight SQL yet; connect over pg-wire",
+            );
         }
-        match self.store_org_for(&identity, user).await {
-            Ok(store_org) => {
-                let org = resolved_session_org(None, store_org, &self.boot_org);
-                FlightAuth::Ok(identity.with_org(org))
-            }
-            Err(e) => {
-                // Fail closed: running without the org would skip its rules.
-                tracing::warn!(error = %e, "flight sql: can't resolve the user's org");
-                FlightAuth::Unauthenticated("could not resolve the user's org")
-            }
-        }
+        FlightAuth::Ok(if identity.org.is_none() {
+            identity.with_org(org)
+        } else {
+            identity
+        })
     }
 
     /// TLS config for the Flight SQL listener, if `[flight_sql].tls` is set.
@@ -5998,6 +6013,25 @@ mod tests {
             FlightAuth::Ok(id) => assert_eq!(id.org.as_deref(), Some("acme")),
             _ => panic!("trust accepts tenant_admin"),
         }
+        // With a control plane, only the boot org's catalogs are loaded for a
+        // Flight session, so another org's user is refused rather than
+        // planned against them.
+        server.live_catalogs = Some(Arc::new(std::sync::RwLock::new(HashMap::new())));
+        assert!(matches!(
+            server
+                .authenticate_flight(Some(&basic_header("tenant_admin", "x")))
+                .await,
+            FlightAuth::Forbidden(_)
+        ));
+        match server
+            .authenticate_flight(Some(&basic_header("alice", "x")))
+            .await
+        {
+            FlightAuth::Ok(id) => assert_eq!(id.org.as_deref(), Some(pgwire_org.as_str())),
+            _ => panic!("a boot-org user is still served"),
+        }
+        server.live_catalogs = None;
+
         // Same under password auth.
         server.auth = AuthMode::Md5(Arc::new(OneUser {
             user: "alice".into(),
