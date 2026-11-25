@@ -156,6 +156,16 @@ pub enum LiveConnectorKind {
     /// `TableProvider` (rule 3), sibling of [`Self::Odata`], with a per-table
     /// declared Arrow schema. Pure-Rust, so always compiled into the server.
     Rest,
+    /// `kind: "clickhouse"` in `dataglot.toml`. A `SQLExecutor` source
+    /// reached over ClickHouse's HTTP interface, with results returned as
+    /// Arrow IPC. The connector is gated behind a `clickhouse` feature; the
+    /// binding kind is always present so lineage / catalog-service surfaces
+    /// the source regardless of how the server was built.
+    ///
+    /// Spelled `clickhouse`, not `click_house`: `rename_all = "snake_case"`
+    /// would split the name at the capital H, and the config key is one word.
+    #[serde(rename = "clickhouse")]
+    ClickHouse,
 }
 
 impl LiveConnectorKind {
@@ -186,6 +196,7 @@ impl LiveConnectorKind {
             Self::Adbc => ProductPlatform::Adbc,
             Self::Rest => ProductPlatform::Rest,
             Self::FlightSql => ProductPlatform::FlightSql,
+            Self::ClickHouse => ProductPlatform::ClickHouse,
         }
     }
 }
@@ -278,6 +289,7 @@ mod tests {
             (LiveConnectorKind::Adbc, ProductPlatform::Adbc),
             (LiveConnectorKind::Rest, ProductPlatform::Rest),
             (LiveConnectorKind::FlightSql, ProductPlatform::FlightSql),
+            (LiveConnectorKind::ClickHouse, ProductPlatform::ClickHouse),
         ] {
             assert_eq!(kind.product_platform(), platform, "{kind:?}");
         }
@@ -324,6 +336,10 @@ mod tests {
                 kind: LiveConnectorKind::FlightSql,
                 endpoint_hint: "grpc://dremio.internal:32010".to_string(),
             }),
+            CatalogBinding::LiveConnector(LiveConnectorBinding {
+                kind: LiveConnectorKind::ClickHouse,
+                endpoint_hint: "https://clickhouse.internal:8443".to_string(),
+            }),
             CatalogBinding::SemanticCatalog(
                 SemanticCatalogBinding::try_new("dp_42".to_string(), pg_binding())
                     .expect("one-level nesting OK"),
@@ -369,6 +385,7 @@ mod tests {
             // `kind = "adbc"` catalog-service IPC and dataglot.json.
             (LiveConnectorKind::Adbc, r#""adbc""#),
             (LiveConnectorKind::Rest, r#""rest""#),
+            (LiveConnectorKind::ClickHouse, r#""clickhouse""#),
         ];
         for (kind, expected) in cases {
             let json = serde_json::to_string(&kind).expect("serialize");
