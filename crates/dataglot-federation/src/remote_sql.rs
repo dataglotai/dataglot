@@ -1,8 +1,8 @@
 //! Shape helpers shared by the connectors that push **one finished SQL
-//! string** to a remote and receive Arrow back — today `adbc.rs` and
-//! `flightsql.rs`.
+//! string** to a remote and receive Arrow back — today `adbc.rs`,
+//! `clickhouse.rs` and `flightsql.rs`.
 //!
-//! Both sit behind the same two seams of `datafusion-federation`'s
+//! They sit behind the same two seams of `datafusion-federation`'s
 //! [`SQLExecutor`](datafusion_federation::sql::SQLExecutor):
 //!
 //! * `get_table_schema` receives a *rendered* `RemoteTableRef`, so the

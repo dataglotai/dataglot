@@ -58,6 +58,12 @@ odata = ["dep:quick-xml", "dep:serde_json", "dep:reqwest"]
 # (rule 3: REST is not SQL), sibling of `odata`. Shares the `serde_json`
 # decode + `reqwest` HTTP client. Salesforce / Athena Health API sources.
 rest = ["dep:serde_json", "dep:reqwest"]
+# ClickHouse connector: a `SQLExecutor` source over ClickHouse's HTTP
+# interface, reading results as Arrow IPC (`FORMAT ArrowStream`). Reuses the
+# `reqwest` client and `arrow`'s IPC reader, so it adds no crate. Pure Rust;
+# native-dep hygiene unaffected. Off by default and outside `all` until the
+# server can configure it.
+clickhouse = ["dep:reqwest"]
 # Lakehouse warehouse table format support (Apache Iceberg under the hood).
 #
 # Per hard rule 7 the user-facing surface never says "Iceberg".
