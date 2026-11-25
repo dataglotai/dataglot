@@ -156,11 +156,12 @@ pub enum LiveConnectorKind {
     /// `TableProvider` (rule 3), sibling of [`Self::Odata`], with a per-table
     /// declared Arrow schema. Pure-Rust, so always compiled into the server.
     Rest,
-    /// `kind: "clickhouse"` in `dataglot.toml`. A `SQLExecutor` source
-    /// reached over ClickHouse's HTTP interface, with results returned as
-    /// Arrow IPC. The connector is gated behind a `clickhouse` feature; the
-    /// binding kind is always present so lineage / catalog-service surfaces
-    /// the source regardless of how the server was built.
+    /// `kind: "clickhouse"` in `dataglot.toml` — planned, not accepted yet.
+    /// Present in the binding enum ahead of the connector, which will be a
+    /// `SQLExecutor` source reached over ClickHouse's HTTP interface, with
+    /// results returned as Arrow IPC, gated behind a `clickhouse` feature.
+    /// Until the server config for it lands, a `kind = "clickhouse"` catalog
+    /// is rejected at boot as an unknown kind.
     ///
     /// Spelled `clickhouse`, not `click_house`: `rename_all = "snake_case"`
     /// would split the name at the capital H, and the config key is one word.
