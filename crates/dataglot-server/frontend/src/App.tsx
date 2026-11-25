@@ -48,13 +48,20 @@ export function App() {
   // The server answered 401: ask for the /api token.
   const [needToken, setNeedToken] = useState(false);
   const [tokenInput, setTokenInput] = useState("");
+  const [tokenError, setTokenError] = useState<string | null>(null);
 
   useEffect(() => onAuthRequired(() => setNeedToken(true)), []);
 
   const submitToken = (e: FormEvent) => {
     e.preventDefault();
     if (!tokenInput) return;
-    setApiToken(tokenInput);
+    if (!setApiToken(tokenInput)) {
+      // A reload would come back to this same prompt without the token.
+      setTokenError(
+        "This browser blocked storing the token (site data or private mode). Allow site data for this page and try again.",
+      );
+      return;
+    }
     // Reload so every tab fetches again, now with the token.
     window.location.reload();
   };
@@ -169,6 +176,7 @@ export function App() {
           <button type="submit" className="btn-check">
             Use token
           </button>
+          {tokenError && <span className="err">{tokenError}</span>}
         </form>
       )}
 

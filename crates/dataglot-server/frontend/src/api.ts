@@ -123,11 +123,14 @@ export function apiToken(): string | null {
   }
 }
 
-export function setApiToken(token: string): void {
+/** Remember the token for this tab. `false` when the browser refused to
+ *  store it (blocked site data, some private modes). */
+export function setApiToken(token: string): boolean {
   try {
     sessionStorage.setItem(TOKEN_KEY, token);
+    return true;
   } catch {
-    // Not remembered; the next request asks again.
+    return false;
   }
 }
 

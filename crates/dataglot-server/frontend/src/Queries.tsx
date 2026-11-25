@@ -29,16 +29,22 @@ export function Queries({
   const kill = (runId: string) => {
     setKilling((s) => new Set(s).add(runId));
     setKillError(null);
-    void cancelQuery(runId).then((error) => {
-      if (error === null) return;
-      // Refused: say why and give the button back.
-      setKillError(`Cancel failed: ${error}`);
+        // Refused or unreachable: say why and give the button back. On success it
+    // stays disabled until polling drops the row.
+    const giveBack = (reason: string) => {
+      setKillError(`Cancel failed: ${reason}`);
       setKilling((s) => {
         const next = new Set(s);
         next.delete(runId);
         return next;
       });
-    });
+    };
+    void cancelQuery(runId).then(
+      (error) => {
+        if (error !== null) giveBack(error);
+      },
+      (e: unknown) => giveBack(e instanceof Error ? e.message : "request failed"),
+    );
   };
 
   if (queries.length === 0) {
