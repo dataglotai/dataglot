@@ -44,6 +44,8 @@
 
 #[cfg(feature = "adbc")]
 pub mod adbc;
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse;
 pub mod codec;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
@@ -67,8 +69,9 @@ pub mod postgres;
 pub mod pushdown_metrics;
 pub mod pushdown_trace;
 pub mod registry;
-/// Shape helpers shared by the SQL-pushing connectors (`adbc`, `flightsql`).
-#[cfg(any(feature = "adbc", feature = "flightsql"))]
+/// Shape helpers shared by the SQL-pushing connectors (`adbc`, `clickhouse`,
+/// `flightsql`).
+#[cfg(any(feature = "adbc", feature = "clickhouse", feature = "flightsql"))]
 pub(crate) mod remote_sql;
 #[cfg(feature = "rest")]
 pub mod rest;
@@ -77,6 +80,7 @@ pub mod rest;
 // governance-filter isolation (/291).
 #[cfg(any(
     feature = "adbc",
+    feature = "clickhouse",
     feature = "flightsql",
     feature = "postgres",
     feature = "mysql",
@@ -87,6 +91,7 @@ pub mod rest;
 pub(crate) mod derived_requalify;
 #[cfg(any(
     feature = "adbc",
+    feature = "clickhouse",
     feature = "flightsql",
     feature = "postgres",
     feature = "mysql",
