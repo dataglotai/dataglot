@@ -472,15 +472,32 @@ fn truncate(text: &str, max: usize) -> String {
 ///
 /// An empty result is still a stream (schema, no batches); an empty body is
 /// accepted too rather than treated as malformed.
+///
+/// The reader stops at the end-of-stream marker, so bytes after it (error
+/// text appended to a stream that had already started) would otherwise be
+/// ignored and the batches before them returned as a complete result. The
+/// whole body must be consumed.
 fn decode_arrow_stream(body: &[u8]) -> Result<Vec<RecordBatch>, String> {
     if body.is_empty() {
         return Ok(Vec::new());
     }
-    let reader = StreamReader::try_new(Cursor::new(body), None)
+    let mut reader = StreamReader::try_new(Cursor::new(body), None)
         .map_err(|e| format!("the response is not an Arrow stream: {e}"))?;
-    reader
+    let batches = reader
+        .by_ref()
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("reading the Arrow stream failed: {e}"))
+        .map_err(|e| format!("reading the Arrow stream failed: {e}"))?;
+    // `StreamReader` does no buffering of its own, so the cursor position is
+    // exactly what it consumed.
+    let consumed = reader.get_ref().position();
+    let total = body.len() as u64;
+    if consumed < total {
+        return Err(format!(
+            "the response has {} bytes after the end of the Arrow stream",
+            total - consumed
+        ));
+    }
+    Ok(batches)
 }
 
 // ---------------------------------------------------------------------------
@@ -847,10 +864,12 @@ impl ClickHouseConnector {
                 let name = names.value(row);
                 let (data_type, nullable) = arrow_type(types.value(row), zones.value(row))
                     .map_err(|reason| {
-                        DataglotError::catalog(format!(
+                        // The type text comes from the server, so it is
+                        // scrubbed like any other server text (rule 12).
+                        DataglotError::catalog(self.remote.scrub(&format!(
                             "clickhouse catalog '{}': column '{database}.{table}.{name}' {reason}",
                             self.config.name
-                        ))
+                        )))
                     })?;
                 fields.push(Field::new(name, data_type, nullable));
             }
@@ -881,8 +900,13 @@ impl ClickHouseConnector {
             let tables = string_column(batch, 1)?;
             for row in 0..batch.num_rows() {
                 // Fail closed: a row that cannot be addressed would otherwise
-                // be dropped, and the listing would look complete.
-                if databases.is_null(row) || tables.is_null(row) {
+                // be dropped, or listed as a table no reference can reach,
+                // and the listing would look complete.
+                if databases.is_null(row)
+                    || tables.is_null(row)
+                    || databases.value(row).is_empty()
+                    || tables.value(row).is_empty()
+                {
                     return Err(DataglotError::catalog(format!(
                         "clickhouse catalog '{}': system.tables returned a row without a \
                          database or table name",
@@ -1033,13 +1057,14 @@ impl SQLExecutor for ClickHouseConnector {
     }
 }
 
-/// `SELECT 1` on the existing client: proves the server is reachable and the
-/// credentials are still valid. The error text is scrubbed (rule 12).
+/// `SELECT 1 WHERE 0` on the existing client: proves the server is reachable
+/// and the credentials are still valid without moving a row. The error text
+/// is scrubbed (rule 12).
 #[async_trait]
 impl crate::health::ConnectorHealthCheck for ClickHouseConnector {
     async fn health_check(&self) -> Result<(), String> {
         self.remote
-            .query("SELECT 1", &[])
+            .query("SELECT 1 WHERE 0", &[])
             .await
             .map(|_| ())
             .map_err(|e| format!("clickhouse health check failed: {e}"))
@@ -1373,6 +1398,27 @@ mod tests {
         assert!(decode_arrow_stream(b"").unwrap().is_empty());
         let err = decode_arrow_stream(b"Code: 60. DB::Exception").unwrap_err();
         assert!(err.contains("not an Arrow stream"), "{err}");
+    }
+
+    #[test]
+    fn bytes_after_the_end_of_the_stream_are_an_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        let mut body = Vec::new();
+        {
+            let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut body, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        assert_eq!(decode_arrow_stream(&body).unwrap().len(), 1);
+
+        body.extend_from_slice(b"Code: 241. DB::Exception: Memory limit exceeded");
+        let err = decode_arrow_stream(&body).unwrap_err();
+        assert!(err.contains("after the end of the Arrow stream"), "{err}");
     }
 
     // -----------------------------------------------------------------

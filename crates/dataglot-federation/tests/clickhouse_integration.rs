@@ -7,8 +7,11 @@
 //!
 //! `against_a_real_server` runs the same paths against a real ClickHouse in
 //! Docker and is `#[ignore]`d. Set `DATAGLOT_CLICKHOUSE_URL` to point it at a
-//! server that is already running instead (it must have a user `dataglot`
-//! with the password in `CLICKHOUSE_PASSWORD` below).
+//! server that is already running instead. That server needs a user
+//! `dataglot` with the password in `CLICKHOUSE_PASSWORD` below, and an
+//! `https://` URL unless it is on loopback, since the connector refuses to
+//! send a password over plain HTTP. The test creates its own uniquely named
+//! database and drops only that one.
 
 #![cfg(feature = "clickhouse")]
 
@@ -211,30 +214,44 @@ async fn a_configured_database_is_sent_as_a_query_parameter() {
 #[tokio::test]
 async fn a_listing_row_without_a_name_fails_closed() {
     let _env = env_read().await;
-    let server = MockServer::start().await;
     let schema = Arc::new(Schema::new(vec![
         Field::new("database", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
     ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(StringArray::from(vec![Some("analytics"), None])),
-            Arc::new(StringArray::from(vec![Some("events"), Some("users")])),
-        ],
-    )
-    .unwrap();
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(arrow_stream(&schema, &[batch])))
-        .mount(&server)
-        .await;
+    // A null and an empty name, each beside a valid row.
+    for (databases, tables) in [
+        (
+            vec![Some("analytics"), None],
+            vec![Some("events"), Some("users")],
+        ),
+        (
+            vec![Some("analytics"), Some("analytics")],
+            vec![Some("events"), Some("")],
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(databases)),
+                Arc::new(StringArray::from(tables)),
+            ],
+        )
+        .unwrap();
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(arrow_stream(&schema, &[batch])),
+            )
+            .mount(&server)
+            .await;
 
-    let err = connect(ClickHouseConfig::new("ch", server.uri()))
-        .as_catalog_provider()
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("without a database or table name"), "{err}");
+        let err = connect(ClickHouseConfig::new("ch", server.uri()))
+            .as_catalog_provider()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without a database or table name"), "{err}");
+    }
 }
 
 #[tokio::test]
@@ -429,7 +446,29 @@ async fn credentials_go_in_headers_and_never_into_errors() {
     assert!(!err.to_ascii_lowercase().contains("sw0rdfish-42"), "{err}");
     assert!(!format!("{connector:?}").contains("Sw0rdfish"));
     // The mock only matched with both headers present.
-    assert_eq!(received_sql(&server).await, vec!["SELECT 1".to_string()]);
+    assert_eq!(
+        received_sql(&server).await,
+        vec!["SELECT 1 WHERE 0".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn a_password_reflected_in_a_column_type_is_scrubbed() {
+    let _env = env_write().await;
+    let _password = EnvVar::set("DATAGLOT_TEST_CH_PASSWORD", "Sw0rdfish-42");
+    let server = MockServer::start().await;
+    mount_columns(&server, &[("status", "Enum8('Sw0rdfish-42' = 1)")]).await;
+
+    let mut config = ClickHouseConfig::new("ch", server.uri());
+    config.password_env = Some("DATAGLOT_TEST_CH_PASSWORD".into());
+    let err = connect(config)
+        .table_provider("analytics", "events")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("analytics.events.status"), "{err}");
+    assert!(err.contains("Enum8('[redacted]' = 1)"), "{err}");
+    assert!(!err.contains("Sw0rdfish"), "{err}");
 }
 
 #[tokio::test]
@@ -444,12 +483,12 @@ async fn an_unset_password_variable_fails_at_connect() {
 }
 
 #[tokio::test]
-async fn the_health_check_runs_select_1() {
+async fn the_health_check_runs_a_query_that_returns_no_rows() {
     let _env = env_read().await;
     let server = MockServer::start().await;
     let schema = Arc::new(Schema::new(vec![Field::new("1", DataType::UInt8, false)]));
     Mock::given(method("POST"))
-        .and(body_string_contains("SELECT 1"))
+        .and(body_string_contains("SELECT 1 WHERE 0"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(arrow_stream(&schema, &[])))
         .mount(&server)
         .await;
@@ -522,25 +561,43 @@ async fn real_server() -> (
     (url, container)
 }
 
-/// Create the `dataglot_it` database the real-server test reads.
-async fn seed(url: &str) {
+/// A database name no earlier run or other user is using.
+fn unique_database() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after 1970")
+        .as_nanos();
+    format!("dataglot_it_{}_{nanos}", std::process::id())
+}
+
+/// Create `database` and the tables the real-server test reads. No
+/// `DROP ... IF EXISTS` first: `CREATE DATABASE` fails on a name that is
+/// already taken rather than replacing someone's data.
+async fn seed(url: &str, database: &str) {
     for sql in [
-        "DROP DATABASE IF EXISTS dataglot_it",
-        "CREATE DATABASE dataglot_it",
-        "CREATE TABLE dataglot_it.events (id UInt64, day Date, at DateTime('UTC'), \
-         price Decimal(18, 4), country LowCardinality(String), note Nullable(String)) \
-         ENGINE = MergeTree ORDER BY id",
-        "INSERT INTO dataglot_it.events VALUES \
-         (1, '2024-01-01', '2024-01-01 10:00:00', 1.5, 'DE', NULL), \
-         (2, '2024-01-02', '2024-01-02 11:30:00', 2.25, 'TR', 'second'), \
-         (3, '2024-01-03', '2024-01-03 12:45:00', 3.125, 'DE', 'third')",
-        "CREATE TABLE dataglot_it.countries (code String, name String) \
-         ENGINE = MergeTree ORDER BY code",
-        "INSERT INTO dataglot_it.countries VALUES ('DE', 'Germany')",
-        "CREATE TABLE dataglot_it.tagged (id UInt64, tag Enum8('a' = 1, 'b' = 2)) \
-         ENGINE = MergeTree ORDER BY id",
+        format!("CREATE DATABASE {database}"),
+        format!(
+            "CREATE TABLE {database}.events (id UInt64, day Date, at DateTime('UTC'), \
+             price Decimal(18, 4), country LowCardinality(String), note Nullable(String)) \
+             ENGINE = MergeTree ORDER BY id"
+        ),
+        format!(
+            "INSERT INTO {database}.events VALUES \
+             (1, '2024-01-01', '2024-01-01 10:00:00', 1.5, 'DE', NULL), \
+             (2, '2024-01-02', '2024-01-02 11:30:00', 2.25, 'TR', 'second'), \
+             (3, '2024-01-03', '2024-01-03 12:45:00', 3.125, 'DE', 'third')"
+        ),
+        format!(
+            "CREATE TABLE {database}.countries (code String, name String) \
+             ENGINE = MergeTree ORDER BY code"
+        ),
+        format!("INSERT INTO {database}.countries VALUES ('DE', 'Germany')"),
+        format!(
+            "CREATE TABLE {database}.tagged (id UInt64, tag Enum8('a' = 1, 'b' = 2)) \
+             ENGINE = MergeTree ORDER BY id"
+        ),
     ] {
-        admin(url, sql).await;
+        admin(url, &sql).await;
     }
 }
 
@@ -549,20 +606,38 @@ async fn seed(url: &str) {
 #[tokio::test]
 #[ignore = "requires Docker (or DATAGLOT_CLICKHOUSE_URL)"]
 async fn against_a_real_server() {
+    use futures::FutureExt;
+
     let _env = env_write().await;
     let (url, _container) = real_server().await;
-    seed(&url).await;
+    let database = unique_database();
 
+    // Build the connector before touching the server, so a config it refuses
+    // (plain http:// to a remote host) fails before anything is created.
     let _password = EnvVar::set("DATAGLOT_TEST_CH_IT_PASSWORD", CLICKHOUSE_PASSWORD);
     let mut config = ClickHouseConfig::new("ch", url.clone());
     config.user = Some("dataglot".into());
     config.password_env = Some("DATAGLOT_TEST_CH_IT_PASSWORD".into());
-    config.database = Some("dataglot_it".into());
+    config.database = Some(database.clone());
     let connector = connect(config);
+
+    seed(&url, &database).await;
+    // Drop the database this run created even when an assertion fails.
+    let outcome = std::panic::AssertUnwindSafe(check_real_server(&connector, &database))
+        .catch_unwind()
+        .await;
+    admin(&url, &format!("DROP DATABASE {database}")).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// The assertions of [`against_a_real_server`], against a seeded `database`.
+async fn check_real_server(connector: &Arc<ClickHouseConnector>, database: &str) {
     connector.health_check().await.expect("healthy");
 
     let catalog = connector.as_catalog_provider().await.expect("listing");
-    assert_eq!(catalog.schema_names(), vec!["dataglot_it"]);
+    assert_eq!(catalog.schema_names(), vec![database.to_string()]);
     let base = SessionContext::new();
     let state = SessionStateBuilder::new_from_existing(base.state())
         .with_optimizer_rules(datafusion_federation::default_optimizer_rules())
@@ -571,16 +646,16 @@ async fn against_a_real_server() {
     let ctx = SessionContext::new_with_state(state);
     ctx.register_catalog("ch", catalog);
 
-    let run = |sql: &'static str| {
+    let run = |sql: String| {
         let ctx = ctx.clone();
-        async move { ctx.sql(sql).await?.collect().await }
+        async move { ctx.sql(&sql).await?.collect().await }
     };
 
     // Types and a pushed-down filter.
-    let batches = run(
-        "SELECT id, day, at, price, country, note FROM ch.dataglot_it.events \
-         WHERE country = 'DE' ORDER BY id",
-    )
+    let batches = run(format!(
+        "SELECT id, day, at, price, country, note FROM ch.{database}.events \
+         WHERE country = 'DE' ORDER BY id"
+    ))
     .await
     .expect("filtered select");
     datafusion::assert_batches_eq!(
@@ -597,10 +672,10 @@ async fn against_a_real_server() {
 
     // An unmatched outer-join row is NULL (`join_use_nulls`), not ''. A
     // printed table shows both as blank, so ask the server which it is.
-    let batches = run(
-        "SELECT e.id, c.name IS NULL AS no_country FROM ch.dataglot_it.events e \
-         LEFT JOIN ch.dataglot_it.countries c ON e.country = c.code ORDER BY e.id",
-    )
+    let batches = run(format!(
+        "SELECT e.id, c.name IS NULL AS no_country FROM ch.{database}.events e \
+         LEFT JOIN ch.{database}.countries c ON e.country = c.code ORDER BY e.id"
+    ))
     .await
     .expect("left join");
     datafusion::assert_batches_eq!(
@@ -618,10 +693,11 @@ async fn against_a_real_server() {
 
     // An aggregate over no rows is NULL (`aggregate_functions_null_for_empty`),
     // not 0.
-    let batches =
-        run("SELECT sum(id) IS NULL AS no_total FROM ch.dataglot_it.events WHERE id > 100")
-            .await
-            .expect("empty aggregate");
+    let batches = run(format!(
+        "SELECT sum(id) IS NULL AS no_total FROM ch.{database}.events WHERE id > 100"
+    ))
+    .await
+    .expect("empty aggregate");
     datafusion::assert_batches_eq!(
         [
             "+----------+",
@@ -634,11 +710,9 @@ async fn against_a_real_server() {
     );
 
     // An unreadable column type fails the table, naming the column.
-    let err = run("SELECT id FROM ch.dataglot_it.tagged")
+    let err = run(format!("SELECT id FROM ch.{database}.tagged"))
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("dataglot_it.tagged.tag"), "{err}");
-
-    admin(&url, "DROP DATABASE dataglot_it").await;
+    assert!(err.contains(&format!("{database}.tagged.tag")), "{err}");
 }
